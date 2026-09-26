@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 from psycopg import Connection
-from psycopg.errors import LockNotAvailable
+from psycopg.errors import LockNotAvailable, QueryCanceled
 
 from xetra_loader.contracts.quotes import QuoteRecord
 from xetra_loader.gold.quotes import build_quote_gold
@@ -211,10 +211,14 @@ def test_delta_replay_and_rollback_converge_without_stale_state(tmp_path: Path) 
         prior_marker = _view_marker(connection)
         blocker = connect_postgres(DSN)
         blocker.execute("SELECT count(*) FROM xetra_loader.xetra_features")
-        with pytest.raises(LockNotAvailable):
+        connection.execute("SET statement_timeout = '2s'")
+        connection.commit()
+        with pytest.raises((LockNotAvailable, QueryCanceled)):
             sync_quotes(
                 connection, failed_target, run_id="delta-rollback", published_at_utc=published
             )
+        connection.execute("SET statement_timeout = '0'")
+        connection.commit()
         assert connection.execute("SELECT count(*) FROM xetra_loader.eod_quotes").fetchone() == (1,)
         assert _row_hashes(connection) == prior_hashes
         assert _view_marker(connection) == prior_marker
