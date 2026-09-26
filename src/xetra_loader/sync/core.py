@@ -109,6 +109,9 @@ def run_sync(
         raise ValueError("dataset must be non-empty")
     materialized_rows = tuple(semantic_rows)
     fingerprint, row_count = semantic_fingerprint(materialized_rows)
+    serving_row_count = sum(
+        1 for row in materialized_rows if not bool(row.get("retracted", False))
+    )
     from xetra_loader.sync.row_digests import DATASET_KEY_FIELDS, digest_map, row_digests
 
     source_digests = (
@@ -161,7 +164,7 @@ def run_sync(
                 _replace_row_digests(cursor, dataset, source_digests)
             if dataset == "eod_quotes" and counters.total_mutations:
                 cursor.execute("SELECT xetra_loader.refresh_xetra_features()")
-            _verify_post_write(cursor, dataset, row_count, source_digests)
+            _verify_post_write(cursor, dataset, serving_row_count, source_digests)
             cursor.execute(
                 "INSERT INTO xetra_loader_sync.sync_state "
                 "(dataset, semantic_fingerprint, row_count, synced_at_utc) "

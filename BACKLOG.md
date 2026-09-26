@@ -293,7 +293,8 @@ Git status at completion: PR-owned sync/integration-test files plus the
 existing untracked `artifacts/cron/xdl-weekly.log`.
 
 Owned paths: PostgreSQL sync integration, row-digest delta planner, refresh
-orchestration, and sync integration tests. No new feature formulas.
+orchestration, required feature-refresh ownership migration, and sync
+integration tests. No new feature formulas.
 
 Tasks:
 

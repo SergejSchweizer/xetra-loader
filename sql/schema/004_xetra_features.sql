@@ -235,6 +235,8 @@ LEFT JOIN average_corr AS a ON a.trade_date = r.trade_date;
 CREATE UNIQUE INDEX xetra_features_identity_idx
     ON xetra_loader.xetra_features (isin, exchange, code, trade_date);
 
+ALTER MATERIALIZED VIEW xetra_loader.xetra_features OWNER TO "xetra-data-loader";
+
 COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
     'XETRA feature view; catalog version=1; base levels=adjusted_close_level,volume_level';
 
