@@ -474,9 +474,11 @@ Branch `chore/xdl-pr067-qa-xetra-features-complete-run`; commit scope
 Owned paths: final full-run acceptance command, independent verifier, sanitized
 acceptance artifact, and completion documentation only.
 
-Status: implementation in progress; PR merge pending.
-Git status at completion: to be recorded after the PR is merged; the existing
-untracked `artifacts/cron/xdl-weekly.log` is preserved.
+Status: merged in origin/main via PR #71 (`c5d990c`); complete-run
+PostgreSQL acceptance, independent feature verification, replay QA, Ruff,
+Mypy, policy, push-gate, and merge-gate passed.
+Git status at completion: PR-owned QA test/artifact and backlog update plus the
+existing untracked `artifacts/cron/xdl-weekly.log`.
 
 Tasks: execute a complete isolated XETRA run from Gold publication through raw
 PostgreSQL synchronization, materialized-view refresh, verification, and the
@@ -518,6 +520,10 @@ Branch `chore/xdl-pr068-xetra-loader-feature-view-read-grant`; commit scope
 Owned paths: one forward PostgreSQL privilege migration, privilege integration
 tests, and sanitized permission acceptance output only. No password, DSN,
 provider, feature formula, raw-table, or cron changes.
+
+Status: implementation in progress; PR merge pending.
+Git status at completion: to be recorded after the PR is merged; the existing
+untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
 Tasks:
 
