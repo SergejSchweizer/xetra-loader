@@ -1,5 +1,8 @@
 BEGIN;
 SET LOCAL TIME ZONE 'UTC';
+-- The view uses several causal window frames. Keep their sort work bounded to
+-- this build/refresh transaction instead of relying on the cluster default.
+SET LOCAL work_mem = '1GB';
 
 DROP MATERIALIZED VIEW IF EXISTS xetra_loader.xetra_features;
 
@@ -148,31 +151,6 @@ WITH RECURSIVE ordered AS (
         w5 AS (ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
         w10 AS (ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
         w20 AS (ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
-), pair_rows AS (
-    SELECT a.trade_date, a.isin AS isin_a, a.exchange AS exchange_a, a.code AS code_a,
-        b.isin AS isin_b, b.exchange AS exchange_b, b.code AS code_b,
-        a.log_return_1 AS return_a, b.log_return_1 AS return_b
-    FROM rolling AS a
-    JOIN rolling AS b ON a.trade_date = b.trade_date
-        AND (a.isin, a.exchange, a.code) < (b.isin, b.exchange, b.code)
-    WHERE a.log_return_1 IS NOT NULL AND b.log_return_1 IS NOT NULL
-), pair_corr AS (
-    SELECT p.*,
-        CASE WHEN count(return_a) OVER w5 = 5 THEN corr(return_a, return_b) OVER w5 END AS corr_5,
-        CASE WHEN count(return_a) OVER w10 = 10 THEN corr(return_a, return_b) OVER w10 END AS corr_10,
-        CASE WHEN count(return_a) OVER w20 = 20 THEN corr(return_a, return_b) OVER w20 END AS corr_20
-    FROM pair_rows AS p
-    WINDOW
-        w5 AS (PARTITION BY isin_a, exchange_a, code_a, isin_b, exchange_b, code_b ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
-        w10 AS (PARTITION BY isin_a, exchange_a, code_a, isin_b, exchange_b, code_b ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
-        w20 AS (PARTITION BY isin_a, exchange_a, code_a, isin_b, exchange_b, code_b ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
-), average_corr AS (
-    SELECT trade_date,
-        avg(corr_5) FILTER (WHERE corr_5 IS NOT NULL) AS average_correlation_5,
-        avg(corr_10) FILTER (WHERE corr_10 IS NOT NULL) AS average_correlation_10,
-        avg(corr_20) FILTER (WHERE corr_20 IS NOT NULL) AS average_correlation_20
-    FROM pair_corr
-    GROUP BY trade_date
 )
 SELECT
     r.isin, r.exchange, r.code, r.trade_date,
@@ -222,15 +200,12 @@ SELECT
     c.breadth_daily, c.breadth_5 AS breadth_5obs, c.breadth_10 AS breadth_10obs,
     c.breadth_20 AS breadth_20obs,
     c.dispersion_daily, c.dispersion_5 AS dispersion_5obs,
-    c.dispersion_10 AS dispersion_10obs, c.dispersion_20 AS dispersion_20obs,
-    a.average_correlation_5 AS average_correlation_5obs,
-    a.average_correlation_10 AS average_correlation_10obs,
-    a.average_correlation_20 AS average_correlation_20obs
+    c.dispersion_10 AS dispersion_10obs, c.dispersion_20 AS dispersion_20obs
 FROM rolling AS r
 LEFT JOIN rsi_7 AS r7 ON r7.isin = r.isin AND r7.exchange = r.exchange AND r7.code = r.code AND r7.trade_date = r.trade_date
 LEFT JOIN rsi_14 AS r14 ON r14.isin = r.isin AND r14.exchange = r.exchange AND r14.code = r.code AND r14.trade_date = r.trade_date
 JOIN cross_rolling AS c ON c.trade_date = r.trade_date
-LEFT JOIN average_corr AS a ON a.trade_date = r.trade_date;
+;
 
 CREATE UNIQUE INDEX xetra_features_identity_idx
     ON xetra_loader.xetra_features (isin, exchange, code, trade_date);
@@ -250,6 +225,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, xetra_loader
 AS $$
 BEGIN
+    PERFORM set_config('work_mem', '1GB', true);
     REFRESH MATERIALIZED VIEW xetra_loader.xetra_features;
 END
 $$;

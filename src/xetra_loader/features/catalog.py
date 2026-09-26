@@ -176,13 +176,6 @@ FEATURE_SPECS: Final[tuple[FeatureSpec, ...]] = (
         "rolling_mean(dispersion_daily, n)",
         source=("adjusted_close_level",),
     ),
-    *_series_specs(
-        "average_correlation",
-        (5, 10, 20),
-        "mean pairwise rolling correlation of adjusted-close daily returns",
-        source=("adjusted_close_level",),
-        min_observations=2,
-    ),
 )
 
 INTERNAL_OHLC_FAMILIES: Final[frozenset[str]] = frozenset(

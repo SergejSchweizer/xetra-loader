@@ -36,7 +36,6 @@ def test_catalog_contains_requested_windows() -> None:
         "breadth_20obs",
         "dispersion_daily",
         "dispersion_10obs",
-        "average_correlation_20obs",
     )
     assert set(expected_fragments) <= names
 

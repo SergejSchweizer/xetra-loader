@@ -124,7 +124,6 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
             initial[("AAA", first_date)]["adjusted_close_log_return_1obs"] is None
             and initial[("AAA", fifth_date)]["adjusted_close_return_geom_5obs_pct"] is None
             and initial[("AAA", fifth_date)]["breadth_5obs"] is None
-            and initial[("AAA", fifth_date)]["average_correlation_5obs"] is None
         )
 
         stable_identity = ("AAA", fixture[30].trade_date)

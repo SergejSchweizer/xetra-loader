@@ -40,7 +40,7 @@ Frozen feature rules:
   source fields, windows, null behavior, and leakage rules;
 - price-return, rolling-return, SMA, RSI, ROC, drawdown, and price-volatility
   features use `adjusted_close_level`; volume features use `volume_level`;
-- cross-sectional breadth, dispersion, and average-correlation features use
+- cross-sectional breadth and dispersion features use
   only daily instrument returns derived from `adjusted_close_level`;
 - the naming convention follows macro-loader: `<series>_level`,
   `<series>_log_level`, `<series>_delta_<n>obs`,
@@ -138,7 +138,7 @@ Tasks:
   - adjusted-close ROC for 3, 5, 10, and 20 observations;
   - adjusted-close drawdown for 20 and 60 observations;
   - relative volume and volume Z-score for 5, 10, and 20 observations;
-  - daily and 5/10/20 rolling breadth, dispersion, and average correlation;
+  - daily and 5/10/20 rolling breadth and dispersion;
 - define the formula contract explicitly:
   - `log_return_n = ln(adjusted_close_level / lag(adjusted_close_level, n))`;
   - rolling cumulative return is `exp(sum(log_return_1 over window)) - 1`;
@@ -156,8 +156,7 @@ Tasks:
   - relative volume is `volume_level / rolling_mean(volume_level, n)` and
     volume Z-score is `(volume_level - rolling_mean) / rolling_std`;
   - breadth is the cross-sectional fraction of positive daily adjusted-close
-    returns, dispersion is their cross-sectional standard deviation, and
-    average correlation is the mean pairwise rolling correlation;
+    returns and dispersion is their cross-sectional standard deviation;
 - define whether each rolling window includes the current observation and use
   that convention consistently in SQL and independent QA calculations;
 - define null/zero/insufficient-history behavior;
@@ -377,7 +376,7 @@ untracked `artifacts/cron/xdl-weekly.log` is preserved.
 Tasks: independently verify every PR059 feature family: log returns, rolling
 cumulative returns, rolling return means, volatility/std, high-low range,
 intraday return, overnight gap, SMA ratios, RSI, ROC, drawdown, relative
-volume, volume Z-score, breadth, dispersion, average correlation, null behavior,
+volume, volume Z-score, breadth, dispersion, null behavior,
 partitioning, ordering, and no-look-ahead semantics.
 
 Acceptance:
@@ -389,8 +388,8 @@ Acceptance:
 - volume features use only volume values;
 - high-low, intraday-return, and overnight-gap features use the approved raw
   OHLC inputs and no other OHLC-derived feature does;
-- breadth, dispersion, and average correlation are calculated cross-sectionally
-  from daily adjusted-close returns with the exact daily and 5/10/20 windows;
+- breadth and dispersion are calculated cross-sectionally from daily
+  adjusted-close returns with the exact daily and 5/10/20 windows;
 - changing an irrelevant source field cannot change a feature, while changing
   an approved source field changes exactly the dependent feature families;
 - every requested window (1/3/5/10/20/40/60 and RSI 7/14) is tested;
