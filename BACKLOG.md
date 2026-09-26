@@ -567,9 +567,11 @@ Owned paths: fold-aware feature-standardization query/API, training-fold
 contract, leakage tests, and sanitized QA output only. No changes to raw Gold
 semantics, provider downloads, cron, or PostgreSQL user passwords.
 
-Status: implementation in progress; PR merge pending.
-Git status at completion: to be recorded after the PR is merged; the existing
-untracked `artifacts/cron/xdl-weekly.log` is preserved.
+Status: merged in origin/main via PR #73 (`67b3cf0`); train-fold-local
+standardization adapter, leakage tests, sanitized QA artifact, Ruff, Mypy,
+policy, push-gate, and merge-gate passed.
+Git status at completion: PR-owned adapter/docs/tests/artifact and backlog
+update plus the existing untracked `artifacts/cron/xdl-weekly.log`.
 
 Tasks:
 
@@ -604,6 +606,13 @@ Acceptance:
   fitted statistics;
 - the sanitized report is `PASS` and contains no credentials or raw payloads;
 - PR067's complete-run acceptance is not considered final until PR069 passes.
+
+### PR070 — xdl-pr070-feature-backlog-audit
+
+Status: closed as superseded. The external audit branch proposed removing the
+approved PR069 train-fold contract and changing the already merged feature-view
+and role semantics. Its final disposition is recorded here; the current
+backlog and `origin/main` remain authoritative.
 
 ## 1. Status authority
 
