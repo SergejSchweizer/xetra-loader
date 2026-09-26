@@ -162,11 +162,10 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
             "no_future_observation_leakage": no_lookahead,
             "irrelevant_metadata_invariance": irrelevant_field_invariance,
             "repeated_refresh_semantic_identity": repeated_refresh,
-            "secrets_included": False,
         }
         report_path = tmp_path / "xdl-pr064-feature-calculations.json"
         _write_report(report_path, checks)
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        assert report["status"] == "PASS", report
+        assert report["status"] == "PASS", json.dumps(report, sort_keys=True)
     finally:
         connection.close()
