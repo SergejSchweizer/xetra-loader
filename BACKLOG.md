@@ -521,9 +521,11 @@ Owned paths: one forward PostgreSQL privilege migration, privilege integration
 tests, and sanitized permission acceptance output only. No password, DSN,
 provider, feature formula, raw-table, or cron changes.
 
-Status: implementation in progress; PR merge pending.
-Git status at completion: to be recorded after the PR is merged; the existing
-untracked `artifacts/cron/xdl-weekly.log` is preserved.
+Status: merged in origin/main via PR #72 (`5fdc95d`); external-role
+feature-view privilege migration, PostgreSQL permission QA, fail-closed and
+repeatability checks, Ruff, Mypy, policy, push-gate, and merge-gate passed.
+Git status at completion: PR-owned migration/test/artifact and backlog update
+plus the existing untracked `artifacts/cron/xdl-weekly.log`.
 
 Tasks:
 
@@ -564,6 +566,10 @@ Branch `feat/xdl-pr069-train-fold-local-standardization`; commit scope
 Owned paths: fold-aware feature-standardization query/API, training-fold
 contract, leakage tests, and sanitized QA output only. No changes to raw Gold
 semantics, provider downloads, cron, or PostgreSQL user passwords.
+
+Status: implementation in progress; PR merge pending.
+Git status at completion: to be recorded after the PR is merged; the existing
+untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
 Tasks:
 
