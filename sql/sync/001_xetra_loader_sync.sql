@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS xetra_loader_sync.loader_runs (
     CHECK (finished_at_utc >= started_at_utc)
 );
 
+CREATE TABLE IF NOT EXISTS xetra_loader_sync.row_hashes (
+    dataset TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    row_sha256 CHAR(64) NOT NULL,
+    PRIMARY KEY (dataset, entity_key),
+    CHECK (btrim(dataset) <> ''),
+    CHECK (btrim(entity_key) <> ''),
+    CHECK (row_sha256 ~ '^[0-9a-f]{64}$')
+);
+
 REVOKE ALL ON SCHEMA xetra_loader_sync FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA xetra_loader_sync FROM PUBLIC;
 GRANT USAGE ON SCHEMA xetra_loader_sync TO "xetra-data-loader";
