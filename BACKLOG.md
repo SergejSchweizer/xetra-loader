@@ -114,7 +114,8 @@ Branch `feat/xdl-pr059-xetra-feature-contract`; commit scope
 `feat(xdl-pr059-xetra-feature-contract): ...`; depends on the current `main`
 including the existing corrected contract work through PR058.
 
-Status: implemented; focused unit, Ruff, and Mypy checks pass; PR merge pending.
+Status: merged in origin/main via PR #63 (`d3dbab8`); focused unit, Ruff, and
+Mypy checks passed.
 Git status at completion: PR-owned source/test files plus the existing
 untracked `artifacts/cron/xdl-weekly.log`.
 
@@ -190,6 +191,11 @@ Acceptance:
 
 Branch `feat/xdl-pr060-xetra-features-materialized-view`; commit scope
 `feat(xdl-pr060-xetra-features-materialized-view): ...`; depends on PR059.
+
+Status: implementation complete; 7 focused tests, Ruff, Mypy, and SQL contract
+checks pass; PR merge pending.
+Git status at completion: PR-owned SQL/source/test files plus the existing
+untracked `artifacts/cron/xdl-weekly.log`.
 
 Owned paths: feature PostgreSQL migration/DDL, view-refresh function if
 needed, view contract integration tests, and feature grants. No ingestion or
