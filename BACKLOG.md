@@ -196,9 +196,11 @@ Required market features:
 
 - market_mean_log_return_1obs = mean_i(market_aligned_log_return_i,t);
 - market_median_log_return_1obs = median_i(market_aligned_log_return_i,t);
-- market_cum_return_5obs_pct, 10obs_pct, 20obs_pct =
+- market_mean_log_return_cum_5obs_pct, 10obs_pct, 20obs_pct =
   100 * (exp(sum(market_mean_log_return_1obs over W dates)) - 1);
-- market_return_vol_5obs, 10obs, 20obs =
+  this is the cumulative path of the daily cross-sectional mean log return and
+  must not be labelled as an equal-weight self-financing portfolio return;
+- market_mean_log_return_vol_5obs, 10obs, 20obs =
   stddev_pop(market_mean_log_return_1obs over W dates);
 - breadth_positive_1obs = count(r_i,t > 0) / count(valid r_i,t);
 - breadth_positive_mean_5obs, 10obs, 20obs =
@@ -214,7 +216,9 @@ Required market features:
 Average pairwise correlation is defined only for W in {5,10,20}.
 For each date t and W, E_(t,W) contains instruments having valid
 market_aligned_log_return values on every one of the same W market dates ending
-at t. If |E_(t,W)| < 30 the feature is NULL. Otherwise:
+at t and non-zero return standard deviation over those W dates. This makes every
+pairwise Pearson correlation defined. If |E_(t,W)| < 30 the feature is NULL.
+Otherwise:
 
 avg_pairwise_corr_Wobs =
 mean over all unordered pairs (i,j) in E_(t,W) of
@@ -426,6 +430,7 @@ Tasks:
   safe search_path that refreshes xetra_features first and
   xetra_market_features second using non-concurrent refreshes in the caller's
   transaction;
+- revoke function EXECUTE from PUBLIC explicitly;
 - grant EXECUTE on that function only to the runtime writer and migration/admin
   roles; do not grant general DDL/MAINTAIN rights to the writer.
 
@@ -490,8 +495,8 @@ Acceptance:
 - xetra_market_features contains one row per date and no instrument identity;
 - raw OHLC references occur only in the approved instrument expressions;
 - feature_sync_state has exactly the required lineage fields;
-- the refresh function has the intended owner, EXECUTE grants, and safe
-  search_path;
+- the refresh function has the intended owner, PUBLIC has no EXECUTE grant,
+  and the intended explicit EXECUTE grants/search_path are exact;
 - no training-fit statistic appears in either materialized view.
 
 ### PR064 — xdl-pr064-qa-xetra-feature-calculations
