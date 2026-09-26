@@ -50,6 +50,27 @@ downstream operation documented in
 [`docs/train-fold-standardization.md`](docs/train-fold-standardization.md); it
 never changes Gold or the global feature view.
 
+## PostgreSQL schema inventory
+
+The raw quote table `xetra_loader.eod_quotes` has **13 columns**: four identity
+columns (`isin`, `exchange`, `code`, `trade_date`), one EOD timestamp, six raw
+market fields (`open`, `high`, `low`, `close`, `adjusted_close`, `volume`), and
+two publication-audit timestamps. It contains raw OHLCV data, not derived
+features.
+
+The materialized view `xetra_loader.xetra_features` has **52 columns**:
+
+- **4 identity columns**: `isin`, `exchange`, `code`, `trade_date`;
+- **2 exposed level columns**: `adjusted_close_level`, `volume_level`;
+- **46 derived feature columns** from the versioned catalog, or **48 catalog
+  columns** when the two base levels are included and identity columns are
+  excluded.
+
+The view deliberately contains no `open_level`, `high_level`, `low_level`, or
+`close_level`, and no `average_correlation_5obs`,
+`average_correlation_10obs`, or `average_correlation_20obs`. Internal OHLC
+values are used only for high-low range, intraday return, and overnight gap.
+
 The deployed scheduler is Sunday `08:00` in `Europe/Vienna` and invokes the
 restart-safe `xdl-weekly` runner. The real-target acceptance run remains an
 operational deployment step and requires valid access to the configured
