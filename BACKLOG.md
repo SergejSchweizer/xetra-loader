@@ -2,15 +2,52 @@ Last reviewed: 2026-09-26
 
 # XETRA Data Loader — Atomic Parallel Backlog
 
-## 0. New feature-serving program — XETRA levels and derived features
+## 0. Active feature-serving program — audited contract
 
-This section is the newest requested work package. It is additive to the
-existing loader backlog and must not change the meaning of the existing Bronze,
-Silver, Gold, or raw PostgreSQL datasets.
+This section supersedes the previous XDL-PR059–XDL-PR069 feature-serving plan.
+It was audited against the current repository contracts and against the intended
+regime-engine consumption pattern. The audit makes the feature layer
+point-in-time safe, separates instrument-grain data from market-grain data,
+removes model-training responsibilities from xetra-loader, and reconciles the
+repository's PostgreSQL role naming before feature DDL is added.
 
-Target architecture:
+### 0.1 Audit corrections
 
-```text
+The following issues in the prior plan are corrected here:
+
+- a single xetra_features row grain could not simultaneously represent
+  per-instrument features and non-duplicated market-wide breadth/dispersion/
+  correlation features; the serving layer is therefore split into an
+  instrument view and a market view;
+- regime-engine consumes one ordered market observation per timestamp, whereas
+  the instrument view has many rows per date; xetra_market_features is the
+  explicit regime-detection handoff;
+- "daily average correlation" was mathematically undefined from one return per
+  instrument; average pairwise correlation is now defined only for 5/10/20
+  aligned-observation windows;
+- the previous plan did not define valid-observation lag semantics; every
+  instrument lag/window now counts valid source observations rather than
+  calendar days or rows with unusable inputs;
+- the previous overnight-gap formula could create false gaps across corporate
+  actions; the gap now uses an adjusted-open proxy on the adjusted-close basis;
+- rolling standard-deviation conventions are frozen to population standard
+  deviation (ddof=0) rather than left implementation-selectable;
+- RSI is frozen to a finite rolling RSI convention rather than an ambiguous
+  recursive implementation;
+- the previous row-digest-state work order duplicated the existing authoritative
+  complete-Gold reconciliation and semantic-fingerprint contract; it is removed;
+- train-fold z-score fitting and lagged state tensors are model-training
+  concerns and are removed from xetra-loader; regime-engine owns them;
+- the previous reader-role specification denied all sync-schema access while a
+  reproducible consumer needs source lineage; the reader now receives SELECT
+  only on a dedicated feature lineage relation;
+- the clean-create role SQL still names the writer group xetra-data-loader,
+  while migration 001 renames it to xetra-loader; a prerequisite role-contract
+  reconciliation work order is added.
+
+### 0.2 Target architecture
+
+~~~
 EODHD
   -> Bronze -> Silver -> Gold
   -> PostgreSQL raw tables
@@ -18,528 +55,539 @@ EODHD
        xetra_loader.listings
        xetra_loader.dividends
        xetra_loader.splits
-  -> xetra_loader.xetra_features (MATERIALIZED VIEW)
-```
+  -> xetra_loader.xetra_features
+       one row per (isin, exchange, code, trade_date)
+       instrument-level causal features
+  -> xetra_loader.xetra_market_features
+       one row per trade_date
+       market/cross-sectional regime features
+  -> xetra_loader_sync.feature_sync_state
+       lineage/version/hash for both feature relations
+  -> read-only consumers
+       regime-engine / portfell
+~~~
 
-Frozen feature rules:
+Both feature relations are MATERIALIZED VIEW objects. The market relation is
+derived from the instrument relation and therefore refreshes after it.
 
-- the PostgreSQL object is exactly `xetra_loader.xetra_features`;
-- the view has one row per `(isin, exchange, code, trade_date)`;
-- the only base level columns exposed by the view are `adjusted_close_level`
-  and `volume_level`;
-- `adjusted_close_level` is the canonical Gold/Raw `adjusted_close` value
-  aliased with the macro-loader naming convention; it is not recalculated from
-  `close`;
-- `volume_level` is the canonical Gold/Raw `volume` value;
-- the view contains no `open_level`, `high_level`, `low_level`, `close_level`,
-  or any other OHLC level;
-- `open`, `high`, `low`, and unadjusted `close` may be used only as internal
-  SQL inputs for the explicitly approved high-low range, intraday-return, and
-  overnight-gap features; none of them is exposed as a level column;
-- every derived feature must be declared in a versioned catalog with its exact
-  source fields, windows, null behavior, and leakage rules;
-- price-return, rolling-return, SMA, RSI, ROC, drawdown, and price-volatility
-  features use `adjusted_close_level`; volume features use `volume_level`;
-- cross-sectional breadth, dispersion, and average-correlation features use
-  only daily instrument returns derived from `adjusted_close_level`;
-- the naming convention follows macro-loader: `<series>_level`,
-  `<series>_log_level`, `<series>_delta_<n>obs`,
-  `<series>_return_geom_<n>obs_pct`, `<series>_zscore_<n>obs`, and
-  `<series>_momentum_autocorr_<lag>_<window>obs`;
-- insufficient history, non-positive log inputs, zero denominators, and
-  invalid numeric windows produce `NULL`, never fabricated values;
-- all windows are partitioned by instrument and ordered by `trade_date`; no
-  future observation may influence a feature;
-- the view is refreshed only after a successful raw quote publication that
-  changed any feature input: `open`, `high`, `low`, `close`,
-  `adjusted_close`, or `volume`;
-- an unchanged Gold replay performs no raw mutations, no sync-state mutation,
-  and no materialized-view refresh.
-- train-fold-local z-score standardization is not globally fitted in this
-  materialized view; it is applied by a fold-aware query using training rows
-  only, as specified by PR069, to prevent leakage into validation/test rows.
-- the PostgreSQL user/role `xetra_loader` must have `USAGE` on the
-  `xetra_loader` schema and `SELECT` on `xetra_loader.xetra_features`;
-- `xetra_loader` receives no INSERT, UPDATE, DELETE, TRUNCATE, DDL, refresh,
-  or `xetra_loader_sync` privilege; its password and LOGIN lifecycle are
-  provisioned outside the repository and never committed.
+### 0.3 Frozen statistical and leakage rules
 
-The exact design mirrors the macro-loader's canonical Gold -> PostgreSQL raw
-replica -> feature materialized view pattern. In macro-loader the feature
-object is technically a `MATERIALIZED VIEW`, not an ordinary view; its SQL
-definition and explicit refresh are the reference behavior.
+- adjusted_close is the canonical price basis for price-return, cumulative
+  return, rolling mean, volatility, SMA, RSI, ROC, and drawdown features;
+- volume is the canonical volume basis;
+- open/high/low/unadjusted close are internal-only inputs for high-low range,
+  intraday return, and adjusted overnight gap; they are never exposed as level
+  columns;
+- all logarithms use the natural logarithm;
+- all instrument lags/windows are partitioned by (isin, exchange, code) and
+  ordered by trade_date;
+- "n observations" means n valid observations for the relevant source, not n
+  calendar days; invalid/missing source rows do not become lag anchors;
+- rolling windows include the current valid observation and require the exact
+  configured number of valid observations; otherwise the derived value is NULL;
+- population standard deviation is used everywhere a rolling/cross-sectional
+  standard deviation is specified;
+- no forward fill, backward fill, interpolation, centered window, future row,
+  or current-universe survivorship filter is permitted;
+- historical market membership is inferred from valid quote/feature presence on
+  each trade date; current listings.is_active must not be used to remove
+  historical instruments;
+- cross-sectional market statistics require at least 30 valid instruments on
+  the date; the threshold is a versioned catalog constant;
+- fold-local standardization, PCA, feature selection, and lagged state tensors
+  are explicitly outside xetra-loader and must be fit by regime-engine using
+  training rows only;
+- interest-rate differentials, forward points, and realized-spot comparisons
+  are FX/macro features and are outside xetra-loader.
 
-### 0.1 New feature work-order dependency graph
+### 0.4 Exact instrument feature contract
 
-```text
-current main after existing PR058
-              |
-            PR059  feature catalog and semantic contract
-              |
-        +-----+-----+
-        |           |
-      PR060       PR061
-  view/DDL      row-digest state
-        |           |
-        +-----+-----+
-              |
-            PR062  raw sync + refresh integration
-              |
-        +-----+-----+----------------+
-        |           |                |
-      PR063       PR064            PR065
-  schema QA   calculation QA   delta/replay QA
-        |           |                |
-        +-----------+----------------+
-                    |
-                  PR066  cron/restart QA
-                    |
-                  PR067  complete-run QA gate
-                    |
-                  PR068  xetra_loader view-read grant
-                    |
-                  PR069  train-fold-local standardization
-```
+Identity columns are exactly:
+(isin, exchange, code, trade_date, timestamp_eod).
 
-PR059 is the single semantic authority. PR060 and PR061 may proceed in
-parallel after PR059. PR063–PR065 are independent QA PRs for the intermediate
-implementation state. PR066 verifies the operational path. PR067 verifies the
-complete run. PR068 is the privilege-specific gate for the `xetra_loader`
-PostgreSQL user. PR069 is the final leakage-safety gate for model
-standardization.
+The only exposed raw/base levels are:
+adjusted_close_level and volume_level.
+
+Let A_t be adjusted_close_level, V_t volume_level, and let t-k denote the kth
+previous valid observation for the relevant source.
+
+Required short-regime feature families:
+
+- log returns, horizons 1/3/5/10/20:
+  adjusted_close_log_return_kobs = ln(A_t / A_(t-k));
+- rolling cumulative simple returns, horizons 5/10/20:
+  adjusted_close_cum_return_Wobs_pct =
+  100 * (exp(sum(log_return_1obs over W valid daily returns)) - 1);
+- rolling price means, horizons 5/10/20/40:
+  adjusted_close_sma_Wobs = mean(A over W valid observations);
+- rolling mean daily log return, horizons 5/10/20:
+  adjusted_close_log_return_mean_Wobs =
+  mean(adjusted_close_log_return_1obs over W valid daily returns);
+- rolling volatility, horizons 5/10/20/40:
+  adjusted_close_log_return_vol_Wobs =
+  stddev_pop(adjusted_close_log_return_1obs over W valid daily returns);
+- SMA ratios 5/20, 10/20, 10/40:
+  adjusted_close_sma_ratio_f_s =
+  SMA_fast / SMA_slow - 1;
+- rolling RSI, horizons 7/14, using the finite rolling/Cutler convention:
+  d_t = A_t - A_(t-1),
+  gain_t = max(d_t, 0),
+  loss_t = max(-d_t, 0),
+  RS = mean(gain over W) / mean(loss over W),
+  RSI = 100 - 100/(1+RS);
+  if both rolling gain and loss means are zero, RSI=50; if loss is zero and
+  gain is positive, RSI=100; if gain is zero and loss is positive, RSI=0;
+- ROC, horizons 3/5/10/20:
+  adjusted_close_roc_kobs_pct = 100 * (A_t / A_(t-k) - 1);
+- drawdown, horizons 20/60:
+  adjusted_close_drawdown_Wobs_pct =
+  100 * (A_t / max(A over W valid observations) - 1);
+- log volume:
+  volume_log_level = ln(1 + V_t), requiring V_t >= 0;
+- relative volume, horizons 5/10/20:
+  volume_relative_Wobs = V_t / mean(V over W valid observations);
+- volume z-score, horizons 5/10/20:
+  volume_zscore_Wobs =
+  (V_t - mean(V over W valid observations)) /
+  stddev_pop(V over W valid observations).
+
+OHLC-derived short-horizon features are restricted to:
+
+- high-low log range:
+  hl_log_range_1obs = ln(high_t / low_t), requiring high_t>0 and low_t>0;
+  hl_log_range_mean_5obs = mean(hl_log_range_1obs over 5 valid values);
+- intraday log return:
+  intraday_log_return_1obs = ln(close_t / open_t), requiring both >0;
+  intraday_log_return_mean_5obs = mean(intraday_log_return_1obs over 5 valid values);
+- corporate-action-safe overnight gap:
+  adjusted_open_t = open_t * adjusted_close_t / close_t,
+  overnight_gap_log_return_1obs =
+  ln(adjusted_open_t / adjusted_close_(t-1)),
+  requiring positive open_t, close_t, adjusted_close_t, and prior adjusted close;
+  overnight_gap_log_return_mean_5obs =
+  mean(overnight_gap_log_return_1obs over 5 valid values).
+
+No other feature may depend on unadjusted OHLC fields.
+
+### 0.5 Exact market feature contract
+
+xetra_loader.xetra_market_features has exactly one row per trade_date and
+exposes timestamp_m1 = trade_date 00:00:00+00:00 for downstream time-series
+consumers.
+
+Daily eligible universe E_t is every instrument with a valid
+adjusted_close_log_return_1obs on t. No current is_active filter is allowed.
+
+Required market features:
+
+- market_mean_log_return_1obs = mean_i(r_i,t);
+- market_median_log_return_1obs = median_i(r_i,t);
+- market_cum_return_5obs_pct, 10obs_pct, 20obs_pct =
+  100 * (exp(sum(market_mean_log_return_1obs over W dates)) - 1);
+- market_return_vol_5obs, 10obs, 20obs =
+  stddev_pop(market_mean_log_return_1obs over W dates);
+- breadth_positive_1obs = count(r_i,t > 0) / count(valid r_i,t);
+- breadth_positive_mean_5obs, 10obs, 20obs =
+  rolling mean of the daily breadth series;
+- return_dispersion_1obs = stddev_pop_i(r_i,t);
+- return_dispersion_mean_5obs, 10obs, 20obs =
+  rolling mean of daily return dispersion;
+- median_asset_vol_5obs, 10obs, 20obs =
+  cross-sectional median of the corresponding instrument rolling volatility;
+- median_volume_zscore_5obs, 10obs, 20obs =
+  cross-sectional median of the corresponding instrument volume z-score.
+
+Average pairwise correlation is defined only for W in {5,10,20}.
+For each date t and W, E_(t,W) contains instruments having valid daily returns
+on every one of the same W market dates ending at t. If |E_(t,W)| < 30 the
+feature is NULL. Otherwise:
+
+avg_pairwise_corr_Wobs =
+mean over all unordered pairs (i,j) in E_(t,W) of
+Corr(r_i, r_j) over exactly those W aligned dates.
+
+A "daily average correlation" feature does not exist.
+
+All rolling market-date windows require W non-NULL daily market observations;
+partial windows return NULL.
+
+### 0.6 Source lineage contract
+
+Create xetra_loader_sync.feature_sync_state with one row for each dataset_id:
+xetra_features and xetra_market_features.
+
+Required fields:
+
+- dataset_id;
+- source_build_id;
+- data_sha256;
+- schema_version;
+- feature_version;
+- row_count;
+- min_timestamp;
+- max_timestamp;
+- synced_at_utc.
+
+The feature refresh and corresponding lineage-state update are one publication
+unit. A consumer must be able to pin one source_build_id and reject incompatible
+schema_version/feature_version values.
+
+### 0.7 Active work-order dependency graph
+
+~~~
+current main after PR058
+          |
+        PR070  audited backlog contract (documentation only)
+          |
+        PR071  canonical PostgreSQL role-name reconciliation
+          |
+        PR059  feature catalog + formulas + lineage contract
+          |
+        PR060  instrument feature materialized view
+          |
+        PR061  market feature materialized view + explicit refresh function
+          |
+        PR062  quote sync -> conditional feature refresh + lineage update
+          |
+    +-----+-----+------+
+    |           |      |
+  PR063       PR064  PR065
+ schema QA   math QA  delta/rollback QA
+    |           |      |
+    +-----+-----+------+
+          |
+        PR068  dedicated feature-reader grants
+          |
+        PR066  cron/restart QA
+          |
+        PR067  complete real-run acceptance
+~~~
+
+PR069 is removed. Train-fold-local z-score fitting and lagged state tensors
+belong to regime-engine and must not be implemented in xetra-loader.
+
+### PR070 — xdl-pr070-feature-backlog-audit
+
+Branch docs/xdl-pr070-feature-backlog-audit; commit scope
+docs(xdl-pr070-feature-backlog-audit): ...; documentation-only planning gate.
+
+Tasks:
+
+- reconcile the active feature work orders with the current repository;
+- split instrument and market feature grains;
+- remove duplicate row-digest state and model-training standardization scope;
+- freeze exact formulas, windows, valid-observation semantics, lineage, and
+  consumer privilege boundaries;
+- add PR071 for the discovered clean-create/migration role-name inconsistency;
+- mark PR069 removed and update all dependency/completion references.
+
+Acceptance:
+
+- BACKLOG.md contains no contradictory active feature formulas or ownership;
+- every active implementation work order has one unambiguous predecessor set;
+- no active xetra-loader work order fits training statistics or lag tensors;
+- historical completed work orders remain unchanged except for supersession
+  references needed to remove contradictions.
+
+### PR071 — xdl-pr071-postgres-role-name-reconciliation
+
+Branch fix/xdl-pr071-postgres-role-name-reconciliation; commit scope
+fix(xdl-pr071-postgres-role-name-reconciliation): ...; depends on PR070.
+
+Owned paths: PostgreSQL role/grant DDL, role migration, role tests, and role
+documentation only.
+
+Tasks:
+
+- make the canonical loader writer group role exactly "xetra-loader" NOLOGIN;
+- keep xetra_data_loader_writer as the non-superuser LOGIN member used by the
+  weekly runtime;
+- update clean-create DDL and xetra_loader_sync grant DDL that still reference
+  the historical "xetra-data-loader" name;
+- keep migration 001 idempotent: rename the historical role when only it
+  exists, accept the canonical role when already migrated, and fail closed if
+  both exist;
+- update clean-create and migrated-schema tests so both paths introspect to the
+  same role/grant contract;
+- do not create or alter passwords.
+
+Acceptance:
+
+- a clean database and a migrated database expose the same canonical role names
+  and privileges;
+- xetra_data_loader_writer is a member of "xetra-loader";
+- the canonical writer can perform required DML but no schema/table DDL;
+- portfell_app remains read-only;
+- no SQL or test references the historical role as the canonical post-migration
+  role.
 
 ### PR059 — xdl-pr059-xetra-feature-contract
 
-Branch `feat/xdl-pr059-xetra-feature-contract`; commit scope
-`feat(xdl-pr059-xetra-feature-contract): ...`; depends on the current `main`
-including the existing corrected contract work through PR058.
+Branch feat/xdl-pr059-xetra-feature-contract; commit scope
+feat(xdl-pr059-xetra-feature-contract): ...; depends on PR071.
 
-Owned paths: feature catalog/module, feature contract tests, and the relevant
-feature documentation only. No PostgreSQL DDL and no cron changes.
-
-Tasks:
-
-- define the exact identity `(isin, exchange, code, trade_date)`;
-- define the only exposed base levels: `adjusted_close_level` and
-  `volume_level`;
-- define the complete derived-feature catalog and exact formulas:
-  - adjusted-close log returns for 1, 3, 5, 10, and 20 observations;
-  - rolling cumulative returns for 5, 10, and 20 observations;
-  - rolling return means for 5, 10, and 20 observations;
-  - rolling volatility/std for 5, 10, 20, and 40 observations;
-  - high-low range, intraday return, and overnight gap for 1 and 5 observations;
-  - adjusted-close SMA ratios 5/20, 10/20, and 10/40;
-  - adjusted-close RSI for 7 and 14 observations;
-  - adjusted-close ROC for 3, 5, 10, and 20 observations;
-  - adjusted-close drawdown for 20 and 60 observations;
-  - relative volume and volume Z-score for 5, 10, and 20 observations;
-  - daily and 5/10/20 rolling breadth, dispersion, and average correlation;
-- define the formula contract explicitly:
-  - `log_return_n = ln(adjusted_close_level / lag(adjusted_close_level, n))`;
-  - rolling cumulative return is `exp(sum(log_return_1 over window)) - 1`;
-  - rolling return mean is the arithmetic mean of `log_return_1`;
-  - rolling volatility is the catalog-selected sample standard deviation of
-    `log_return_1`;
-  - high-low range is the rolling mean of `(high - low) / close`;
-  - intraday return is the rolling mean of `(close - open) / open`;
-  - overnight gap is the rolling mean of
-    `(open - lag(close, 1)) / lag(close, 1)`;
-  - SMA ratios divide the adjusted-close SMA numerator by the denominator;
-  - RSI uses Wilder smoothing over adjusted-close gains and losses;
-  - ROC is `adjusted_close_level / lag(adjusted_close_level, n) - 1`;
-  - drawdown is `adjusted_close_level / rolling_max(adjusted_close_level, n) - 1`;
-  - relative volume is `volume_level / rolling_mean(volume_level, n)` and
-    volume Z-score is `(volume_level - rolling_mean) / rolling_std`;
-  - breadth is the cross-sectional fraction of positive daily adjusted-close
-    returns, dispersion is their cross-sectional standard deviation, and
-    average correlation is the mean pairwise rolling correlation;
-- define whether each rolling window includes the current observation and use
-  that convention consistently in SQL and independent QA calculations;
-- define null/zero/insufficient-history behavior;
-- define the version and deterministic fingerprint of the catalog;
-- permit raw `open`, `high`, `low`, and `close` only as internal inputs for the
-  three explicitly approved intraday features; reject their exposure as level
-  columns or use in any other feature family;
-- define the exact calculation convention for every window, including
-  population/sample standard deviation, Wilder RSI smoothing, rolling
-  aggregation, and minimum observation count;
-- define that raw `adjusted_close` is renamed to `adjusted_close_level`, never
-  recalculated from another price field.
-
-Acceptance:
-
-- contract tests enumerate every allowed base and derived column;
-- `adjusted_close_level` and `volume_level` are the only base levels;
-- all requested windows and feature families are present exactly once;
-- `open`, `high`, `low`, and unadjusted `close` occur only in the three
-  approved internal intraday-feature definitions and never as level columns;
-- formulas, windows, null rules, and version are deterministic and documented;
-- a fixture with missing history returns `NULL` for the affected feature rather
-  than a partial or forward-filled value;
-- the catalog explicitly marks train-fold-local standardization as a
-  fold-aware downstream operation and forbids global fit statistics;
-- a semantic catalog change changes the feature fingerprint;
-- this PR does not create tables, views, migrations, cron entries, or provider
-  calls.
-
-### PR060 — xdl-pr060-xetra-features-materialized-view
-
-Branch `feat/xdl-pr060-xetra-features-materialized-view`; commit scope
-`feat(xdl-pr060-xetra-features-materialized-view): ...`; depends on PR059.
-
-Owned paths: feature PostgreSQL migration/DDL, view-refresh function if
-needed, view contract integration tests, and feature grants. No ingestion or
-provider changes.
+Owned paths: versioned feature catalog/module, lineage contract, feature
+contract tests, and feature documentation only. No PostgreSQL feature DDL,
+provider calls, or cron changes.
 
 Tasks:
 
-- create exactly `xetra_loader.xetra_features` as a `MATERIALIZED VIEW`;
-- source the view from canonical `xetra_loader.eod_quotes` only;
-- project identity columns, `adjusted_close AS adjusted_close_level`, and
-  `volume AS volume_level`;
-- implement only the PR059 catalog formulas;
-- use raw `open`, `high`, `low`, and `close` only inside the approved
-  high-low-range, intraday-return, and overnight-gap expressions;
-- never expose `open_level`, `high_level`, `low_level`, or `close_level`;
-- keep adjusted-close and volume feature families independent from unadjusted
-  OHLC inputs;
-- add deterministic view version/fingerprint metadata;
-- add the unique identity index required for safe concurrent refresh if that
-  refresh mode is selected;
-- grant `SELECT` to `portfell_app` and the runtime writer, while keeping DDL
-  restricted to the migration/owner role;
-- leave the dedicated `xetra_loader` user grant to PR068 so that its external
-  login/password lifecycle remains separate from feature DDL.
+- encode Sections 0.3–0.6 as the single semantic authority;
+- declare every output column name, source field, window, valid-observation
+  rule, type, null behavior, and relation grain;
+- maintain separate ordered catalogs for xetra_features and
+  xetra_market_features;
+- freeze population standard deviation and the rolling/Cutler RSI convention;
+- freeze MIN_MARKET_INSTRUMENTS=30 as a versioned semantic constant;
+- define deterministic catalog version/fingerprint and source schema/feature
+  versions;
+- forbid global standardization, PCA, feature selection, and lagged tensors.
 
 Acceptance:
 
-- empty-database migration creates the view with the exact expected object
-  type, columns, order, and types;
-- populated migration produces exactly one feature row per quote identity;
-- `adjusted_close_level` equals raw `adjusted_close` and `volume_level` equals
-  raw `volume` for every fixture row;
-- view definition contains no OHLC level output and uses raw OHLC expressions
-  only in the three catalog-approved intraday feature families;
-- all derived columns match the PR059 catalog;
-- all requested windows 1/3/5/10/20/40/60 and 7/14 are represented exactly
-  where specified by the catalog;
-- view refresh is idempotent and does not modify raw tables;
-- `portfell_app` can select the view but cannot insert, update, delete, alter,
-  drop, or refresh it;
-- the `xetra_loader` user grant is not implicit and is verified by PR068;
-- migration is repeatable and does not recreate or truncate the raw tables.
+- tests enumerate every permitted output column exactly once;
+- catalog fingerprints change for every semantic formula/window/source change;
+- all formulas and edge cases in Sections 0.3–0.6 are machine-testable;
+- no OHLC level output exists;
+- the market catalog contains no 1-observation average-correlation feature;
+- no PostgreSQL DDL or training-fit logic is introduced.
 
-### PR061 — xdl-pr061-postgres-row-digest-state
+### PR060 — xdl-pr060-xetra-instrument-features-view
 
-Branch `feat/xdl-pr061-postgres-row-digest-state`; commit scope
-`feat(xdl-pr061-postgres-row-digest-state): ...`; depends on PR059.
+Branch feat/xdl-pr060-xetra-instrument-features-view; commit scope
+feat(xdl-pr060-xetra-instrument-features-view): ...; depends on PR059.
 
-Owned paths: `xetra_loader_sync` row-digest schema, canonical key/digest
-helpers, and focused sync-state tests. No feature SQL and no cron changes.
+Owned paths: instrument feature DDL/migration, indexes, focused integration
+tests, and required owner grants. No market aggregation or sync orchestration.
 
 Tasks:
 
-- add a deterministic row-digest state for listings, quotes, dividends, and
-  splits;
-- use canonical typed business identities, not provider order or fetch time;
-- hash semantic source fields only; exclude `fetched_at_utc`,
-  `published_at_utc`, and run IDs;
-- support quote identity `(isin, exchange, code, trade_date)` and event
-  identity `(isin, exchange, code, event_key)`;
-- preserve the existing dataset-level `sync_state` as the publication
-  checkpoint and add row-level hashes as its reconciliation index;
-- fail closed when hashes exist without compatible sync state or contain
-  duplicate/invalid identities.
+- create exactly xetra_loader.xetra_features as a MATERIALIZED VIEW;
+- produce one row per raw quote identity;
+- project only adjusted_close_level and volume_level as base levels;
+- implement exactly the instrument catalog from PR059;
+- implement valid-observation CTEs so lags ignore unusable source observations;
+- implement the adjusted-open overnight-gap formula exactly;
+- create a unique identity index;
+- do not expose fit statistics or market-wide aggregates.
 
 Acceptance:
 
-- semantically identical rows produce identical hashes independent of field or
-  provider order;
-- changing one semantic field changes exactly one row hash;
-- changing only fetch/publication metadata changes no row hash;
-- quote, listing, dividend, and split identities are collision-safe and
-  round-trip through the persisted schema;
-- duplicate identities, malformed hashes, and orphan hash state fail closed;
-- first synchronization supports a full bootstrap; subsequent identical state
-  produces a zero-change plan;
-- no feature view or raw serving row is mutated by this PR alone.
+- object type, column order/types, identity uniqueness, and formulas match the
+  catalog exactly;
+- missing/invalid history yields NULL rather than partial windows;
+- a split-like discontinuity in raw close/open with a continuous adjusted price
+  does not create a false overnight-gap spike in the adjustment fixture;
+- no unadjusted OHLC field is exposed;
+- migration is repeatable and leaves raw tables untouched.
 
-### PR062 — xdl-pr062-xetra-delta-sync-and-feature-refresh
+### PR061 — xdl-pr061-xetra-market-features-view
 
-Branch `feat/xdl-pr062-xetra-delta-sync-and-feature-refresh`; commit scope
-`feat(xdl-pr062-xetra-delta-sync-and-feature-refresh): ...`; depends on
-PR060+PR061.
+Branch feat/xdl-pr061-xetra-market-features-view; commit scope
+feat(xdl-pr061-xetra-market-features-view): ...; depends on PR060.
 
-Owned paths: PostgreSQL sync integration, row-digest delta planner, refresh
-orchestration, and sync integration tests. No new feature formulas.
+Owned paths: market feature DDL/migration, explicit feature refresh function,
+market-grain integration tests, and source-lineage DDL.
 
 Tasks:
 
-- compare the complete current Gold state against row-digest state;
-- apply only inserts, updates, and deletes to the raw serving tables;
-- update row hashes and dataset sync state in the same transaction as raw
-  mutations;
-- acquire a dataset-scoped lock and preflight the schema before mutation;
-- refresh `xetra_loader.xetra_features` only when quote rows changed in one of
-  its feature inputs: `open`, `high`, `low`, `close`, `adjusted_close`, or
-  `volume`;
-- verify post-write row counts, key sets, hashes, and feature-view identity
-  counts before commit;
-- keep the Gold data lake authoritative and PostgreSQL as a serving replica.
+- create exactly xetra_loader.xetra_market_features as a MATERIALIZED VIEW;
+- source market calculations from xetra_loader.xetra_features;
+- produce exactly one row per trade_date with timestamp_m1;
+- implement exactly the PR059 market catalog and MIN_MARKET_INSTRUMENTS rule;
+- create xetra_loader_sync.feature_sync_state;
+- create an owner-controlled SECURITY DEFINER refresh function with a fixed
+  safe search_path that refreshes xetra_features first and
+  xetra_market_features second using non-concurrent refreshes in the caller's
+  transaction;
+- grant EXECUTE on that function only to the runtime writer and migration/admin
+  roles; do not grant general DDL/MAINTAIN rights to the writer.
 
 Acceptance:
 
-- first run performs a complete bootstrap and creates matching row hashes;
-- one new, revised, and removed quote produces exactly one insert, update, and
-  delete respectively;
-- a listing/dividend/split-only change does not refresh the feature view;
-- an `adjusted_close`, `volume`, `open`, `high`, `low`, or `close` change
-  refreshes the feature view exactly once;
-- unchanged replay produces zero raw mutations, zero hash mutations, zero
-  sync-state advancement, and zero view refreshes;
-- injected failure rolls back raw rows, row hashes, sync state, and view state;
-- stale PostgreSQL rows absent from complete Gold are removed;
-- schema/version/hash mismatch fails before any row mutation;
-- transaction lock contention fails boundedly and leaves the prior state intact.
+- market rows are unique by trade_date and timestamp_m1;
+- cross-sectional results do not depend on current listings.is_active;
+- average correlation exists only for 5/10/20 aligned-date windows;
+- no market statistic is duplicated once per instrument;
+- refresh order is deterministic and rollback-safe;
+- feature_sync_state exists but no consumer grant is added yet;
+- security-definer ownership/search_path tests prevent privilege escalation.
 
-### PR063 — xdl-pr063-qa-xetra-feature-contract-and-schema
+### PR062 — xdl-pr062-feature-refresh-integration
 
-Branch `test/xdl-pr063-qa-xetra-feature-contract-and-schema`; commit scope
-`test(xdl-pr063-qa-xetra-feature-contract-and-schema): ...`; depends on PR060.
+Branch feat/xdl-pr062-feature-refresh-integration; commit scope
+feat(xdl-pr062-feature-refresh-integration): ...; depends on PR061.
 
-Owned paths: feature schema QA tests and sanitized QA report only. No production
-implementation changes.
+Owned paths: quote sync change classification, feature refresh orchestration,
+feature lineage update, and sync integration tests. No new formulas.
 
-Tasks: independently inspect PostgreSQL catalogs and the materialized-view
-definition; validate identity, types, grants, version metadata, and forbidden
-OHLC references.
+Tasks:
+
+- preserve the existing complete-Gold authoritative reconciliation and
+  dataset-level semantic fingerprint as the publication authority;
+- do not add persistent per-row digest state;
+- classify quote inserts/deletes as feature-affecting;
+- classify an update as feature-affecting only when at least one of
+  open/high/low/close/adjusted_close/volume changes;
+- invoke the PR061 explicit refresh function at most once per quote publication
+  transaction when feature inputs changed;
+- update feature_sync_state only after both views have refreshed successfully;
+- leave listing/dividend/split-only publications unable to refresh the feature
+  views unless they also produce a quote semantic change;
+- unchanged complete-Gold replay performs zero raw mutations, zero feature
+  refreshes, and zero feature-lineage advancement.
 
 Acceptance:
 
-- object is exactly `xetra_loader.xetra_features` and is a materialized view;
-- identity and level columns are exactly the PR059 contract;
-- only `adjusted_close_level` and `volume_level` are base levels;
-- no view column exposes `open_level`, `high_level`, `low_level`, or
-  `close_level`;
-- raw OHLC references occur only in the three explicitly approved intraday
-  feature families;
-- all derived columns are present exactly once and in deterministic order;
-- `portfell_app` is SELECT-only;
-- runtime writer has no DDL privilege;
-- the `xetra_loader` user is verified as a separate view-reader role by PR068;
-- report is sanitized and marks `PASS` only when every assertion succeeds.
+- insert/update/delete and no-op fixtures exercise the exact refresh gate;
+- metadata-only changes cannot refresh the views;
+- a failure before, during, or after refresh rolls back the raw quote mutation,
+  both materialized-view states, and feature_sync_state;
+- one successful quote transaction causes no more than one ordered refresh of
+  each feature view;
+- the final lineage row counts/timestamp bounds/digests match the refreshed
+  relations.
+
+### PR063 — xdl-pr063-qa-xetra-feature-schema
+
+Branch test/xdl-pr063-qa-xetra-feature-schema; commit scope
+test(xdl-pr063-qa-xetra-feature-schema): ...; depends on PR062.
+
+Owned paths: independent PostgreSQL catalog/privilege/schema QA and sanitized
+report only.
+
+Acceptance:
+
+- both feature relations have the exact object type, grain, columns, order,
+  types, unique indexes, and source versions from PR059;
+- xetra_features exposes only the two approved base levels;
+- xetra_market_features contains one row per date and no instrument identity;
+- raw OHLC references occur only in the approved instrument expressions;
+- feature_sync_state has exactly the required lineage fields;
+- the refresh function has the intended owner, EXECUTE grants, and safe
+  search_path;
+- no training-fit statistic appears in either materialized view.
 
 ### PR064 — xdl-pr064-qa-xetra-feature-calculations
 
-Branch `test/xdl-pr064-qa-xetra-feature-calculations`; commit scope
-`test(xdl-pr064-qa-xetra-feature-calculations): ...`; depends on PR060.
+Branch test/xdl-pr064-qa-xetra-feature-calculations; commit scope
+test(xdl-pr064-qa-xetra-feature-calculations): ...; depends on PR062.
 
-Owned paths: deterministic calculation fixtures, independent expected-value
-calculator, and calculation QA report only.
-
-Tasks: independently verify every PR059 feature family: log returns, rolling
-cumulative returns, rolling return means, volatility/std, high-low range,
-intraday return, overnight gap, SMA ratios, RSI, ROC, drawdown, relative
-volume, volume Z-score, breadth, dispersion, average correlation, null behavior,
-partitioning, ordering, and no-look-ahead semantics.
+Owned paths: deterministic independent expected-value calculator, fixtures, and
+sanitized calculation report only.
 
 Acceptance:
 
-- expected values are independently calculated rather than copied from the
-  production SQL implementation;
-- adjusted-close return/mean/volatility/SMA/RSI/ROC/drawdown features use only
-  adjusted close values;
-- volume features use only volume values;
-- high-low, intraday-return, and overnight-gap features use the approved raw
-  OHLC inputs and no other OHLC-derived feature does;
-- breadth, dispersion, and average correlation are calculated cross-sectionally
-  from daily adjusted-close returns with the exact daily and 5/10/20 windows;
-- changing an irrelevant source field cannot change a feature, while changing
-  an approved source field changes exactly the dependent feature families;
-- every requested window (1/3/5/10/20/40/60 and RSI 7/14) is tested;
-- insufficient history and invalid log/denominator cases return `NULL`;
-- instrument A cannot affect instrument B;
-- future rows cannot affect an earlier feature row;
-- no global mean/std statistic is used for train-fold standardization;
-- repeated refreshes produce byte/semantic-identical results;
-- calculation report is sanitized and marked `PASS` only on complete success.
+- independently verify every instrument and market formula in PR059;
+- explicitly test valid-observation rather than calendar-day lag semantics;
+- explicitly test ddof=0;
+- explicitly test Cutler RSI edge cases 0/50/100;
+- explicitly test the corporate-action-adjusted overnight gap;
+- explicitly test market membership without current is_active filtering;
+- explicitly test 5/10/20 aligned-date average pairwise correlation and the
+  30-instrument minimum;
+- future rows cannot change an earlier feature;
+- repeated refreshes are semantically identical.
 
-### PR065 — xdl-pr065-qa-xetra-delta-replay-and-rollback
+### PR065 — xdl-pr065-qa-xetra-refresh-replay-rollback
 
-Branch `test/xdl-pr065-qa-xetra-delta-replay-and-rollback`; commit scope
-`test(xdl-pr065-qa-xetra-delta-replay-and-rollback): ...`; depends on PR061+PR062.
+Branch test/xdl-pr065-qa-xetra-refresh-replay-rollback; commit scope
+test(xdl-pr065-qa-xetra-refresh-replay-rollback): ...; depends on PR062.
 
-Owned paths: end-to-end delta/replay/rollback QA fixtures and report only.
-
-Tasks: verify bootstrap, single-row delta, stale-row deletion, unchanged replay,
-hash integrity, transaction rollback, and refresh gating across raw tables and
-`xetra_features`.
+Owned paths: end-to-end refresh/replay/rollback QA and sanitized report only.
 
 Acceptance:
 
-- complete Gold bootstrap reconciles raw tables and row hashes exactly;
-- one adjusted-close change updates only its quote identity and refreshes the
-  feature view;
-- one volume change behaves the same;
-- one open/high/low/close change refreshes the feature view and changes only the
-  approved dependent intraday features;
-- a change outside the feature inputs does not refresh the feature view;
-- deleted Gold rows disappear from PostgreSQL;
-- unchanged replay reports zero mutations and zero refreshes;
-- a failure between raw mutation and view refresh leaves the previous committed
-  state visible;
-- rerun after failure converges to Gold without duplicate rows;
-- QA report includes inserted/updated/deleted/unchanged/refresh counters.
+- one quote insert, delete, adjusted-close change, volume change, and each OHLC
+  change refreshes both views exactly once;
+- metadata-only quote changes and non-quote-only dataset changes do not refresh;
+- unchanged replay reports zero raw mutations and zero refreshes;
+- injected failure at each publication/refresh/lineage boundary preserves the
+  prior committed raw rows, both feature relations, and lineage state;
+- rerun after failure converges without duplicate feature rows.
+
+### PR068 — xdl-pr068-feature-reader-role
+
+Branch chore/xdl-pr068-feature-reader-role; commit scope
+chore(xdl-pr068-feature-reader-role): ...; depends on PR063.
+
+Owned paths: one forward privilege migration, privilege tests, and sanitized
+permission report only.
+
+Tasks:
+
+- create the canonical group role xetra_feature_reader as NOLOGIN;
+- grant USAGE on xetra_loader and SELECT only on xetra_features and
+  xetra_market_features;
+- grant USAGE on xetra_loader_sync and SELECT only on feature_sync_state;
+- grant no SELECT on raw serving tables and no access to other sync relations;
+- grant no INSERT/UPDATE/DELETE/TRUNCATE/DDL/MAINTAIN/refresh privilege;
+- do not create consumer LOGIN roles or passwords; consumer membership is
+  deployment configuration outside this repository;
+- preserve existing portfell_app and writer contracts.
+
+Acceptance:
+
+- SET ROLE xetra_feature_reader can read both feature views and
+  feature_sync_state;
+- it cannot read raw tables or loader_runs/sync_state;
+- it cannot mutate or refresh any object;
+- default privileges do not silently widen future access;
+- no credentials or full DSNs appear in the migration/report.
 
 ### PR066 — xdl-pr066-qa-xetra-cron-and-restart
 
-Branch `test/xdl-pr066-qa-xetra-cron-and-restart`; commit scope
-`test(xdl-pr066-qa-xetra-cron-and-restart): ...`; depends on PR062+PR063+PR065.
+Branch test/xdl-pr066-qa-xetra-cron-and-restart; commit scope
+test(xdl-pr066-qa-xetra-cron-and-restart): ...; depends on PR062+PR063+PR065+PR068.
 
 Owned paths: cron/restart QA tests and operational report only.
 
-Tasks: verify the deployed Sunday schedule, guarded weekly runner, lock,
-checkpoint rehydration, incremental source requests, feature refresh ordering,
-and absence of destructive bootstrap from the scheduled path.
-
 Acceptance:
 
-- cron is exactly `CRON_TZ=Europe/Vienna` plus `0 8 * * 0`;
-- cron invokes the restart-safe weekly runner, not destructive bootstrap;
-- two concurrent invocations cannot run publication simultaneously;
-- process death at every persisted stage boundary resumes successfully;
-- an unchanged weekly run uses delta/overlap requests and not a full provider
-  download for already known data;
-- a quote input change refreshes `xetra_features` after raw publication;
-- an unchanged run does not refresh the view;
+- cron remains exactly CRON_TZ=Europe/Vienna plus 0 8 * * 0;
+- cron invokes the restart-safe weekly runner, never destructive bootstrap;
+- concurrent invocations cannot publish simultaneously;
+- restart at persisted stage boundaries converges;
+- quote feature-input changes refresh instrument then market views after raw
+  publication;
+- unchanged runs do not refresh;
 - failed Gold construction prevents PostgreSQL publication;
-- failed PostgreSQL publication does not invalidate committed Gold;
-- operational logs contain no provider token, password, full DSN, or raw secret;
-- QA report records cron expression, stage order, restart result, request mode,
-  and feature-refresh result.
+- operational logs contain no token, password, full DSN, or raw secret.
 
 ### PR067 — xdl-pr067-qa-xetra-features-complete-run
 
-Branch `chore/xdl-pr067-qa-xetra-features-complete-run`; commit scope
-`chore(xdl-pr067-qa-xetra-features-complete-run): ...`; depends on PR063+PR064+PR065+PR066.
+Branch chore/xdl-pr067-qa-xetra-features-complete-run; commit scope
+chore(xdl-pr067-qa-xetra-features-complete-run): ...; depends on
+PR063+PR064+PR065+PR066+PR068.
 
-Owned paths: final full-run acceptance command, independent verifier, sanitized
-acceptance artifact, and completion documentation only.
-
-Tasks: execute a complete isolated XETRA run from Gold publication through raw
-PostgreSQL synchronization, materialized-view refresh, verification, and the
-scheduled runner path; do not introduce new business semantics.
+Owned paths: final real-target acceptance command, independent verifier,
+sanitized artifact, and completion documentation only.
 
 Acceptance:
 
-- full listing, quote, dividend, and split Gold datasets are committed and
-  validated before PostgreSQL publication;
-- raw PostgreSQL counts and business keys exactly match Gold;
-- row hashes and dataset sync state exactly match Gold;
-- `xetra_loader.xetra_features` contains exactly the expected instrument/date
-  identities;
-- only `adjusted_close_level`, `volume_level`, and catalog-approved derived
-  features are exposed;
-- no `open_level`, `high_level`, `low_level`, or `close_level` is exposed;
-- all requested OHLC-derived features are limited to high-low range,
-  intraday return, and overnight gap;
-- independent calculation checks pass for representative short and long
-  histories;
-- all requested transformation families and windows are present and match the
-  independent expected-value calculator;
-- cron contract and restart-safe weekly runner checks pass;
-- immediate unchanged complete replay produces zero raw mutations, zero hash
-  mutations, zero feature refreshes, and zero semantic changes;
-- permissions pass for `xetra-data-loader` and `portfell_app`;
-- all timestamps and sessions satisfy the repository UTC contract;
-- the sanitized acceptance artifact is `PASS` and contains no credentials,
-  tokens, full DSNs, or raw provider payloads;
-- all repository quality checks and `merge-gate` pass on the same head SHA;
-- this PR may declare the complete-run core green, but the feature-serving
-  program remains incomplete until PR069 passes.
+- execute one complete real-target run from validated Gold through raw
+  reconciliation, ordered feature refresh, lineage update, and unchanged replay;
+- raw PostgreSQL remains exact to Gold;
+- both feature relations match their independent schema/math verifiers;
+- feature_sync_state exactly identifies the materialized source build;
+- xetra_feature_reader passes positive and negative permission probes;
+- the complete-run artifact records row counts, date bounds, source versions,
+  feature fingerprints, and refresh durations without secrets/raw payloads;
+- immediate unchanged replay produces zero raw mutations, zero feature
+  refreshes, and zero lineage changes;
+- all repository quality checks and merge-gate pass on the same head SHA;
+- only after this PR passes is the XETRA feature-serving extension complete.
 
-### PR068 — xdl-pr068-xetra-loader-feature-view-read-grant
+### Removed work order: PR069 — train-fold-local-standardization
 
-Branch `chore/xdl-pr068-xetra-loader-feature-view-read-grant`; commit scope
-`chore(xdl-pr068-xetra-loader-feature-view-read-grant): ...`; depends on PR060+PR063+PR067.
+PR069 is intentionally deleted from the active xetra-loader program.
 
-Owned paths: one forward PostgreSQL privilege migration, privilege integration
-tests, and sanitized permission acceptance output only. No password, DSN,
-provider, feature formula, raw-table, or cron changes.
-
-Tasks:
-
-- require the externally provisioned PostgreSQL user/role `xetra_loader` to
-  exist without creating or changing its password;
-- grant `USAGE` on schema `xetra_loader` to the quoted role `xetra_loader`;
-- grant `SELECT` on exactly `xetra_loader.xetra_features`;
-- explicitly revoke mutation, refresh, DDL, and sync-schema privileges from
-  `xetra_loader`;
-- keep `portfell_app`, `xetra-data-loader`, and the runtime writer grants
-  unchanged;
-- make the migration idempotent and fail closed with a sanitized diagnostic if
-  the externally managed user does not exist.
-
-Acceptance:
-
-- a real connection as `xetra_loader` can execute `SELECT` against
-  `xetra_loader.xetra_features`;
-- the same user cannot `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER`,
-  `DROP`, or execute a materialized-view refresh;
-- the same user cannot read, write, or use the `xetra_loader_sync` schema;
-- the user cannot access passwords, full DSNs, provider tokens, or migration
-  secrets through errors or reports;
-- `portfell_app` remains SELECT-only and the loader writer retains its required
-  publication rights;
-- migration is repeatable and grants no privilege on any other raw table unless
-  that privilege already existed in the prior role contract;
-- a missing externally provisioned `xetra_loader` role fails before any grant
-  or data mutation and produces a sanitized actionable error;
-- privilege QA is executed in real PostgreSQL CI and is included in this PR's
-  permission acceptance artifact.
-
-### PR069 — xdl-pr069-train-fold-local-standardization
-
-Branch `feat/xdl-pr069-train-fold-local-standardization`; commit scope
-`feat(xdl-pr069-train-fold-local-standardization): ...`; depends on PR064+PR067+PR068.
-
-Owned paths: fold-aware feature-standardization query/API, training-fold
-contract, leakage tests, and sanitized QA output only. No changes to raw Gold
-semantics, provider downloads, cron, or PostgreSQL user passwords.
-
-Tasks:
-
-- consume the approved derived columns from `xetra_loader.xetra_features`;
-- require an explicit train-fold definition with train, validation, and test
-  boundaries or row membership;
-- fit each standardization mean and standard deviation on training rows only;
-- apply the fitted training statistics to validation and test rows without
-  refitting;
-- return `NULL` for a zero training standard deviation rather than fabricate a
-  standardized value;
-- keep fold-local statistics out of the global `xetra_features` materialized
-  view and out of Gold fingerprints;
-- expose the fold-aware operation through a deterministic SQL query/function
-  or equivalent documented training adapter, so consumers cannot accidentally
-  perform global standardization.
-
-Acceptance:
-
-- a training fold produces statistics using training rows only;
-- changing a validation or test value cannot change fitted training mean/std;
-- changing a training value changes the applied validation/test standardization
-  deterministically;
-- no future observation or validation/test row participates in fitting;
-- all catalog-approved derived feature families can be standardized through
-  the fold-aware path;
-- zero-variance training features return `NULL` and are reported;
-- repeated execution with the same fold and source fingerprint is identical;
-- the global `xetra_loader.xetra_features` view contains no fit statistics or
-  fold-dependent values;
-- a leakage probe fails the QA gate if any non-training row influences the
-  fitted statistics;
-- the sanitized report is `PASS` and contains no credentials or raw payloads;
-- PR067's complete-run acceptance is not considered final until PR069 passes.
+Reason: train-fold means/standard deviations are learned model parameters.
+Keeping them in xetra-loader would couple the data publication layer to
+regime-engine fold definitions and create an avoidable leakage boundary.
+regime-engine must fit z-score statistics on training rows only, apply those
+frozen statistics to validation/test rows, and create any lagged state tensor
+after that transformation.
 
 ## 1. Status authority
 
@@ -588,7 +636,7 @@ Frozen rules:
 - exact scheduler: `CRON_TZ=Europe/Vienna` and `0 8 * * 0`;
 - passwords, provider tokens, and full DSNs are never committed;
 - Portfell code, analytics, UI, users/tenants/projects, and authorization do not belong here;
-- the project is not complete until a real full XETRA bootstrap has been completely synchronized to PostgreSQL `10.10.1.3:54321` and independently verified by XDL-PR033.
+- the corrected loader core was completed by XDL-PR053's real-target V2 verification; the additive feature-serving extension is complete only after the active PR059–PR068/PR071 program above passes its final PR067 gate.
 
 ## 3. Git / branch / weak-agent contract
 
@@ -1425,6 +1473,4 @@ existing backlog and is intentionally not inferred here.
 | PR057 | follow-up: action replay key deduplication | Deduplication of corporate-action replay keys | merged per existing status note |
 | PR058 | follow-up: weekly invalid-OHLC quarantine | Weekly quarantine of invalid OHLC records | merged per existing status note |
 
-The new XDL-PR059–XDL-PR069 work orders are not included in this historical
-summary; they are defined at the beginning of this file and form the active
-XETRA feature-serving program.
+The active feature-serving work orders are defined at the beginning of this file. PR069 has been removed as a consumer-training concern; PR070 is the planning audit gate and PR071 is the role-name reconciliation prerequisite.
