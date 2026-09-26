@@ -167,6 +167,6 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
         report_path = tmp_path / "xdl-pr064-feature-calculations.json"
         _write_report(report_path, checks)
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        assert report["status"] == "PASS"
+        assert report["status"] == "PASS", report
     finally:
         connection.close()
