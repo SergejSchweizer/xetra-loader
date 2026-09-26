@@ -1,0 +1,12 @@
+{
+  "feature_column_count": 51,
+  "gold_rows": {
+    "dividends": 2,
+    "eod_quotes": 130,
+    "listings": 2,
+    "splits": 2
+  },
+  "secrets_included": false,
+  "status": "PASS",
+  "work_order": "xdl-pr067-qa-xetra-features-complete-run"
+}

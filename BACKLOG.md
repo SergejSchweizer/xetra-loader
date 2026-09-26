@@ -441,9 +441,10 @@ Branch `test/xdl-pr066-qa-xetra-cron-and-restart`; commit scope
 
 Owned paths: cron/restart QA tests and operational report only.
 
-Status: implementation in progress; PR merge pending.
-Git status at completion: to be recorded after the PR is merged; the existing
-untracked `artifacts/cron/xdl-weekly.log` is preserved.
+Status: merged in origin/main via PR #70 (`9941f81`); cron/restart QA,
+PostgreSQL integration, Ruff, Mypy, policy, push-gate, and merge-gate passed.
+Git status at completion: PR-owned QA test and backlog update plus the existing
+untracked `artifacts/cron/xdl-weekly.log`.
 
 Tasks: verify the deployed Sunday schedule, guarded weekly runner, lock,
 checkpoint rehydration, incremental source requests, feature refresh ordering,
@@ -472,6 +473,10 @@ Branch `chore/xdl-pr067-qa-xetra-features-complete-run`; commit scope
 
 Owned paths: final full-run acceptance command, independent verifier, sanitized
 acceptance artifact, and completion documentation only.
+
+Status: implementation in progress; PR merge pending.
+Git status at completion: to be recorded after the PR is merged; the existing
+untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
 Tasks: execute a complete isolated XETRA run from Gold publication through raw
 PostgreSQL synchronization, materialized-view refresh, verification, and the
