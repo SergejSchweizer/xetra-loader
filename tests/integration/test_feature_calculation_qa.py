@@ -32,33 +32,34 @@ def _apply_sql(path: str) -> None:
 def _insert_fixture(connection: Connection[Any], rows: tuple[FixtureQuote, ...]) -> None:
     connection.execute("TRUNCATE xetra_loader.listings CASCADE")
     listings = tuple(sorted({(row.isin, row.code) for row in rows}))
-    connection.executemany(
-        "INSERT INTO xetra_loader.listings "
-        "(isin, exchange, code, fetched_at_utc, published_at_utc) "
-        "VALUES (%s, 'XETRA', %s, now(), now())",
-        [(isin, code) for isin, code in listings],
-    )
-    connection.executemany(
-        "INSERT INTO xetra_loader.eod_quotes "
-        "(isin, exchange, code, trade_date, timestamp_eod, open, high, low, close, "
-        "adjusted_close, volume, fetched_at_utc, published_at_utc) "
-        "VALUES (%s, 'XETRA', %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())",
-        [
-            (
-                row.isin,
-                row.code,
-                row.trade_date,
-                datetime.combine(row.trade_date, time.min, tzinfo=UTC),
-                row.open,
-                row.high,
-                row.low,
-                row.close,
-                row.adjusted_close,
-                row.volume,
-            )
-            for row in rows
-        ],
-    )
+    with connection.cursor() as cursor:
+        cursor.executemany(
+            "INSERT INTO xetra_loader.listings "
+            "(isin, exchange, code, fetched_at_utc, published_at_utc) "
+            "VALUES (%s, 'XETRA', %s, now(), now())",
+            [(isin, code) for isin, code in listings],
+        )
+        cursor.executemany(
+            "INSERT INTO xetra_loader.eod_quotes "
+            "(isin, exchange, code, trade_date, timestamp_eod, open, high, low, close, "
+            "adjusted_close, volume, fetched_at_utc, published_at_utc) "
+            "VALUES (%s, 'XETRA', %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())",
+            [
+                (
+                    row.isin,
+                    row.code,
+                    row.trade_date,
+                    datetime.combine(row.trade_date, time.min, tzinfo=UTC),
+                    row.open,
+                    row.high,
+                    row.low,
+                    row.close,
+                    row.adjusted_close,
+                    row.volume,
+                )
+                for row in rows
+            ],
+        )
 
 
 def _feature_rows(connection: Connection[Any]) -> dict[tuple[str, object], dict[str, object]]:
