@@ -408,9 +408,11 @@ Branch `test/xdl-pr065-qa-xetra-delta-replay-and-rollback`; commit scope
 
 Owned paths: end-to-end delta/replay/rollback QA fixtures and report only.
 
-Status: implementation in progress; PR merge pending.
-Git status at completion: to be recorded after the PR is merged; the existing
-untracked `artifacts/cron/xdl-weekly.log` is preserved.
+Status: merged in origin/main via PR #69 (`9606182`); delta/replay/rollback
+QA, PostgreSQL integration, Ruff, Mypy, policy, push-gate, and merge-gate
+passed.
+Git status at completion: PR-owned QA test files plus the existing untracked
+`artifacts/cron/xdl-weekly.log`.
 
 Tasks: verify bootstrap, single-row delta, stale-row deletion, unchanged replay,
 hash integrity, transaction rollback, and refresh gating across raw tables and
@@ -438,6 +440,10 @@ Branch `test/xdl-pr066-qa-xetra-cron-and-restart`; commit scope
 `test(xdl-pr066-qa-xetra-cron-and-restart): ...`; depends on PR062+PR063+PR065.
 
 Owned paths: cron/restart QA tests and operational report only.
+
+Status: implementation in progress; PR merge pending.
+Git status at completion: to be recorded after the PR is merged; the existing
+untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
 Tasks: verify the deployed Sunday schedule, guarded weekly runner, lock,
 checkpoint rehydration, incremental source requests, feature refresh ordering,
