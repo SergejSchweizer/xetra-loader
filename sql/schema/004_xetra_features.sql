@@ -137,12 +137,12 @@ WITH RECURSIVE ordered AS (
     GROUP BY trade_date
 ), cross_rolling AS (
     SELECT d.*,
-        avg(breadth_daily) OVER w5 AS breadth_5,
-        avg(breadth_daily) OVER w10 AS breadth_10,
-        avg(breadth_daily) OVER w20 AS breadth_20,
-        avg(dispersion_daily) OVER w5 AS dispersion_5,
-        avg(dispersion_daily) OVER w10 AS dispersion_10,
-        avg(dispersion_daily) OVER w20 AS dispersion_20
+        CASE WHEN count(breadth_daily) OVER w5 = 5 THEN avg(breadth_daily) OVER w5 END AS breadth_5,
+        CASE WHEN count(breadth_daily) OVER w10 = 10 THEN avg(breadth_daily) OVER w10 END AS breadth_10,
+        CASE WHEN count(breadth_daily) OVER w20 = 20 THEN avg(breadth_daily) OVER w20 END AS breadth_20,
+        CASE WHEN count(dispersion_daily) OVER w5 = 5 THEN avg(dispersion_daily) OVER w5 END AS dispersion_5,
+        CASE WHEN count(dispersion_daily) OVER w10 = 10 THEN avg(dispersion_daily) OVER w10 END AS dispersion_10,
+        CASE WHEN count(dispersion_daily) OVER w20 = 20 THEN avg(dispersion_daily) OVER w20 END AS dispersion_20
     FROM daily_cross AS d
     WINDOW
         w5 AS (ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),

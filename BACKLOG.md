@@ -363,7 +363,8 @@ Branch `test/xdl-pr064-qa-xetra-feature-calculations`; commit scope
 `test(xdl-pr064-qa-xetra-feature-calculations): ...`; depends on PR060.
 
 Owned paths: deterministic calculation fixtures, independent expected-value
-calculator, and calculation QA report only.
+calculator, calculation QA report, and minimal SQL corrections required by
+the independent contract checks. No new feature families are introduced.
 
 Status: implementation in progress; PR merge pending.
 Git status at completion: to be recorded after the PR is merged; the existing
