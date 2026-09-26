@@ -366,7 +366,11 @@ Owned paths: deterministic calculation fixtures, independent expected-value
 calculator, calculation QA report, and minimal SQL corrections required by
 the independent contract checks. No new feature families are introduced.
 
-Status: implementation in progress; PR merge pending.
+Status: merged in origin/main via PR #68 (`c218749`); independent calculation
+QA, PostgreSQL integration, Ruff, Mypy, policy, push-gate, and merge-gate
+passed, including the required SQL minimum-window corrections.
+Git status at completion: PR-owned QA/reference/SQL files plus the existing
+untracked `artifacts/cron/xdl-weekly.log`.
 Git status at completion: to be recorded after the PR is merged; the existing
 untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
@@ -403,6 +407,10 @@ Branch `test/xdl-pr065-qa-xetra-delta-replay-and-rollback`; commit scope
 `test(xdl-pr065-qa-xetra-delta-replay-and-rollback): ...`; depends on PR061+PR062.
 
 Owned paths: end-to-end delta/replay/rollback QA fixtures and report only.
+
+Status: implementation in progress; PR merge pending.
+Git status at completion: to be recorded after the PR is merged; the existing
+untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
 Tasks: verify bootstrap, single-row delta, stale-row deletion, unchanged replay,
 hash integrity, transaction rollback, and refresh gating across raw tables and
