@@ -137,12 +137,12 @@ WITH RECURSIVE ordered AS (
     GROUP BY trade_date
 ), cross_rolling AS (
     SELECT d.*,
-        avg(breadth_daily) OVER w5 AS breadth_5,
-        avg(breadth_daily) OVER w10 AS breadth_10,
-        avg(breadth_daily) OVER w20 AS breadth_20,
-        avg(dispersion_daily) OVER w5 AS dispersion_5,
-        avg(dispersion_daily) OVER w10 AS dispersion_10,
-        avg(dispersion_daily) OVER w20 AS dispersion_20
+        CASE WHEN count(breadth_daily) OVER w5 = 5 THEN avg(breadth_daily) OVER w5 END AS breadth_5,
+        CASE WHEN count(breadth_daily) OVER w10 = 10 THEN avg(breadth_daily) OVER w10 END AS breadth_10,
+        CASE WHEN count(breadth_daily) OVER w20 = 20 THEN avg(breadth_daily) OVER w20 END AS breadth_20,
+        CASE WHEN count(dispersion_daily) OVER w5 = 5 THEN avg(dispersion_daily) OVER w5 END AS dispersion_5,
+        CASE WHEN count(dispersion_daily) OVER w10 = 10 THEN avg(dispersion_daily) OVER w10 END AS dispersion_10,
+        CASE WHEN count(dispersion_daily) OVER w20 = 20 THEN avg(dispersion_daily) OVER w20 END AS dispersion_20
     FROM daily_cross AS d
     WINDOW
         w5 AS (ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
@@ -158,9 +158,9 @@ WITH RECURSIVE ordered AS (
     WHERE a.log_return_1 IS NOT NULL AND b.log_return_1 IS NOT NULL
 ), pair_corr AS (
     SELECT p.*,
-        corr(return_a, return_b) OVER w5 AS corr_5,
-        corr(return_a, return_b) OVER w10 AS corr_10,
-        corr(return_a, return_b) OVER w20 AS corr_20
+        CASE WHEN count(return_a) OVER w5 = 5 THEN corr(return_a, return_b) OVER w5 END AS corr_5,
+        CASE WHEN count(return_a) OVER w10 = 10 THEN corr(return_a, return_b) OVER w10 END AS corr_10,
+        CASE WHEN count(return_a) OVER w20 = 20 THEN corr(return_a, return_b) OVER w20 END AS corr_20
     FROM pair_rows AS p
     WINDOW
         w5 AS (PARTITION BY isin_a, exchange_a, code_a, isin_b, exchange_b, code_b ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),

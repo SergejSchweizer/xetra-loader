@@ -333,9 +333,10 @@ Branch `test/xdl-pr063-qa-xetra-feature-contract-and-schema`; commit scope
 Owned paths: feature schema QA tests and sanitized QA report only. No production
 implementation changes.
 
-Status: implementation in progress; PR merge pending.
-Git status at completion: to be recorded after the PR is merged; the existing
-untracked `artifacts/cron/xdl-weekly.log` is preserved.
+Status: merged in origin/main via PR #67 (`4af0637`); static and PostgreSQL
+schema-QA checks, Ruff, Mypy, policy, push-gate, and merge-gate passed.
+Git status at completion: PR-owned QA test files plus the existing untracked
+`artifacts/cron/xdl-weekly.log`.
 
 Tasks: independently inspect PostgreSQL catalogs and the materialized-view
 definition; validate identity, types, grants, version metadata, and forbidden
@@ -362,7 +363,12 @@ Branch `test/xdl-pr064-qa-xetra-feature-calculations`; commit scope
 `test(xdl-pr064-qa-xetra-feature-calculations): ...`; depends on PR060.
 
 Owned paths: deterministic calculation fixtures, independent expected-value
-calculator, and calculation QA report only.
+calculator, calculation QA report, and minimal SQL corrections required by
+the independent contract checks. No new feature families are introduced.
+
+Status: implementation in progress; PR merge pending.
+Git status at completion: to be recorded after the PR is merged; the existing
+untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
 Tasks: independently verify every PR059 feature family: log returns, rolling
 cumulative returns, rolling return means, volatility/std, high-low range,
