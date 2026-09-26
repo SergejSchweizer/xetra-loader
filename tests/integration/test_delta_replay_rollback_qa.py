@@ -7,12 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from psycopg import Connection
-from psycopg.errors import LockNotAvailable, QueryCanceled
+from psycopg import Connection, Cursor
 
 from xetra_loader.contracts.quotes import QuoteRecord
 from xetra_loader.gold.quotes import build_quote_gold
-from xetra_loader.sync import connect_postgres, digest_map, row_digests
+from xetra_loader.sync import SyncCounters, connect_postgres, digest_map, row_digests, run_sync
 from xetra_loader.sync.quotes import sync_quotes
 
 DSN = os.getenv("XDL_TEST_POSTGRES_DSN")
@@ -105,7 +104,6 @@ def test_delta_replay_and_rollback_converge_without_stale_state(tmp_path: Path) 
     _apply_sql("sql/sync/001_xetra_loader_sync.sql")
     _apply_sql("sql/schema/004_xetra_features.sql")
     connection = connect_postgres(DSN)
-    blocker: Connection[Any] | None = None
     counters = {"inserted": 0, "updated": 0, "deleted": 0, "unchanged": 0, "refreshes": 0}
     try:
         with connection.transaction():
@@ -209,22 +207,25 @@ def test_delta_replay_and_rollback_converge_without_stale_state(tmp_path: Path) 
         failed_target = _gold(raw_variants[-1], _quote(23, "12", high="13"))
         prior_hashes = _row_hashes(connection)
         prior_marker = _view_marker(connection)
-        blocker = connect_postgres(DSN)
-        blocker.execute("SELECT count(*) FROM xetra_loader.xetra_features")
-        connection.execute("SET statement_timeout = '2s'")
-        connection.commit()
-        with pytest.raises((LockNotAvailable, QueryCanceled)):
-            sync_quotes(
-                connection, failed_target, run_id="delta-rollback", published_at_utc=published
+
+        def fail_after_raw_mutation(cursor: Cursor[Any]) -> SyncCounters:
+            cursor.execute(
+                "DELETE FROM xetra_loader.eod_quotes WHERE code = 'AAA' "
+                "AND trade_date = '2026-08-21'"
             )
-        connection.execute("SET statement_timeout = '0'")
-        connection.commit()
+            raise RuntimeError("injected failure between raw mutation and refresh")
+
+        with pytest.raises(RuntimeError, match="between raw mutation and refresh"):
+            run_sync(
+                connection,
+                dataset="eod_quotes",
+                semantic_rows=failed_target.semantic_rows(),
+                mutate=fail_after_raw_mutation,
+                run_id="delta-rollback",
+            )
         assert connection.execute("SELECT count(*) FROM xetra_loader.eod_quotes").fetchone() == (1,)
         assert _row_hashes(connection) == prior_hashes
         assert _view_marker(connection) == prior_marker
-        blocker.rollback()
-        blocker.close()
-        blocker = None
 
         recovered = sync_quotes(
             connection, failed_target, run_id="delta-recover", published_at_utc=published
@@ -252,7 +253,4 @@ def test_delta_replay_and_rollback_converge_without_stale_state(tmp_path: Path) 
         report = json.loads(report_path.read_text(encoding="utf-8"))
         assert report["status"] == "PASS"
     finally:
-        if blocker is not None:
-            blocker.rollback()
-            blocker.close()
         connection.close()
