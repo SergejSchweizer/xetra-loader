@@ -140,7 +140,7 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
         no_lookahead = after_adjusted_close[stable_identity] == stable_before
 
         connection.execute(
-            "UPDATE xetra_loader.eod_quotes SET timestamp_eod = timestamp_eod "
+            "UPDATE xetra_loader.eod_quotes SET published_at_utc = published_at_utc "
             "+ interval '1 second' WHERE code = %s AND trade_date = %s",
             (latest.code, latest.trade_date),
         )
