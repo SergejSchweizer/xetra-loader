@@ -1,0 +1,7 @@
+{
+  "relation": "xetra_loader.xetra_features",
+  "role": "xetra_loader",
+  "secrets_included": false,
+  "status": "PASS",
+  "work_order": "xdl-pr068-xetra-loader-feature-view-read-grant"
+}
