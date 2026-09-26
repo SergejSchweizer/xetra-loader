@@ -206,7 +206,7 @@ def test_delta_replay_and_rollback_converge_without_stale_state(tmp_path: Path) 
         assert _view_marker(connection) != before_delete
         assert connection.execute("SELECT count(*) FROM xetra_loader.eod_quotes").fetchone() == (1,)
 
-        failed_target = _gold(raw_variants[-1], _quote(23, "12"))
+        failed_target = _gold(raw_variants[-1], _quote(23, "12", high="13"))
         prior_hashes = _row_hashes(connection)
         prior_marker = _view_marker(connection)
         blocker = connect_postgres(DSN)
