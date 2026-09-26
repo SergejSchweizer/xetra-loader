@@ -69,6 +69,7 @@ def _copy_desired_quotes(
 ) -> None:
     """Stage the complete desired quote state once for set-based reconciliation."""
 
+    cursor.execute("DROP TABLE IF EXISTS xdl_desired_eod_quotes")
     cursor.execute(_CREATE_DESIRED_QUOTES)
     with cursor.copy(_COPY_DESIRED_QUOTES) as copy:
         for row in gold.rows:

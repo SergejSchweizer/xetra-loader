@@ -48,6 +48,7 @@ def test_quote_sync_initial_replay_correction_and_new_date() -> None:
     _apply_sql("sql/schema/001_xetra_loader.sql")
     _apply_sql("sql/schema/002_roles.sql")
     _apply_sql("sql/sync/001_xetra_loader_sync.sql")
+    _apply_sql("sql/schema/004_xetra_features.sql")
     connection = connect_postgres(DSN)
     try:
         with connection.transaction():
@@ -57,6 +58,9 @@ def test_quote_sync_initial_replay_correction_and_new_date() -> None:
             )
             connection.execute(
                 "DELETE FROM xetra_loader_sync.sync_state WHERE dataset = 'eod_quotes'"
+            )
+            connection.execute(
+                "DELETE FROM xetra_loader_sync.row_hashes WHERE dataset = 'eod_quotes'"
             )
             connection.execute(
                 "INSERT INTO xetra_loader.listings "
@@ -73,6 +77,14 @@ def test_quote_sync_initial_replay_correction_and_new_date() -> None:
             published_at_utc=published,
         )
         assert first.counters.inserted == 1
+        assert connection.execute(
+            "SELECT count(*) FROM xetra_loader_sync.row_hashes "
+            "WHERE dataset = 'eod_quotes'"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT adjusted_close_level, volume_level "
+            "FROM xetra_loader.xetra_features"
+        ).fetchone() == (Decimal("10"), 100)
         replay = sync_quotes(
             connection,
             initial_gold,
@@ -80,6 +92,9 @@ def test_quote_sync_initial_replay_correction_and_new_date() -> None:
             published_at_utc=published,
         )
         assert replay.counters.total_mutations == 0
+        assert connection.execute(
+            "SELECT count(*) FROM xetra_loader.xetra_features"
+        ).fetchone() == (1,)
 
         correction = sync_quotes(
             connection,
@@ -88,6 +103,9 @@ def test_quote_sync_initial_replay_correction_and_new_date() -> None:
             published_at_utc=published,
         )
         assert correction.counters.updated == 1
+        assert connection.execute(
+            "SELECT adjusted_close_level FROM xetra_loader.xetra_features"
+        ).fetchone() == (Decimal("10.5"),)
 
         extended = sync_quotes(
             connection,
@@ -108,5 +126,8 @@ def test_quote_sync_initial_replay_correction_and_new_date() -> None:
         )
         assert removed.counters.deleted == 1
         assert connection.execute("SELECT count(*) FROM xetra_loader.eod_quotes").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT count(*) FROM xetra_loader.xetra_features"
+        ).fetchone() == (1,)
     finally:
         connection.close()

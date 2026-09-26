@@ -42,6 +42,9 @@ def test_listing_sync_initial_replay_and_one_update() -> None:
             connection.execute(
                 "DELETE FROM xetra_loader_sync.sync_state WHERE dataset = 'listings'"
             )
+            connection.execute(
+                "DELETE FROM xetra_loader_sync.row_hashes WHERE dataset = 'listings'"
+            )
 
         published = datetime(2026, 8, 22, 20, 0, tzinfo=UTC)
         first_gold = build_listing_gold(

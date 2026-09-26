@@ -244,8 +244,9 @@ Acceptance:
 Branch `feat/xdl-pr061-postgres-row-digest-state`; commit scope
 `feat(xdl-pr061-postgres-row-digest-state): ...`; depends on PR059.
 
-Status: implementation complete; 5 focused digest tests, Ruff, Mypy, and
-schema contract checks pass; PR merge pending.
+Status: merged in origin/main via PR #65
+(`b678c6224e2b22ae8a15015b4fb8b2c0ca5af081`); 5 focused digest tests, Ruff,
+Mypy, and schema contract checks passed.
 Git status at completion: PR-owned sync/source/test files plus the existing
 untracked `artifacts/cron/xdl-weekly.log`.
 
@@ -285,8 +286,15 @@ Branch `feat/xdl-pr062-xetra-delta-sync-and-feature-refresh`; commit scope
 `feat(xdl-pr062-xetra-delta-sync-and-feature-refresh): ...`; depends on
 PR060+PR061.
 
+Status: implementation complete; unit, Ruff, Mypy, and diff gates pass;
+PostgreSQL integration is pending CI because no local test DSN is configured.
+PR merge pending.
+Git status at completion: PR-owned sync/integration-test files plus the
+existing untracked `artifacts/cron/xdl-weekly.log`.
+
 Owned paths: PostgreSQL sync integration, row-digest delta planner, refresh
-orchestration, and sync integration tests. No new feature formulas.
+orchestration, required feature-refresh ownership migration, and sync
+integration tests. No new feature formulas.
 
 Tasks:
 
