@@ -19,6 +19,13 @@ type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, J
 type SemanticRow = Mapping[str, JSONValue]
 type Mutator = Callable[[Cursor[Any]], "SyncCounters"]
 
+_DATASET_TABLES: dict[str, str] = {
+    "listings": "listings",
+    "eod_quotes": "eod_quotes",
+    "dividends": "dividends",
+    "splits": "splits",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class SyncCounters:
@@ -100,13 +107,27 @@ def run_sync(
 
     if not dataset.strip():
         raise ValueError("dataset must be non-empty")
-    fingerprint, row_count = semantic_fingerprint(semantic_rows)
+    materialized_rows = tuple(semantic_rows)
+    fingerprint, row_count = semantic_fingerprint(materialized_rows)
+    from xetra_loader.sync.row_digests import DATASET_KEY_FIELDS, digest_map, row_digests
+
+    source_digests = (
+        digest_map(row_digests(dataset, materialized_rows))
+        if dataset in DATASET_KEY_FIELDS
+        else {}
+    )
     resolved_run_id = run_id or str(uuid4())
     clock = now or (lambda: datetime.now(UTC))
     started_at = _require_utc(clock())
 
     with connection.transaction(), connection.cursor() as cursor:
         cursor.execute("SET LOCAL TIME ZONE 'UTC'")
+        cursor.execute("SET LOCAL lock_timeout = '5s'")
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (dataset,),
+        )
+        _preflight(cursor, dataset)
         cursor.execute(
             "SELECT semantic_fingerprint, row_count "
             "FROM xetra_loader_sync.sync_state WHERE dataset = %s FOR UPDATE",
@@ -114,10 +135,33 @@ def run_sync(
         )
         raw_state = cursor.fetchone()
         state = cast(tuple[str, int] | None, raw_state)
-        is_noop = state is not None and state[0] == fingerprint and state[1] == row_count
+        cursor.execute(
+            "SELECT entity_key, row_sha256 "
+            "FROM xetra_loader_sync.row_hashes WHERE dataset = %s FOR UPDATE",
+            (dataset,),
+        )
+        persisted_digests = {
+            str(entity_key): str(row_sha256)
+            for entity_key, row_sha256 in cursor.fetchall()
+        }
+        if state is None and persisted_digests:
+            raise RuntimeError(
+                f"digest state exists without sync state for dataset {dataset!r}"
+            )
+        is_noop = (
+            state is not None
+            and state[0] == fingerprint
+            and state[1] == row_count
+            and persisted_digests == source_digests
+        )
 
         counters = SyncCounters() if is_noop else mutate(cursor)
         if not is_noop:
+            if dataset in DATASET_KEY_FIELDS:
+                _replace_row_digests(cursor, dataset, source_digests)
+            if dataset == "eod_quotes" and counters.total_mutations:
+                cursor.execute("SELECT xetra_loader.refresh_xetra_features()")
+            _verify_post_write(cursor, dataset, row_count, source_digests)
             cursor.execute(
                 "INSERT INTO xetra_loader_sync.sync_state "
                 "(dataset, semantic_fingerprint, row_count, synced_at_utc) "
@@ -160,6 +204,85 @@ def run_sync(
         status=status,
         counters=counters,
     )
+
+
+def _replace_row_digests(
+    cursor: Cursor[Any],
+    dataset: str,
+    digests: Mapping[str, str],
+) -> None:
+    """Replace one dataset's complete digest snapshot in the open transaction."""
+
+    cursor.execute(
+        "DELETE FROM xetra_loader_sync.row_hashes WHERE dataset = %s",
+        (dataset,),
+    )
+    if digests:
+        cursor.executemany(
+            "INSERT INTO xetra_loader_sync.row_hashes "
+            "(dataset, entity_key, row_sha256) VALUES (%s, %s, %s)",
+            [(dataset, entity_key, row_sha256) for entity_key, row_sha256 in digests.items()],
+        )
+
+
+def _preflight(cursor: Cursor[Any], dataset: str) -> None:
+    """Check every relation and routine needed before allowing a mutation."""
+
+    table = _DATASET_TABLES.get(dataset)
+    cursor.execute(
+        "SELECT to_regclass('xetra_loader_sync.sync_state') IS NOT NULL, "
+        "to_regclass('xetra_loader_sync.loader_runs') IS NOT NULL, "
+        "to_regclass('xetra_loader_sync.row_hashes') IS NOT NULL, "
+        "to_regclass(%s) IS NOT NULL, "
+        "(%s = 'eod_quotes' AND "
+        "to_regclass('xetra_loader.xetra_features') IS NOT NULL AND "
+        "to_regprocedure('xetra_loader.refresh_xetra_features()') IS NOT NULL) "
+        "OR %s <> 'eod_quotes'",
+        (f"xetra_loader.{table}" if table else "xetra_loader_sync.sync_state", dataset, dataset),
+    )
+    raw = cursor.fetchone()
+    if raw is None or not all(bool(value) for value in raw):
+        raise RuntimeError(f"PostgreSQL sync preflight failed for dataset {dataset!r}")
+
+
+def _verify_post_write(
+    cursor: Cursor[Any],
+    dataset: str,
+    row_count: int,
+    expected_digests: Mapping[str, str],
+) -> None:
+    """Verify the complete Gold snapshot before the transaction can commit."""
+
+    from xetra_loader.sync.row_digests import DATASET_KEY_FIELDS
+
+    if dataset in DATASET_KEY_FIELDS:
+        cursor.execute(
+            "SELECT entity_key, row_sha256 "
+            "FROM xetra_loader_sync.row_hashes WHERE dataset = %s",
+            (dataset,),
+        )
+        actual_digests = {
+            str(entity_key): str(row_sha256)
+            for entity_key, row_sha256 in cursor.fetchall()
+        }
+        if actual_digests != expected_digests:
+            raise RuntimeError(f"row digest verification failed for dataset {dataset!r}")
+
+    table = _DATASET_TABLES.get(dataset)
+    if table is not None:
+        cursor.execute(f"SELECT count(*) FROM xetra_loader.{table}")
+        raw_count = cursor.fetchone()
+        if raw_count is None or int(raw_count[0]) != row_count:
+            raise RuntimeError(f"row count verification failed for dataset {dataset!r}")
+
+    if dataset == "eod_quotes":
+        cursor.execute(
+            "SELECT count(*), count(DISTINCT (isin, exchange, code, trade_date)) "
+            "FROM xetra_loader.xetra_features"
+        )
+        view_counts = cursor.fetchone()
+        if view_counts is None or tuple(map(int, view_counts)) != (row_count, row_count):
+            raise RuntimeError("feature view identity verification failed")
 
 
 def _canonical_row(row: SemanticRow) -> str:

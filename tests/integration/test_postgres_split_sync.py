@@ -56,6 +56,9 @@ def test_split_sync_initial_replay_correction_and_retraction() -> None:
                 "DELETE FROM xetra_loader_sync.sync_state WHERE dataset = 'splits'"
             )
             connection.execute(
+                "DELETE FROM xetra_loader_sync.row_hashes WHERE dataset = 'splits'"
+            )
+            connection.execute(
                 "INSERT INTO xetra_loader.listings "
                 "(isin, exchange, code, fetched_at_utc, published_at_utc) "
                 "VALUES ('DE0000000001', 'XETRA', 'AAA', now(), now())"
