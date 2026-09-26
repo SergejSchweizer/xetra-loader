@@ -175,13 +175,27 @@ xetra_loader.xetra_market_features has exactly one row per trade_date and
 exposes timestamp_m1 = trade_date 00:00:00+00:00 for downstream time-series
 consumers.
 
+Define the ordered market calendar as the distinct trade_date values present in
+xetra_features. For each market date t, prev_market_date(t) is the immediately
+preceding date in that calendar. The market-aligned daily return is defined only
+when an instrument has a positive adjusted_close_level on both t and
+prev_market_date(t):
+
+market_aligned_log_return_i,t =
+ln(A_i,t / A_i,prev_market_date(t)).
+
+An instrument return that bridges a missing market date is therefore excluded
+from cross-sectional market calculations even though its instrument-level
+1-observation return may remain valid. This prevents mixed holding periods
+inside breadth, dispersion, and correlation.
+
 Daily eligible universe E_t is every instrument with a valid
-adjusted_close_log_return_1obs on t. No current is_active filter is allowed.
+market_aligned_log_return on t. No current is_active filter is allowed.
 
 Required market features:
 
-- market_mean_log_return_1obs = mean_i(r_i,t);
-- market_median_log_return_1obs = median_i(r_i,t);
+- market_mean_log_return_1obs = mean_i(market_aligned_log_return_i,t);
+- market_median_log_return_1obs = median_i(market_aligned_log_return_i,t);
 - market_cum_return_5obs_pct, 10obs_pct, 20obs_pct =
   100 * (exp(sum(market_mean_log_return_1obs over W dates)) - 1);
 - market_return_vol_5obs, 10obs, 20obs =
@@ -198,13 +212,14 @@ Required market features:
   cross-sectional median of the corresponding instrument volume z-score.
 
 Average pairwise correlation is defined only for W in {5,10,20}.
-For each date t and W, E_(t,W) contains instruments having valid daily returns
-on every one of the same W market dates ending at t. If |E_(t,W)| < 30 the
-feature is NULL. Otherwise:
+For each date t and W, E_(t,W) contains instruments having valid
+market_aligned_log_return values on every one of the same W market dates ending
+at t. If |E_(t,W)| < 30 the feature is NULL. Otherwise:
 
 avg_pairwise_corr_Wobs =
 mean over all unordered pairs (i,j) in E_(t,W) of
-Corr(r_i, r_j) over exactly those W aligned dates.
+Corr(market_aligned_log_return_i, market_aligned_log_return_j)
+over exactly those W aligned dates.
 
 A "daily average correlation" feature does not exist.
 
@@ -229,8 +244,19 @@ Required fields:
 - synced_at_utc.
 
 The feature refresh and corresponding lineage-state update are one publication
-unit. A consumer must be able to pin one source_build_id and reject incompatible
-schema_version/feature_version values.
+unit. Both feature relations from one ordered refresh share the same
+source_build_id. Define source_build_id deterministically from the quote-source
+semantic fingerprint, the ordered feature-catalog fingerprint, schema_version,
+and feature_version.
+
+data_sha256 is relation-specific and hashes the exact materialized matrix in
+canonical identity order. The canonical encoding must include relation name,
+ordered column names, ordered row identities/timestamps, an explicit NULL
+token, and locale-independent IEEE-754 hexadecimal encoding for every floating
+value. The encoding version is part of the catalog contract.
+
+A consumer must be able to pin one source_build_id, verify the relation-specific
+data_sha256, and reject incompatible schema_version/feature_version values.
 
 ### 0.7 Active work-order dependency graph
 
@@ -484,6 +510,9 @@ Acceptance:
 - explicitly test Cutler RSI edge cases 0/50/100;
 - explicitly test the corporate-action-adjusted overnight gap;
 - explicitly test market membership without current is_active filtering;
+- explicitly test that an instrument missing the immediately prior market date
+  is excluded from daily cross-sectional calculations rather than contributing
+  a multi-day return;
 - explicitly test 5/10/20 aligned-date average pairwise correlation and the
   30-instrument minimum;
 - future rows cannot change an earlier feature;
@@ -672,7 +701,7 @@ Python / quality baseline:
 - separate fast `policy` job validates Conventional Commits and exact work-order naming;
 - final `push-gate` / `merge-gate` aggregate all required checks.
 
-## 4. Optimized dependency graph
+## 4. Historical dependency graph (PR001–PR033)
 
 ```text
 XDL-PR000
@@ -718,7 +747,7 @@ PR008               PR010 || PR011 || PR012      |
                               PR033
 ```
 
-Interpretation: PR022 starts as soon as DB roles and medallion core exist; it does not wait for entity ingestion or Gold builders. Each entity then progresses independently through contract -> ingestion -> Gold -> PostgreSQL sync. PR033 is intentionally final and serial: it is the real target-PostgreSQL completion gate, not a fixture-only test.
+Historical interpretation: PR022 started as soon as DB roles and medallion core existed; it did not wait for entity ingestion or Gold builders. Each entity then progressed independently through contract -> ingestion -> Gold -> PostgreSQL sync. PR033 was the historical final gate for this graph and was later superseded by the corrected PR053 real-target V2 verification described in Section 10.
 
 Safe parallel waves:
 
@@ -730,7 +759,7 @@ Safe parallel waves:
 - Wave 6: PR018 + PR019 + PR020 + PR021; PR030 can start after PR022.
 - Wave 7: PR023 + PR024 + PR025 + PR026, each as soon as its own Gold builder plus PR022 are merged.
 - Wave 8: PR028 + PR029 after PR027.
-- Final serial gates: PR031 -> PR032 -> PR033.
+- Historical final serial gates: PR031 -> PR032 -> PR033; PR033 was later superseded by PR053.
 
 ## 5. Work-order index
 
@@ -1408,8 +1437,8 @@ The completion claims in Sections 7 and 9 are superseded. XDL-PR033 and the exis
 
 ## 11. Summary of all existing backlog PRs
 
-This summary covers the work orders that already existed before the new
-XDL-PR059–XDL-PR069 feature-serving program. Their detailed specifications
+This summary covers the historical work orders that existed before the
+currently audited feature-serving program. Their detailed specifications
 remain in the preceding sections. PR054 has no work-order specification in the
 existing backlog and is intentionally not inferred here.
 
