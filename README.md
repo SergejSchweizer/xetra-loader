@@ -17,10 +17,16 @@ python -c "import xetra_loader; print(xetra_loader.__version__)"
 
 The repository-local `.venv/` is intentionally ignored and must never be committed.
 
-For an existing PostgreSQL installation, run the migrations in `sql/migrations/` in order
-with an administrative connection before starting the renamed loader. They preserve the
-existing loader data while renaming the role to `xetra-loader` and the schemas to
-`xetra_loader` and `xetra_loader_sync`.
+For a new PostgreSQL serving database, apply the current contracts with an
+administrative connection in this order: `sql/schema/001_xetra_loader.sql`,
+`sql/schema/002_roles.sql`, `sql/sync/001_xetra_loader_sync.sql`, and
+`sql/schema/004_xetra_features.sql`. Apply
+`sql/roles/005_xetra_loader_feature_view_reader.sql` only after the externally
+provisioned `xetra_loader` role exists; it grants that role `USAGE` on the
+`xetra_loader` schema and `SELECT` only on `xetra_loader.xetra_features`.
+The publication writer is the non-superuser `xetra_data_loader_writer`, a
+member of the `xetra-data-loader` group. The legacy files in `sql/migrations/`
+are historical rename migrations, not the current clean-create setup.
 
 ## Local secrets
 
@@ -28,4 +34,20 @@ Copy `config.example.yaml` to `config.yaml` and fill in the EODHD token plus sep
 
 ## Current scope
 
-The dependency-ordered work orders in `BACKLOG.md` provide the EODHD transport, XETRA listing and corporate-action ingestion, Bronze/Silver/Gold datasets, transactional PostgreSQL publication, weekly orchestration, guarded bootstrap, and acceptance verification. The real-target acceptance run remains an operational deployment step and requires valid access to the configured PostgreSQL instance.
+The dependency-ordered work orders in `BACKLOG.md` provide the EODHD
+transport, XETRA listing and corporate-action ingestion, Bronze/Silver/Gold
+datasets, transactional PostgreSQL publication, weekly orchestration, guarded
+bootstrap, and acceptance verification.
+
+The feature contract is `xetra_loader.xetra_features`, a materialized view
+with only `adjusted_close_level` and `volume_level` as base levels. OHLC
+columns are internal inputs only for the approved high-low range, intraday
+return, and overnight-gap families. Fold-local standardization is a
+downstream operation documented in
+[`docs/train-fold-standardization.md`](docs/train-fold-standardization.md); it
+never changes Gold or the global feature view.
+
+The deployed scheduler is Sunday `08:00` in `Europe/Vienna` and invokes the
+restart-safe `xdl-weekly` runner. The real-target acceptance run remains an
+operational deployment step and requires valid access to the configured
+PostgreSQL instance.
