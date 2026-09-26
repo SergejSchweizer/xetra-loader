@@ -192,8 +192,8 @@ Acceptance:
 Branch `feat/xdl-pr060-xetra-features-materialized-view`; commit scope
 `feat(xdl-pr060-xetra-features-materialized-view): ...`; depends on PR059.
 
-Status: implementation complete; 7 focused tests, Ruff, Mypy, and SQL contract
-checks pass; PR merge pending.
+Status: merged in origin/main via PR #64 (`0f3b16c`); 7 focused tests, Ruff,
+Mypy, and SQL contract checks passed.
 Git status at completion: PR-owned SQL/source/test files plus the existing
 untracked `artifacts/cron/xdl-weekly.log`.
 
@@ -243,6 +243,11 @@ Acceptance:
 
 Branch `feat/xdl-pr061-postgres-row-digest-state`; commit scope
 `feat(xdl-pr061-postgres-row-digest-state): ...`; depends on PR059.
+
+Status: implementation complete; 5 focused digest tests, Ruff, Mypy, and
+schema contract checks pass; PR merge pending.
+Git status at completion: PR-owned sync/source/test files plus the existing
+untracked `artifacts/cron/xdl-weekly.log`.
 
 Owned paths: `xetra_loader_sync` row-digest schema, canonical key/digest
 helpers, and focused sync-state tests. No feature SQL and no cron changes.
