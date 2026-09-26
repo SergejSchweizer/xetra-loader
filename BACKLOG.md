@@ -286,9 +286,9 @@ Branch `feat/xdl-pr062-xetra-delta-sync-and-feature-refresh`; commit scope
 `feat(xdl-pr062-xetra-delta-sync-and-feature-refresh): ...`; depends on
 PR060+PR061.
 
-Status: implementation complete; unit, Ruff, Mypy, and diff gates pass;
-PostgreSQL integration is pending CI because no local test DSN is configured.
-PR merge pending.
+Status: merged in origin/main via PR #66
+(`4aa87ec82399429f11f813110498b6cc72484673`); unit, Ruff, Mypy, PostgreSQL
+integration, policy, push-gate, and merge-gate passed.
 Git status at completion: PR-owned sync/integration-test files plus the
 existing untracked `artifacts/cron/xdl-weekly.log`.
 
@@ -332,6 +332,10 @@ Branch `test/xdl-pr063-qa-xetra-feature-contract-and-schema`; commit scope
 
 Owned paths: feature schema QA tests and sanitized QA report only. No production
 implementation changes.
+
+Status: implementation in progress; PR merge pending.
+Git status at completion: to be recorded after the PR is merged; the existing
+untracked `artifacts/cron/xdl-weekly.log` is preserved.
 
 Tasks: independently inspect PostgreSQL catalogs and the materialized-view
 definition; validate identity, types, grants, version metadata, and forbidden
