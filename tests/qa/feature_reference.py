@@ -178,9 +178,6 @@ def reference_features(
         dispersion_values = {
             window: _mean(_window(daily_dispersion, index, window)) for window in (5, 10, 20)
         }
-        correlations = {
-            window: _pair_correlation(returns_by_code, index, window) for window in (5, 10, 20)
-        }
         for code in by_code:
             features = output[(code, trade_date)]
             features["breadth_daily"] = daily_breadth[index]
@@ -188,7 +185,6 @@ def reference_features(
             for window in (5, 10, 20):
                 features[f"breadth_{window}obs"] = breadth_values[window]
                 features[f"dispersion_{window}obs"] = dispersion_values[window]
-                features[f"average_correlation_{window}obs"] = correlations[window]
     return output
 
 
@@ -237,23 +233,3 @@ def _wilder_rsi(values: list[float], index: int, period: int) -> float | None:
     if average_loss == 0:
         return 100.0
     return 100.0 - 100.0 / (1.0 + average_gain / average_loss)
-
-
-def _pair_correlation(
-    returns_by_code: dict[str, list[float | None]], index: int, window: int
-) -> float | None:
-    codes = sorted(returns_by_code)
-    if len(codes) < 2:
-        return None
-    left = _window(returns_by_code[codes[0]], index, window)
-    right = _window(returns_by_code[codes[1]], index, window)
-    if left is None or right is None:
-        return None
-    left_mean = statistics.fmean(left)
-    right_mean = statistics.fmean(right)
-    numerator = sum(
-        (x - left_mean) * (y - right_mean) for x, y in zip(left, right, strict=True)
-    )
-    left_scale = math.sqrt(sum((x - left_mean) ** 2 for x in left))
-    right_scale = math.sqrt(sum((y - right_mean) ** 2 for y in right))
-    return None if left_scale == 0 or right_scale == 0 else numerator / (left_scale * right_scale)

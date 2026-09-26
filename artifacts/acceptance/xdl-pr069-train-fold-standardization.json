@@ -1,5 +1,5 @@
 {
-  "derived_features": 49,
+  "derived_features": 46,
   "global_view_fit_statistics": false,
   "leakage_probe": "PASS",
   "secrets_included": false,

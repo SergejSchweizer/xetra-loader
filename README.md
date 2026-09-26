@@ -24,6 +24,9 @@ administrative connection in this order: `sql/schema/001_xetra_loader.sql`,
 `sql/roles/005_xetra_loader_feature_view_reader.sql` only after the externally
 provisioned `xetra_loader` role exists; it grants that role `USAGE` on the
 `xetra_loader` schema and `SELECT` only on `xetra_loader.xetra_features`.
+The explicit provisioning command is `.venv/bin/xdl-migrate`; it uses only the
+admin DSN and creates/populates the materialized feature view. The weekly
+`.venv/bin/xdl-weekly` command never creates or alters PostgreSQL objects.
 The publication writer is the non-superuser `xetra_data_loader_writer`, a
 member of the `xetra-data-loader` group. The legacy files in `sql/migrations/`
 are historical rename migrations, not the current clean-create setup.

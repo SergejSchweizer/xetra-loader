@@ -1,5 +1,5 @@
 {
-  "feature_column_count": 51,
+  "feature_column_count": 48,
   "gold_rows": {
     "dividends": 2,
     "eod_quotes": 130,
