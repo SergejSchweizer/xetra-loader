@@ -775,6 +775,7 @@ class PostgresEodhdBootstrapRuntime:
             "sql/schema/002_roles.sql",
             "sql/schema/003_listing_lifecycle.sql",
             "sql/sync/001_xetra_loader_sync.sql",
+            "sql/schema/004_xetra_features.sql",
         ):
             sql = (self._repository_root / relative).read_text(encoding="utf-8")
             self._connection.execute(sql)
