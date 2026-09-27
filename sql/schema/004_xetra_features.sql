@@ -4,10 +4,58 @@ SET LOCAL TIME ZONE 'UTC';
 -- this build/refresh transaction instead of relying on the cluster default.
 SET LOCAL work_mem = '1GB';
 
+CREATE OR REPLACE FUNCTION xetra_loader.wilder_rsi(
+    gains double precision[],
+    losses double precision[],
+    period integer
+)
+RETURNS double precision[]
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+DECLARE
+    observations integer := coalesce(array_length(gains, 1), 0);
+    result double precision[];
+    average_gain double precision := 0.0;
+    average_loss double precision := 0.0;
+    position integer;
+BEGIN
+    IF period < 1 OR observations < period + 1 THEN
+        RETURN CASE
+            WHEN observations = 0 THEN ARRAY[]::double precision[]
+            ELSE array_fill(NULL::double precision, ARRAY[observations])
+        END;
+    END IF;
+
+    result := array_fill(NULL::double precision, ARRAY[observations]);
+    FOR position IN 2..period + 1 LOOP
+        average_gain := average_gain + coalesce(gains[position], 0.0);
+        average_loss := average_loss + coalesce(losses[position], 0.0);
+    END LOOP;
+    average_gain := average_gain / period;
+    average_loss := average_loss / period;
+    result[period + 1] := CASE
+        WHEN average_loss = 0 THEN 100.0
+        ELSE 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+    END;
+
+    FOR position IN period + 2..observations LOOP
+        average_gain := (average_gain * (period - 1) + coalesce(gains[position], 0.0)) / period;
+        average_loss := (average_loss * (period - 1) + coalesce(losses[position], 0.0)) / period;
+        result[position] := CASE
+            WHEN average_loss = 0 THEN 100.0
+            ELSE 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+        END;
+    END LOOP;
+    RETURN result;
+END
+$$;
+
 DROP MATERIALIZED VIEW IF EXISTS xetra_loader.xetra_features;
 
 CREATE MATERIALIZED VIEW xetra_loader.xetra_features AS
-WITH RECURSIVE ordered AS (
+WITH ordered AS (
     SELECT
         q.isin, q.exchange, q.code, q.trade_date,
         q.adjusted_close::double precision AS adjusted_close_level,
@@ -25,7 +73,7 @@ WITH RECURSIVE ordered AS (
         row_number() OVER w AS observation_number
     FROM xetra_loader.eod_quotes AS q
     WINDOW w AS (PARTITION BY q.isin, q.exchange, q.code ORDER BY q.trade_date)
-), returns AS (
+), returns AS MATERIALIZED (
     SELECT o.*,
         CASE WHEN adjusted_close_level > 0 AND adjusted_close_lag_1 > 0
              THEN ln(adjusted_close_level / adjusted_close_lag_1) END AS log_return_1,
@@ -45,46 +93,26 @@ WITH RECURSIVE ordered AS (
         CASE WHEN adjusted_close_level > 0 AND adjusted_close_lag_1 > 0
              THEN greatest(adjusted_close_lag_1 - adjusted_close_level, 0.0) END AS loss
     FROM ordered AS o
-), rsi_seed_7 AS (
-    SELECT r.*,
-        avg(gain) OVER w AS avg_gain_7,
-        avg(loss) OVER w AS avg_loss_7
+), rsi_arrays AS (
+    SELECT r.isin, r.exchange, r.code,
+        xetra_loader.wilder_rsi(
+            array_agg(coalesce(r.gain, 0.0) ORDER BY r.observation_number),
+            array_agg(coalesce(r.loss, 0.0) ORDER BY r.observation_number),
+            7
+        ) AS rsi_7,
+        xetra_loader.wilder_rsi(
+            array_agg(coalesce(r.gain, 0.0) ORDER BY r.observation_number),
+            array_agg(coalesce(r.loss, 0.0) ORDER BY r.observation_number),
+            14
+        ) AS rsi_14
     FROM returns AS r
-    WINDOW w AS (
-        PARTITION BY r.isin, r.exchange, r.code ORDER BY r.observation_number
-        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-    )
-), rsi_7 AS (
-    SELECT isin, exchange, code, trade_date, observation_number, avg_gain_7, avg_loss_7
-    FROM rsi_seed_7
-    WHERE observation_number = 8
-    UNION ALL
-    SELECT n.isin, n.exchange, n.code, n.trade_date, n.observation_number,
-        (p.avg_gain_7 * 6.0 + n.gain) / 7.0,
-        (p.avg_loss_7 * 6.0 + n.loss) / 7.0
-    FROM rsi_7 AS p
-    JOIN returns AS n ON n.isin = p.isin AND n.exchange = p.exchange AND n.code = p.code
-        AND n.observation_number = p.observation_number + 1
-), rsi_seed_14 AS (
-    SELECT r.*,
-        avg(gain) OVER w AS avg_gain_14,
-        avg(loss) OVER w AS avg_loss_14
-    FROM returns AS r
-    WINDOW w AS (
-        PARTITION BY r.isin, r.exchange, r.code ORDER BY r.observation_number
-        ROWS BETWEEN 13 PRECEDING AND CURRENT ROW
-    )
-), rsi_14 AS (
-    SELECT isin, exchange, code, trade_date, observation_number, avg_gain_14, avg_loss_14
-    FROM rsi_seed_14
-    WHERE observation_number = 15
-    UNION ALL
-    SELECT n.isin, n.exchange, n.code, n.trade_date, n.observation_number,
-        (p.avg_gain_14 * 13.0 + n.gain) / 14.0,
-        (p.avg_loss_14 * 13.0 + n.loss) / 14.0
-    FROM rsi_14 AS p
-    JOIN returns AS n ON n.isin = p.isin AND n.exchange = p.exchange AND n.code = p.code
-        AND n.observation_number = p.observation_number + 1
+    GROUP BY r.isin, r.exchange, r.code
+), rsi_values AS (
+    SELECT a.isin, a.exchange, a.code, s.observation_number,
+        a.rsi_7[s.observation_number] AS rsi_7,
+        a.rsi_14[s.observation_number] AS rsi_14
+    FROM rsi_arrays AS a
+    CROSS JOIN LATERAL generate_subscripts(a.rsi_7, 1) AS s(observation_number)
 ), rolling AS (
     SELECT r.*,
         CASE WHEN count(log_return_1) OVER w5 = 5 THEN exp(sum(log_return_1) OVER w5) - 1 END AS ret_5,
@@ -179,12 +207,8 @@ SELECT
     r.sma_5_20 AS adjusted_close_sma_ratio_5_20,
     r.sma_10_20 AS adjusted_close_sma_ratio_10_20,
     r.sma_10_40 AS adjusted_close_sma_ratio_10_40,
-    CASE WHEN r7.avg_loss_7 = 0 THEN 100.0
-         WHEN r7.avg_gain_7 IS NULL OR r7.avg_loss_7 IS NULL THEN NULL
-         ELSE 100.0 - 100.0 / (1.0 + r7.avg_gain_7 / r7.avg_loss_7) END AS adjusted_close_rsi_7obs,
-    CASE WHEN r14.avg_loss_14 = 0 THEN 100.0
-         WHEN r14.avg_gain_14 IS NULL OR r14.avg_loss_14 IS NULL THEN NULL
-         ELSE 100.0 - 100.0 / (1.0 + r14.avg_gain_14 / r14.avg_loss_14) END AS adjusted_close_rsi_14obs,
+    rv.rsi_7 AS adjusted_close_rsi_7obs,
+    rv.rsi_14 AS adjusted_close_rsi_14obs,
     CASE WHEN r.adjusted_close_level > 0 AND r.adjusted_close_lag_3 > 0 THEN r.adjusted_close_level / r.adjusted_close_lag_3 - 1 END AS adjusted_close_roc_3obs,
     CASE WHEN r.adjusted_close_level > 0 AND r.adjusted_close_lag_5 > 0 THEN r.adjusted_close_level / r.adjusted_close_lag_5 - 1 END AS adjusted_close_roc_5obs,
     CASE WHEN r.adjusted_close_level > 0 AND r.adjusted_close_lag_10 > 0 THEN r.adjusted_close_level / r.adjusted_close_lag_10 - 1 END AS adjusted_close_roc_10obs,
@@ -202,8 +226,8 @@ SELECT
     c.dispersion_daily, c.dispersion_5 AS dispersion_5obs,
     c.dispersion_10 AS dispersion_10obs, c.dispersion_20 AS dispersion_20obs
 FROM rolling AS r
-LEFT JOIN rsi_7 AS r7 ON r7.isin = r.isin AND r7.exchange = r.exchange AND r7.code = r.code AND r7.trade_date = r.trade_date
-LEFT JOIN rsi_14 AS r14 ON r14.isin = r.isin AND r14.exchange = r.exchange AND r14.code = r.code AND r14.trade_date = r.trade_date
+LEFT JOIN rsi_values AS rv ON rv.isin = r.isin AND rv.exchange = r.exchange
+    AND rv.code = r.code AND rv.observation_number = r.observation_number
 JOIN cross_rolling AS c ON c.trade_date = r.trade_date
 ;
 
@@ -211,6 +235,10 @@ CREATE UNIQUE INDEX xetra_features_identity_idx
     ON xetra_loader.xetra_features (isin, exchange, code, trade_date);
 
 ALTER MATERIALIZED VIEW xetra_loader.xetra_features OWNER TO "xetra-data-loader";
+
+ALTER FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], integer)
+    OWNER TO "xetra-data-loader";
+REVOKE ALL ON FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], integer) FROM PUBLIC;
 
 COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
     'XETRA feature view; catalog version=1; base levels=adjusted_close_level,volume_level';
