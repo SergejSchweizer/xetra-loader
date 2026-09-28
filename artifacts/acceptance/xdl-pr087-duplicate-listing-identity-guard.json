@@ -1,0 +1,11 @@
+{
+  "pr": "PR087",
+  "status": "PASS",
+  "checks": {
+    "conflicting_identity_rejected": true,
+    "exact_provider_duplicate_deduplicated": true,
+    "active_precedence_documented": true,
+    "deterministic_ordering": true,
+    "unit_tests": "PASS"
+  }
+}

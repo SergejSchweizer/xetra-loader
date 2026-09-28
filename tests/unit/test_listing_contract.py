@@ -36,6 +36,25 @@ def test_duplicate_isin_with_distinct_code_is_retained() -> None:
     ]
 
 
+def test_conflicting_duplicate_identity_fails_closed() -> None:
+    rows = [
+        {"ISIN": "DE0000000001", "Exchange": "XETRA", "Code": "AAA", "Name": "One"},
+        {"ISIN": "DE0000000001", "Exchange": "XETRA", "Code": "AAA", "Name": "Two"},
+    ]
+
+    try:
+        normalize_listings(rows)
+    except ValueError as exc:
+        assert "conflicting listing rows" in str(exc)
+    else:
+        raise AssertionError("conflicting duplicate identity was accepted")
+
+
+def test_exact_duplicate_identity_is_provider_deduplicated() -> None:
+    row = {"ISIN": "DE0000000001", "Exchange": "XETRA", "Code": "AAA"}
+    assert normalize_listings([row, row]) == normalize_listings([row])
+
+
 def test_round_trip_and_order_are_deterministic() -> None:
     rows = [
         {"ISIN": "DE0000000002", "Exchange": "XETRA", "Code": "BBB", "Name": "B"},
