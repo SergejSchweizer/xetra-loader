@@ -1,0 +1,22 @@
+{
+  "pr": "PR088",
+  "status": "PASS",
+  "checks": {
+    "feature_columns": 48,
+    "identity_columns": 4,
+    "materialized_view_columns": 52,
+    "average_correlation_removed": true,
+    "forbidden_ohlc_levels_absent": true,
+    "sunday_cron": "0 8 * * 0",
+    "cron_timezone": "Europe/Vienna",
+    "gold_validation_before_publication": true,
+    "restart_safe_runner": true,
+    "independent_feature_oracle": true,
+    "postgres_integration_complete_run": "PASS",
+    "unit_tests": "PASS"
+  },
+  "resource_evidence": {
+    "feature_refresh_memory_policy": "configured xdl feature work_mem, default 256MB, range 16MB-4GB",
+    "secrets_included": false
+  }
+}
