@@ -1,0 +1,11 @@
+{
+  "pr": "PR086",
+  "status": "PASS",
+  "checks": {
+    "single_contract_authority": true,
+    "listing_lifecycle_is_active": true,
+    "quote_finite_non_negative_ohlc_validation": true,
+    "legacy_market_imports_are_aliases": true,
+    "unit_tests": "PASS"
+  }
+}
