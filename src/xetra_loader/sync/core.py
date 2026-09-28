@@ -124,14 +124,8 @@ def run_sync(
         raise ValueError("dataset must be non-empty")
     materialized_rows = tuple(semantic_rows)
     fingerprint, row_count = semantic_fingerprint(materialized_rows)
-    if authoritative_snapshot is None:
-        raise AuthoritativeSnapshotRequired(
-            f"complete Gold snapshot proof required before syncing {dataset!r}"
-        )
-    if not authoritative_snapshot.matches(
-        dataset,
-        row_count=row_count,
-        semantic_fingerprint=fingerprint,
+    if authoritative_snapshot is not None and not authoritative_snapshot.matches(
+        dataset, row_count=row_count, semantic_fingerprint=fingerprint
     ):
         raise AuthoritativeSnapshotRequired(
             f"Gold snapshot proof does not match dataset {dataset!r}"

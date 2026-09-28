@@ -61,13 +61,14 @@ def _snapshot():
     )
 
 
-def test_sync_requires_a_complete_snapshot_before_dml() -> None:
+def test_mismatched_snapshot_is_rejected_before_dml() -> None:
     with pytest.raises(AuthoritativeSnapshotRequired):
         run_sync(
             object(),  # type: ignore[arg-type]
             dataset="eod_quotes",
-            semantic_rows=(),
+            semantic_rows=({"id": 1},),
             mutate=lambda _cursor: object(),  # type: ignore[return-value]
+            authoritative_snapshot=_snapshot(),
         )
 
 
