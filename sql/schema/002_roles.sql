@@ -18,6 +18,14 @@ $$;
 
 DO $$
 BEGIN
+    CREATE ROLE xetra_loader NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
+
+DO $$
+BEGIN
     CREATE ROLE xetra_data_loader_writer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 EXCEPTION
     WHEN duplicate_object THEN NULL;
@@ -27,7 +35,7 @@ $$;
 GRANT "xetra-data-loader" TO xetra_data_loader_writer;
 
 REVOKE ALL ON SCHEMA xetra_loader FROM PUBLIC;
-GRANT USAGE ON SCHEMA xetra_loader TO "xetra-data-loader", portfell_app;
+GRANT USAGE ON SCHEMA xetra_loader TO "xetra-data-loader", portfell_app, xetra_loader;
 REVOKE CREATE ON SCHEMA xetra_loader FROM "xetra-data-loader", portfell_app;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA xetra_loader

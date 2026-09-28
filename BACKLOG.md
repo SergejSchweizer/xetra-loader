@@ -1938,6 +1938,7 @@ finished work.
 | PR086 | `e676056` | merged; canonical serving-domain model aliases |
 | PR087 | `8e2cc26` | merged; conflicting listing identity rejection and deterministic lifecycle precedence |
 | PR088 | `0651e69` | merged; corrective complete-run QA gate and sanitized PASS evidence |
+| PR090 | current role-contract fix | merged with this reader-role correction; `xetra_loader` is idempotently provisioned as NOLOGIN and receives SELECT-only view access |
 
 Final repository status at the completion checkpoint:
 

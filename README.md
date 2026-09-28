@@ -21,9 +21,11 @@ For a new PostgreSQL serving database, apply the current contracts with an
 administrative connection in this order: `sql/schema/001_xetra_loader.sql`,
 `sql/schema/002_roles.sql`, `sql/sync/001_xetra_loader_sync.sql`, and
 `sql/schema/004_xetra_features.sql`. Apply
-`sql/roles/005_xetra_loader_feature_view_reader.sql` only after the externally
-provisioned `xetra_loader` role exists; it grants that role `USAGE` on the
-`xetra_loader` schema and `SELECT` only on `xetra_loader.xetra_features`.
+The role `xetra_loader` is created as a `NOLOGIN` reader role by
+`sql/schema/002_roles.sql`; `sql/roles/005_xetra_loader_feature_view_reader.sql`
+reapplies its `USAGE` and `SELECT`-only contract when an external deployment
+manages that role separately. A login user may be granted membership by the
+deployment without putting another password in the repository.
 The explicit provisioning command is `.venv/bin/xdl-migrate`; it uses only the
 admin DSN and creates/populates the materialized feature view. The weekly
 `.venv/bin/xdl-weekly` command never creates or alters PostgreSQL objects.

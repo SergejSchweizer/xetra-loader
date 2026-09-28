@@ -293,7 +293,7 @@ COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
     'XETRA feature view; catalog version=2; base levels=adjusted_close_level,volume_level';
 
 REVOKE ALL ON xetra_loader.xetra_features FROM PUBLIC;
-GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app;
+GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app, xetra_loader;
 
 CREATE OR REPLACE FUNCTION xetra_loader.refresh_xetra_features()
 RETURNS void

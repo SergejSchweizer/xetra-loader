@@ -41,7 +41,8 @@ def test_schema_qa_has_repeatable_privilege_contract_and_catalog_version() -> No
     assert "COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features" in VIEW_SQL
     assert "catalog version=2" in VIEW_SQL
     assert (
-        'GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app'
+        'GRANT SELECT ON xetra_loader.xetra_features TO '
+        '"xetra-data-loader", portfell_app, xetra_loader'
         in VIEW_SQL
     )
     assert "REVOKE ALL ON xetra_loader.xetra_features FROM PUBLIC" in VIEW_SQL
