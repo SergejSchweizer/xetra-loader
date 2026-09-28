@@ -171,6 +171,7 @@ def run_sync(
             and state[0] == fingerprint
             and state[1] == row_count
             and persisted_digests == source_digests
+            and _serving_row_count(cursor, dataset) == serving_row_count
         )
 
         counters = SyncCounters() if is_noop else mutate(cursor)
@@ -232,14 +233,25 @@ def _replace_row_digests(
     """Replace one dataset's complete digest snapshot in the open transaction."""
 
     cursor.execute(
+        "CREATE TEMP TABLE xdl_desired_row_hashes ("
+        "entity_key text PRIMARY KEY, row_sha256 text NOT NULL"
+        ") ON COMMIT DROP"
+    )
+    with cursor.copy(
+        "COPY xdl_desired_row_hashes (entity_key, row_sha256) FROM STDIN"
+    ) as copy:
+        for entity_key, row_sha256 in digests.items():
+            copy.write_row((entity_key, row_sha256))
+    cursor.execute(
         "DELETE FROM xetra_loader_sync.row_hashes WHERE dataset = %s",
         (dataset,),
     )
     if digests:
-        cursor.executemany(
+        cursor.execute(
             "INSERT INTO xetra_loader_sync.row_hashes "
-            "(dataset, entity_key, row_sha256) VALUES (%s, %s, %s)",
-            [(dataset, entity_key, row_sha256) for entity_key, row_sha256 in digests.items()],
+            "(dataset, entity_key, row_sha256) "
+            "SELECT %s, entity_key, row_sha256 FROM xdl_desired_row_hashes",
+            (dataset,),
         )
 
 
@@ -261,6 +273,19 @@ def _preflight(cursor: Cursor[Any], dataset: str) -> None:
     raw = cursor.fetchone()
     if raw is None or not all(bool(value) for value in raw):
         raise RuntimeError(f"PostgreSQL sync preflight failed for dataset {dataset!r}")
+
+
+def _serving_row_count(cursor: Cursor[Any], dataset: str) -> int:
+    """Confirm that a state-matching sync still has the expected table cardinality."""
+
+    table = _DATASET_TABLES.get(dataset)
+    if table is None:
+        return 0
+    cursor.execute(f'SELECT count(*) FROM xetra_loader."{table}"')
+    row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError(f"missing serving row count for dataset {dataset!r}")
+    return int(row[0])
 
 
 def _verify_post_write(
@@ -290,7 +315,10 @@ def _verify_post_write(
     if table is not None:
         cursor.execute(f"SELECT count(*) FROM xetra_loader.{table}")
         raw_count = cursor.fetchone()
-        if raw_count is None or int(raw_count[0]) != row_count:
+        if raw_count is None or (
+            int(raw_count[0]) < row_count
+            or (dataset != "listings" and int(raw_count[0]) != row_count)
+        ):
             raise RuntimeError(f"row count verification failed for dataset {dataset!r}")
 
     if dataset == "eod_quotes":

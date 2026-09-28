@@ -10,6 +10,7 @@ from xetra_loader.config import (
     resolve_postgres_admin_dsn,
     resolve_postgres_dsn,
     resolve_postgres_writer_dsn,
+    resolve_weekly_workers,
 )
 
 
@@ -46,9 +47,7 @@ def test_ignored_yaml_config_resolves_loader_values(
     monkeypatch.delenv("XDL_MEDALLION_ROOT", raising=False)
 
     assert resolve_eodhd_token() == "file-token"
-    assert resolve_postgres_dsn() == (
-        "postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market"
-    )
+    assert resolve_postgres_dsn() == ("postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market")
     assert resolve_postgres_writer_dsn() == resolve_postgres_dsn()
     assert resolve_postgres_admin_dsn() == (
         "postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market"
@@ -91,3 +90,26 @@ def test_feature_work_mem_environment_overrides_yaml(
     monkeypatch.setenv("XDL_FEATURE_WORK_MEM", "1GB")
 
     assert resolve_feature_work_mem() == "1GB"
+
+
+def test_weekly_workers_resolve_from_yaml_and_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "\nweekly:\n  workers: 6\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
+    monkeypatch.delenv("XDL_WEEKLY_WORKERS", raising=False)
+    assert resolve_weekly_workers() == 6
+    monkeypatch.setenv("XDL_WEEKLY_WORKERS", "4")
+    assert resolve_weekly_workers() == 4
+
+
+@pytest.mark.parametrize("value", ["0", "33", "not-an-int"])
+def test_weekly_workers_validation_fails_closed(value: str) -> None:
+    with pytest.raises(ConfigurationError):
+        resolve_weekly_workers(value)

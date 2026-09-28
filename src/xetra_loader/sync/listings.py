@@ -76,6 +76,27 @@ def sync_listings(
     )
 
 
+def prune_stale_listings(connection: Connection[Any], gold: ListingGoldResult) -> int:
+    """Delete listings absent from Gold after dependent datasets were reconciled."""
+
+    expected_keys = {row.key for row in gold.rows}
+    with connection.transaction(), connection.cursor() as cursor:
+        existing_keys = {
+            tuple(str(value) for value in key)
+            for key in cursor.execute(
+                "SELECT isin, exchange, code FROM xetra_loader.listings"
+            ).fetchall()
+        }
+        deleted = 0
+        for stale_key in sorted(existing_keys - expected_keys):
+            cursor.execute(
+                "DELETE FROM xetra_loader.listings WHERE isin = %s AND exchange = %s AND code = %s",
+                stale_key,
+            )
+            deleted += cursor.rowcount
+    return deleted
+
+
 def _require_utc(value: datetime) -> None:
     offset = value.utcoffset()
     if value.tzinfo is None or offset is None or offset != UTC.utcoffset(value):

@@ -255,6 +255,9 @@ class _AdminResetWriterPublishRuntime:
     def reset_owned_state(self) -> None:
         self._admin.reset_owned_state()
 
+    def database_worker(self) -> PostgresEodhdBootstrapRuntime:
+        return self._writer_runtime().database_worker()
+
     def fetch_listings(self) -> FetchBatch[ListingRecord]:
         return self._admin.fetch_listings()
 

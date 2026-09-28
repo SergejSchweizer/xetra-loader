@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+import logging
+import time
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
+from xetra_loader.config import resolve_weekly_workers
 from xetra_loader.contracts.corporate_actions import ActionStatus, DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord, deserialize_listings
 from xetra_loader.contracts.quotes import QuoteRecord, overlap_start
@@ -21,14 +25,18 @@ from xetra_loader.gold.splits import SplitGoldResult, build_split_gold
 from xetra_loader.gold.validation import GoldValidationSummary, validate_complete_gold
 from xetra_loader.ingestion.corporate_actions import action_overlap_start
 from xetra_loader.medallion.core import JSONValue, Layer, Manifest, MedallionLayout, canonical_json
-from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime
+from xetra_loader.ops.bootstrap import FetchBatch, PostgresEodhdBootstrapRuntime
 from xetra_loader.pipeline.orchestrator import PipelineStages
 from xetra_loader.sync.core import SyncCounters, SyncOutcome
+
+_LOGGER = logging.getLogger(__name__)
+_PROVIDER_STABLE_WORKERS = 8
 
 
 @dataclass(slots=True)
 class _WeeklyState:
     runtime: PostgresEodhdBootstrapRuntime
+    max_workers: int = 1
     listings: ListingGoldResult | None = None
     quotes: QuoteGoldResult | None = None
     dividends: DividendGoldResult | None = None
@@ -37,6 +45,8 @@ class _WeeklyState:
     action_changed_listings: set[tuple[str, str, str]] = field(default_factory=set)
     fetched_at_by_dataset: dict[str, dict[object, datetime]] = field(default_factory=dict)
     authoritative_snapshot: GoldValidationSummary | None = None
+    _publication_executor: ThreadPoolExecutor | None = None
+    _publication_futures: dict[str, Future[SyncOutcome]] = field(default_factory=dict)
 
     def ingest_listings(self) -> dict[str, JSONValue]:
         batch = self.runtime.fetch_listings()
@@ -60,20 +70,38 @@ class _WeeklyState:
     def ingest_quotes(self) -> dict[str, JSONValue]:
         listings = self._require_listings()
         previous = _quotes_from_rows(_load_silver_rows(self.runtime._layout.root, "eod_quotes"))
+        previous_by_listing: dict[tuple[str, str, str], list[QuoteRecord]] = {}
+        for record in previous:
+            previous_by_listing.setdefault(record.key[:3], []).append(record)
         records: list[QuoteRecord] = []
+        jobs: list[tuple[ListingRecord, tuple[QuoteRecord, ...], date | None, bool]] = []
         requests = 0
         for listing in listings.rows:
-            listing_previous = tuple(record for record in previous if record.key[:3] == listing.key)
+            listing_previous = tuple(previous_by_listing.get(listing.key, ()))
             last_date = _latest_date(listing_previous)
             if not listing.is_active:
                 records.extend(listing_previous)
                 continue
             action_changed = listing.key in self.action_changed_listings
-            batch = self.runtime.fetch_quotes(
-                listing,
-                last_business_date=None if action_changed else last_date,
-                previous_records=() if action_changed else listing_previous,
-            )
+            jobs.append((listing, listing_previous, last_date, action_changed))
+
+        _LOGGER.info(
+            "provider_stage_start dataset=eod_quotes jobs=%d workers=%d",
+            len(jobs),
+            self.max_workers,
+        )
+        batches = _parallel_fetch(
+            self.runtime,
+            jobs,
+            lambda worker, job: worker.fetch_quotes(
+                job[0],
+                last_business_date=None if job[3] else job[2],
+                previous_records=() if job[3] else job[1],
+            ),
+            self.max_workers,
+        )
+        for job, batch in zip(jobs, batches, strict=True):
+            listing, listing_previous, last_date, action_changed = job
             records.extend(
                 _replace_quote_window(
                     listing_previous,
@@ -83,6 +111,15 @@ class _WeeklyState:
             )
             self._record_fetch_times("eod_quotes", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
+            _LOGGER.debug(
+                "provider_fetch_complete dataset=eod_quotes code=%s exchange=%s "
+                "rows=%d requests=%d action_changed=%s",
+                listing.code,
+                listing.exchange,
+                len(batch.rows),
+                batch.metrics.logical_requests,
+                action_changed,
+            )
         self.quotes = build_quote_gold(records)
         self.runtime.persist_gold(
             "eod_quotes",
@@ -104,25 +141,48 @@ class _WeeklyState:
         previous = _dividends_from_silver_rows(
             _load_silver_rows(self.runtime._layout.root, "dividends")
         )
+        previous_by_listing: dict[tuple[str, str, str], list[DividendEvent]] = {}
+        for event in previous:
+            previous_by_listing.setdefault(event.key[:3], []).append(event)
         records: list[DividendEvent] = []
+        jobs: list[tuple[ListingRecord, tuple[DividendEvent, ...], date | None]] = []
         requests = 0
         for listing in listings.rows:
-            listing_previous = tuple(record for record in previous if record.key[:3] == listing.key)
+            listing_previous = tuple(previous_by_listing.get(listing.key, ()))
             last_date = _latest_date(listing_previous)
             if not listing.is_active:
                 records.extend(listing_previous)
                 continue
-            batch = self.runtime.fetch_dividends(
-                listing,
-                last_event_date=last_date,
-                previous_records=listing_previous,
-            )
+            jobs.append((listing, listing_previous, last_date))
+
+        _LOGGER.info(
+            "provider_stage_start dataset=dividends jobs=%d workers=%d",
+            len(jobs),
+            self.max_workers,
+        )
+        batches = _parallel_fetch(
+            self.runtime,
+            jobs,
+            lambda worker, job: worker.fetch_dividends(
+                job[0], last_event_date=job[2], previous_records=job[1]
+            ),
+            self.max_workers,
+        )
+        for job, batch in zip(jobs, batches, strict=True):
+            listing, listing_previous, last_date = job
             merged = _replace_action_window(listing_previous, batch.rows, last_date)
             if _action_set_changed(listing_previous, merged):
                 self.action_changed_listings.add(listing.key)
             records.extend(merged)
             self._record_fetch_times("dividends", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
+            _LOGGER.debug(
+                "provider_fetch_complete dataset=dividends code=%s exchange=%s rows=%d requests=%d",
+                listing.code,
+                listing.exchange,
+                len(batch.rows),
+                batch.metrics.logical_requests,
+            )
         self.dividends = build_dividend_gold(records)
         self.runtime.persist_gold(
             "dividends",
@@ -149,25 +209,48 @@ class _WeeklyState:
     def ingest_splits(self) -> dict[str, JSONValue]:
         listings = self._require_listings()
         previous = _splits_from_silver_rows(_load_silver_rows(self.runtime._layout.root, "splits"))
+        previous_by_listing: dict[tuple[str, str, str], list[SplitEvent]] = {}
+        for event in previous:
+            previous_by_listing.setdefault(event.key[:3], []).append(event)
         records: list[SplitEvent] = []
+        jobs: list[tuple[ListingRecord, tuple[SplitEvent, ...], date | None]] = []
         requests = 0
         for listing in listings.rows:
-            listing_previous = tuple(record for record in previous if record.key[:3] == listing.key)
+            listing_previous = tuple(previous_by_listing.get(listing.key, ()))
             last_date = _latest_date(listing_previous)
             if not listing.is_active:
                 records.extend(listing_previous)
                 continue
-            batch = self.runtime.fetch_splits(
-                listing,
-                last_event_date=last_date,
-                previous_records=listing_previous,
-            )
+            jobs.append((listing, listing_previous, last_date))
+
+        _LOGGER.info(
+            "provider_stage_start dataset=splits jobs=%d workers=%d",
+            len(jobs),
+            self.max_workers,
+        )
+        batches = _parallel_fetch(
+            self.runtime,
+            jobs,
+            lambda worker, job: worker.fetch_splits(
+                job[0], last_event_date=job[2], previous_records=job[1]
+            ),
+            self.max_workers,
+        )
+        for job, batch in zip(jobs, batches, strict=True):
+            listing, listing_previous, last_date = job
             merged = _replace_action_window(listing_previous, batch.rows, last_date)
             if _action_set_changed(listing_previous, merged):
                 self.action_changed_listings.add(listing.key)
             records.extend(merged)
             self._record_fetch_times("splits", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
+            _LOGGER.debug(
+                "provider_fetch_complete dataset=splits code=%s exchange=%s rows=%d requests=%d",
+                listing.code,
+                listing.exchange,
+                len(batch.rows),
+                batch.metrics.logical_requests,
+            )
         self.splits = build_split_gold(records)
         self.runtime.persist_gold(
             "splits",
@@ -189,9 +272,7 @@ class _WeeklyState:
 
     def validate_gold(self) -> dict[str, JSONValue]:
         listings, quotes, dividends, splits = self._require_gold()
-        self.authoritative_snapshot = validate_complete_gold(
-            listings, quotes, dividends, splits
-        )
+        self.authoritative_snapshot = validate_complete_gold(listings, quotes, dividends, splits)
         return self.authoritative_snapshot.as_dict()
 
     def _require_authoritative_snapshot(self) -> GoldValidationSummary:
@@ -223,28 +304,24 @@ class _WeeklyState:
         return _sync_details(outcome)
 
     def sync_dividends(self) -> dict[str, JSONValue]:
-        outcome = self.runtime.publish_dividends(
-            self._require_dividends(),
-            fetched_at_by_key=cast(
-                dict[tuple[str, str, str, str], datetime],
-                self.fetched_at_by_dataset["dividends"],
-            ),
-            authoritative_snapshot=self._require_authoritative_snapshot(),
-        )
+        self._start_parallel_corporate_publication()
+        outcome = self._publication_futures["dividends"].result()
         self.outcomes["dividends"] = outcome
         return _sync_details(outcome)
 
     def sync_splits(self) -> dict[str, JSONValue]:
-        outcome = self.runtime.publish_splits(
-            self._require_splits(),
-            fetched_at_by_key=cast(
-                dict[tuple[str, str, str, str], datetime],
-                self.fetched_at_by_dataset["splits"],
-            ),
-            authoritative_snapshot=self._require_authoritative_snapshot(),
-        )
+        self._start_parallel_corporate_publication()
+        outcome = self._publication_futures["splits"].result()
         self.outcomes["splits"] = outcome
-        return _sync_details(outcome)
+        details = _sync_details(outcome)
+        details["stale_listings_deleted"] = self.runtime.prune_stale_listings(
+            self._require_listings()
+        )
+        executor = self._publication_executor
+        self._publication_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        return details
 
     def verify(self) -> dict[str, JSONValue]:
         listings, quotes, dividends, splits = self._require_gold()
@@ -260,7 +337,67 @@ class _WeeklyState:
                 raise RuntimeError("weekly PostgreSQL verification failed")
             return verification.as_dict()
         finally:
+            executor = self._publication_executor
+            self._publication_executor = None
+            if executor is not None:
+                executor.shutdown(wait=True)
             self.runtime.close()
+
+    def _start_parallel_corporate_publication(self) -> None:
+        if self._publication_futures:
+            return
+        database_worker = getattr(self.runtime, "database_worker", None)
+        if not callable(database_worker):
+            self._publication_futures = {
+                "dividends": _completed_future(
+                    self.runtime.publish_dividends(
+                        self._require_dividends(),
+                        fetched_at_by_key=cast(
+                            dict[tuple[str, str, str, str], datetime],
+                            self.fetched_at_by_dataset["dividends"],
+                        ),
+                        authoritative_snapshot=self._require_authoritative_snapshot(),
+                    )
+                ),
+                "splits": _completed_future(
+                    self.runtime.publish_splits(
+                        self._require_splits(),
+                        fetched_at_by_key=cast(
+                            dict[tuple[str, str, str, str], datetime],
+                            self.fetched_at_by_dataset["splits"],
+                        ),
+                        authoritative_snapshot=self._require_authoritative_snapshot(),
+                    )
+                ),
+            }
+            return
+
+        self._publication_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="xdl-postgres",
+        )
+        self._publication_futures = {
+            "dividends": self._publication_executor.submit(
+                _publish_dividends_worker,
+                database_worker,
+                self._require_dividends(),
+                cast(
+                    dict[tuple[str, str, str, str], datetime],
+                    self.fetched_at_by_dataset["dividends"],
+                ),
+                self._require_authoritative_snapshot(),
+            ),
+            "splits": self._publication_executor.submit(
+                _publish_splits_worker,
+                database_worker,
+                self._require_splits(),
+                cast(
+                    dict[tuple[str, str, str, str], datetime],
+                    self.fetched_at_by_dataset["splits"],
+                ),
+                self._require_authoritative_snapshot(),
+            ),
+        }
 
     def rehydrate(self, checkpoint: Mapping[str, Mapping[str, JSONValue]]) -> None:
         """Restore completed Gold and sync state, refusing mismatched artifacts."""
@@ -321,6 +458,17 @@ class _WeeklyState:
                     dataset,
                     checkpoint[stage],
                 )
+        if "gold_validation" in checkpoint:
+            listings, quotes, dividends, splits = self._require_gold()
+            self.authoritative_snapshot = validate_complete_gold(
+                listings,
+                quotes,
+                dividends,
+                splits,
+            )
+            expected = checkpoint["gold_validation"]
+            if self.authoritative_snapshot.as_dict() != dict(expected):
+                raise ValueError("checkpoint Gold validation does not match Gold artifacts")
 
     def _require_listings(self) -> ListingGoldResult:
         if self.listings is None:
@@ -390,8 +538,10 @@ def build_weekly_stages() -> PipelineStages:
     """Build the concrete factory referenced by the deployed Vienna cron entry."""
 
     state = _WeeklyState(
-        PostgresEodhdBootstrapRuntime.from_environment(quarantine_invalid_ohlc=True)
+        PostgresEodhdBootstrapRuntime.from_environment(quarantine_invalid_ohlc=True),
+        max_workers=resolve_weekly_workers(),
     )
+    _LOGGER.info("weekly_configuration workers=%d", state.max_workers)
     return PipelineStages(
         listings=state.ingest_listings,
         quotes=state.ingest_quotes,
@@ -420,8 +570,94 @@ def _sync_details(outcome: SyncOutcome) -> dict[str, JSONValue]:
     }
 
 
+def _completed_future(value: SyncOutcome) -> Future[SyncOutcome]:
+    future: Future[SyncOutcome] = Future()
+    future.set_result(value)
+    return future
+
+
+def _publish_dividends_worker(
+    database_worker: Callable[[], PostgresEodhdBootstrapRuntime],
+    gold: DividendGoldResult,
+    fetched_at_by_key: dict[tuple[str, str, str, str], datetime],
+    authoritative_snapshot: GoldValidationSummary,
+) -> SyncOutcome:
+    worker = database_worker()
+    try:
+        return worker.publish_dividends(
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
+    finally:
+        worker.close()
+
+
+def _publish_splits_worker(
+    database_worker: Callable[[], PostgresEodhdBootstrapRuntime],
+    gold: SplitGoldResult,
+    fetched_at_by_key: dict[tuple[str, str, str, str], datetime],
+    authoritative_snapshot: GoldValidationSummary,
+) -> SyncOutcome:
+    worker = database_worker()
+    try:
+        return worker.publish_splits(
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
+    finally:
+        worker.close()
+
+
 def _ingest_details(rows: int, requests: int, fingerprint: str) -> dict[str, JSONValue]:
     return {"rows": rows, "requests": requests, "fingerprint": fingerprint}
+
+
+def _parallel_fetch[JobT, ResultT](
+    runtime: PostgresEodhdBootstrapRuntime,
+    jobs: Sequence[JobT],
+    fetch: Callable[[PostgresEodhdBootstrapRuntime, JobT], FetchBatch[ResultT]],
+    max_workers: int,
+) -> tuple[FetchBatch[ResultT], ...]:
+    """Fetch independent provider jobs concurrently while preserving input order."""
+
+    def run(job: JobT) -> FetchBatch[ResultT]:
+        fetch_worker = getattr(runtime, "fetch_worker", None)
+        for attempt in range(1, 4):
+            try:
+                worker = runtime if not callable(fetch_worker) else fetch_worker()
+                return fetch(worker, job)
+            except RuntimeError as exc:
+                if attempt == 3:
+                    raise
+                _LOGGER.warning(
+                    "provider_fetch_retry attempt=%d error=%s",
+                    attempt,
+                    exc,
+                )
+                time.sleep(float(2**attempt))
+        raise AssertionError("provider fetch retry loop exhausted")
+
+    def execute(worker_count: int) -> tuple[FetchBatch[ResultT], ...]:
+        if worker_count == 1 or len(jobs) <= 1:
+            return tuple(run(job) for job in jobs)
+        with ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="xdl-fetch"
+        ) as executor:
+            return tuple(executor.map(run, jobs))
+
+    try:
+        return execute(max_workers)
+    except RuntimeError:
+        if max_workers <= _PROVIDER_STABLE_WORKERS:
+            raise
+        _LOGGER.warning(
+            "provider_parallel_fallback requested_workers=%d fallback_workers=%d",
+            max_workers,
+            _PROVIDER_STABLE_WORKERS,
+        )
+        return execute(_PROVIDER_STABLE_WORKERS)
 
 
 def _changed_listing_keys(keys: set[tuple[str, str, str]]) -> list[JSONValue]:
