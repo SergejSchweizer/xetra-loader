@@ -18,6 +18,22 @@ class GitPolicyValidatorTest(unittest.TestCase):
             pr_title="feat(xdl-pr015-eod-quote-ingestion): add deterministic quote ingestion",
         )
 
+
+    def test_weekly_review_branch_passes(self) -> None:
+        validate_policy(
+            branch="review/weekly-2026-09-28",
+            commit_subjects=["docs(review): weekly repository review 2026-09-28"],
+            pr_title="Weekly repository review -- 2026-09-28",
+        )
+
+    def test_weekly_review_branch_rejects_unexpected_commit(self) -> None:
+        with self.assertRaises(PolicyError):
+            validate_policy(
+                branch="review/weekly-2026-09-28",
+                commit_subjects=["docs(review): weekly repository review 2026-09-21"],
+                pr_title="Weekly repository review -- 2026-09-28",
+            )
+
     def test_branch_without_exact_work_order_fails(self) -> None:
         with self.assertRaises(PolicyError):
             validate_policy(
