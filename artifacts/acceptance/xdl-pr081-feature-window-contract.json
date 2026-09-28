@@ -1,0 +1,14 @@
+{
+  "work_order": "xdl-pr081-feature-window-contract-v2",
+  "status": "PASS",
+  "catalog_version": 2,
+  "checks": {
+    "price_level_and_derived_input_domains_are_explicit": true,
+    "lag_and_return_windows_require_n_plus_one_price_levels": true,
+    "intraday_windows_require_source_rows": true,
+    "overnight_gap_windows_require_n_plus_one_source_rows": true,
+    "cross_sectional_windows_count_valid_market_dates": true,
+    "return_geom_pct_is_decimal_fraction": true
+  },
+  "secrets_included": false
+}

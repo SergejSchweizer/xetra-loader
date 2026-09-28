@@ -241,7 +241,7 @@ ALTER FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], i
 REVOKE ALL ON FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], integer) FROM PUBLIC;
 
 COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
-    'XETRA feature view; catalog version=1; base levels=adjusted_close_level,volume_level';
+    'XETRA feature view; catalog version=2; base levels=adjusted_close_level,volume_level';
 
 REVOKE ALL ON xetra_loader.xetra_features FROM PUBLIC;
 GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app;

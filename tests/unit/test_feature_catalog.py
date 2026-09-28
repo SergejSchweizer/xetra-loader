@@ -4,6 +4,7 @@ from xetra_loader.features.catalog import (
     FEATURE_CATALOG_VERSION,
     FEATURE_SPECS,
     FORBIDDEN_LEVEL_COLUMNS,
+    ObservationCountDomain,
     feature_catalog_payload,
     feature_columns,
     validate_feature_catalog,
@@ -49,10 +50,27 @@ def test_only_three_feature_families_may_use_internal_ohlc() -> None:
 
 def test_catalog_fingerprint_is_stable_and_train_fold_fit_is_not_global() -> None:
     validate_feature_catalog()
-    assert FEATURE_CATALOG_VERSION == 1
+    assert FEATURE_CATALOG_VERSION == 2
     assert len(FEATURE_CATALOG_FINGERPRINT) == 64
     assert feature_catalog_payload()["train_fold_standardization"] == {
         "scope": "downstream_fold_aware_operation",
         "fit_rows": "train_only",
         "global_fit": False,
     }
+
+
+def test_catalog_declares_unambiguous_window_count_domains() -> None:
+    specs = {spec.name: spec for spec in FEATURE_SPECS}
+    assert (
+        specs["adjusted_close_log_return_5obs"].count_domain
+        is ObservationCountDomain.VALID_PRICE_LEVELS
+    )
+    assert specs["adjusted_close_log_return_5obs"].minimum_count == 6
+    assert specs["adjusted_close_return_mean_5obs"].minimum_count == 6
+    assert specs["high_low_range_5obs"].minimum_count == 5
+    assert specs["intraday_return_5obs"].minimum_count == 5
+    assert specs["overnight_gap_5obs"].minimum_count == 6
+    assert specs["adjusted_close_rsi_14obs"].minimum_count == 15
+    assert specs["breadth_daily"].count_domain is ObservationCountDomain.VALID_INSTRUMENT_RETURNS
+    assert specs["dispersion_daily"].minimum_count == 2
+    assert specs["breadth_20obs"].count_domain is ObservationCountDomain.VALID_MARKET_DATES

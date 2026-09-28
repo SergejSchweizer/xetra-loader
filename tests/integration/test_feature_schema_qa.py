@@ -93,7 +93,7 @@ def test_feature_schema_catalog_grants_and_types(tmp_path: Path) -> None:
             "adjusted_close_level:double precision",
             "volume_level:double precision",
         ],
-        "catalog_comment": bool(comment) and "catalog version=1" in comment[0],
+        "catalog_comment": bool(comment) and "catalog version=2" in comment[0],
         "portfell_select_only": privileges == ["t|f|f|f|f"],
         "forbidden_level_columns_absent": not any(
             name in actual_names
