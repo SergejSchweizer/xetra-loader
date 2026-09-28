@@ -14,6 +14,7 @@ from collections.abc import Sequence
 WORK_ORDER_PATTERN = r"xdl-pr\d{3}-[a-z0-9]+(?:-[a-z0-9]+)*"
 WORK_ORDER_RE = re.compile(rf"(?P<work_order>{WORK_ORDER_PATTERN})")
 BRANCH_RE = re.compile(rf"^[a-z][a-z0-9-]*/(?P<work_order>{WORK_ORDER_PATTERN})$")
+REVIEW_BRANCH_RE = re.compile(r"^review/weekly-(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})$")
 CONVENTIONAL_RE = re.compile(
     rf"^(?:feat|fix|refactor|test|docs|chore|ci|build)\((?P<work_order>{WORK_ORDER_PATTERN})\): .+"
     r"$"
