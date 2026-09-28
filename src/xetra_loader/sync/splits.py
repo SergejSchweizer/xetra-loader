@@ -10,6 +10,7 @@ from typing import Any, cast
 from psycopg import Connection, Cursor
 
 from xetra_loader.gold.splits import SplitGoldResult
+from xetra_loader.gold.validation import GoldValidationSummary
 from xetra_loader.sync.core import JSONValue, SyncCounters, SyncOutcome, run_sync
 
 
@@ -20,6 +21,7 @@ def sync_splits(
     run_id: str | None = None,
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
+    authoritative_snapshot: GoldValidationSummary | None = None,
 ) -> SyncOutcome:
     """Apply active split events and tombstone retractions in one transaction."""
 
@@ -100,6 +102,7 @@ def sync_splits(
         semantic_rows=semantic_rows,
         mutate=mutate,
         run_id=run_id,
+        authoritative_snapshot=authoritative_snapshot,
     )
 
 

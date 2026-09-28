@@ -10,6 +10,7 @@ from typing import Any, cast
 from psycopg import Connection, Cursor
 
 from xetra_loader.gold.dividends import DividendGoldResult
+from xetra_loader.gold.validation import GoldValidationSummary
 from xetra_loader.sync.core import JSONValue, SyncCounters, SyncOutcome, run_sync
 
 DividendSemantic = tuple[
@@ -30,6 +31,7 @@ def sync_dividends(
     run_id: str | None = None,
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
+    authoritative_snapshot: GoldValidationSummary | None = None,
 ) -> SyncOutcome:
     """Apply active dividend events and tombstone retractions in one transaction."""
 
@@ -117,6 +119,7 @@ def sync_dividends(
         semantic_rows=semantic_rows,
         mutate=mutate,
         run_id=run_id,
+        authoritative_snapshot=authoritative_snapshot,
     )
 
 

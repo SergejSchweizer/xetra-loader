@@ -9,6 +9,7 @@ from typing import Any, cast
 from psycopg import Connection, Cursor
 
 from xetra_loader.gold.quotes import QuoteGoldResult
+from xetra_loader.gold.validation import GoldValidationSummary
 from xetra_loader.sync.core import SyncCounters, SyncOutcome, run_sync
 
 
@@ -19,6 +20,7 @@ def sync_quotes(
     run_id: str | None = None,
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None = None,
+    authoritative_snapshot: GoldValidationSummary | None = None,
 ) -> SyncOutcome:
     """Insert new quote dates, update corrections, and skip semantic replays."""
 
@@ -40,6 +42,7 @@ def sync_quotes(
         semantic_rows=gold.semantic_rows(),
         mutate=mutate,
         run_id=run_id,
+        authoritative_snapshot=authoritative_snapshot,
     )
 
 

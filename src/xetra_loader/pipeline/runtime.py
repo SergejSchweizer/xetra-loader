@@ -18,7 +18,7 @@ from xetra_loader.gold.dividends import DividendGoldResult, build_dividend_gold
 from xetra_loader.gold.listings import ListingGoldResult, build_listing_gold
 from xetra_loader.gold.quotes import QuoteGoldResult, build_quote_gold
 from xetra_loader.gold.splits import SplitGoldResult, build_split_gold
-from xetra_loader.gold.validation import validate_complete_gold
+from xetra_loader.gold.validation import GoldValidationSummary, validate_complete_gold
 from xetra_loader.ingestion.corporate_actions import action_overlap_start
 from xetra_loader.medallion.core import JSONValue, Layer, Manifest, MedallionLayout, canonical_json
 from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime
@@ -36,6 +36,7 @@ class _WeeklyState:
     outcomes: dict[str, SyncOutcome] = field(default_factory=dict)
     action_changed_listings: set[tuple[str, str, str]] = field(default_factory=set)
     fetched_at_by_dataset: dict[str, dict[object, datetime]] = field(default_factory=dict)
+    authoritative_snapshot: GoldValidationSummary | None = None
 
     def ingest_listings(self) -> dict[str, JSONValue]:
         batch = self.runtime.fetch_listings()
@@ -188,7 +189,15 @@ class _WeeklyState:
 
     def validate_gold(self) -> dict[str, JSONValue]:
         listings, quotes, dividends, splits = self._require_gold()
-        return validate_complete_gold(listings, quotes, dividends, splits).as_dict()
+        self.authoritative_snapshot = validate_complete_gold(
+            listings, quotes, dividends, splits
+        )
+        return self.authoritative_snapshot.as_dict()
+
+    def _require_authoritative_snapshot(self) -> GoldValidationSummary:
+        if self.authoritative_snapshot is None:
+            raise RuntimeError("complete Gold validation must precede PostgreSQL sync")
+        return self.authoritative_snapshot
 
     def sync_listings(self) -> dict[str, JSONValue]:
         outcome = self.runtime.publish_listings(
@@ -208,6 +217,7 @@ class _WeeklyState:
                 dict[tuple[str, str, str, date], datetime],
                 self.fetched_at_by_dataset["eod_quotes"],
             ),
+            authoritative_snapshot=self._require_authoritative_snapshot(),
         )
         self.outcomes["eod_quotes"] = outcome
         return _sync_details(outcome)
@@ -219,6 +229,7 @@ class _WeeklyState:
                 dict[tuple[str, str, str, str], datetime],
                 self.fetched_at_by_dataset["dividends"],
             ),
+            authoritative_snapshot=self._require_authoritative_snapshot(),
         )
         self.outcomes["dividends"] = outcome
         return _sync_details(outcome)
@@ -230,6 +241,7 @@ class _WeeklyState:
                 dict[tuple[str, str, str, str], datetime],
                 self.fetched_at_by_dataset["splits"],
             ),
+            authoritative_snapshot=self._require_authoritative_snapshot(),
         )
         self.outcomes["splits"] = outcome
         return _sync_details(outcome)

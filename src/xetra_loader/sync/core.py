@@ -18,6 +18,7 @@ from xetra_loader.config import (
     resolve_postgres_admin_dsn,
     resolve_postgres_writer_dsn,
 )
+from xetra_loader.gold.validation import GoldValidationSummary
 
 type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, JSONValue]
 type SemanticRow = Mapping[str, JSONValue]
@@ -63,6 +64,10 @@ class SyncOutcome:
     @property
     def changed(self) -> bool:
         return self.status == "applied"
+
+
+class AuthoritativeSnapshotRequired(RuntimeError):
+    """Raised when destructive reconciliation lacks a validated Gold proof."""
 
 
 def connect_postgres(
@@ -111,6 +116,7 @@ def run_sync(
     mutate: Mutator,
     run_id: str | None = None,
     now: Callable[[], datetime] | None = None,
+    authoritative_snapshot: GoldValidationSummary | None = None,
 ) -> SyncOutcome:
     """Couple serving mutations and sync-state advance in one PostgreSQL transaction."""
 
@@ -118,6 +124,18 @@ def run_sync(
         raise ValueError("dataset must be non-empty")
     materialized_rows = tuple(semantic_rows)
     fingerprint, row_count = semantic_fingerprint(materialized_rows)
+    if authoritative_snapshot is None:
+        raise AuthoritativeSnapshotRequired(
+            f"complete Gold snapshot proof required before syncing {dataset!r}"
+        )
+    if not authoritative_snapshot.matches(
+        dataset,
+        row_count=row_count,
+        semantic_fingerprint=fingerprint,
+    ):
+        raise AuthoritativeSnapshotRequired(
+            f"Gold snapshot proof does not match dataset {dataset!r}"
+        )
     serving_row_count = sum(
         1 for row in materialized_rows if not bool(row.get("retracted", False))
     )

@@ -119,13 +119,16 @@ class FixtureRuntime:
     def publish_listings(self, gold: object) -> SyncOutcome:
         return self._publish("listings", gold.semantic_fingerprint, gold.row_count)
 
-    def publish_quotes(self, gold: object) -> SyncOutcome:
+    def publish_quotes(self, gold: object, **kwargs: object) -> SyncOutcome:
+        del kwargs
         return self._publish("eod_quotes", gold.semantic_fingerprint, gold.row_count)
 
-    def publish_dividends(self, gold: object) -> SyncOutcome:
+    def publish_dividends(self, gold: object, **kwargs: object) -> SyncOutcome:
+        del kwargs
         return self._publish("dividends", gold.semantic_fingerprint, gold.row_count)
 
-    def publish_splits(self, gold: object) -> SyncOutcome:
+    def publish_splits(self, gold: object, **kwargs: object) -> SyncOutcome:
+        del kwargs
         return self._publish("splits", gold.semantic_fingerprint, gold.row_count)
 
     def verify(

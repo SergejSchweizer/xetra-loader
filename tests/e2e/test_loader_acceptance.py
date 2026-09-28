@@ -109,11 +109,13 @@ class FixtureRuntime:
         pairs = [(tuple(row.key), row.semantic_dict()) for row in gold.rows]
         return self._publish("listings", pairs, gold.semantic_fingerprint, gold.row_count)
 
-    def publish_quotes(self, gold: object) -> SyncOutcome:
+    def publish_quotes(self, gold: object, **kwargs: object) -> SyncOutcome:
+        del kwargs
         pairs = [(tuple(row.key), row.semantic_dict()) for row in gold.rows]
         return self._publish("eod_quotes", pairs, gold.semantic_fingerprint, gold.row_count)
 
-    def publish_dividends(self, gold: object) -> SyncOutcome:
+    def publish_dividends(self, gold: object, **kwargs: object) -> SyncOutcome:
+        del kwargs
         pairs = [(tuple(row.key), row.business_fields()) for row in gold.rows]
         return self._publish(
             "dividends",
@@ -123,7 +125,8 @@ class FixtureRuntime:
             retracted=gold.retracted_keys,
         )
 
-    def publish_splits(self, gold: object) -> SyncOutcome:
+    def publish_splits(self, gold: object, **kwargs: object) -> SyncOutcome:
+        del kwargs
         pairs = [(tuple(row.key), row.business_fields()) for row in gold.rows]
         return self._publish(
             "splits",
