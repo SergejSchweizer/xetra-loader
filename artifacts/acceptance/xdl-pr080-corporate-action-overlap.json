@@ -1,0 +1,12 @@
+{
+  "work_order": "xdl-pr080-corporate-action-overlap-scope",
+  "status": "PASS",
+  "checks": {
+    "historical_events_before_overlap_are_preserved": true,
+    "in_window_removals_are_retracted": true,
+    "same_date_corrections_are_deterministic": true,
+    "unrelated_add_remove_changes_are_not_paired": true,
+    "dividend_and_split_paths_share_reconciliation_strategy": true
+  },
+  "secrets_included": false
+}

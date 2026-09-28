@@ -35,6 +35,13 @@ def _same_date_payload(first: str = "2:1", second: str = "3:1") -> JSONValue:
     ]
 
 
+def _dated_payload() -> JSONValue:
+    return [
+        {"date": "2026-08-10", "split": "2:1"},
+        {"date": "2026-08-20", "split": "3:1"},
+    ]
+
+
 def test_full_history_and_overlap_requests() -> None:
     full_transport = FixtureTransport(_payload())
     ingest_splits(full_transport, _listing())
@@ -113,3 +120,20 @@ def test_same_date_events_reconcile_as_a_content_addressed_set() -> None:
     assert removed.correction_count == 0
     assert removed.retraction_count == 1
     assert sum(event.status is ActionStatus.RETRACTED for event in removed.silver_records) == 1
+
+
+def test_bounded_response_preserves_history_before_overlap_boundary() -> None:
+    first = ingest_splits(FixtureTransport(_dated_payload()), _listing())
+    bounded = ingest_splits(
+        FixtureTransport(_payload("3:1")),
+        _listing(),
+        last_event_date=date(2026, 8, 22),
+        previous_records=first.silver_records,
+    )
+
+    assert {event.event_date for event in bounded.silver_records} == {
+        date(2026, 8, 10),
+        date(2026, 8, 20),
+    }
+    assert bounded.removed_count == 0
+    assert bounded.retraction_count == 0

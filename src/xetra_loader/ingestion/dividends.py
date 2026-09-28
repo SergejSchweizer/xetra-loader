@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 from typing import Protocol
 
@@ -16,11 +16,12 @@ from xetra_loader.contracts.corporate_actions import (
 )
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.contracts.numeric import provider_decimal
+from xetra_loader.ingestion.corporate_actions import (
+    action_overlap_start,
+    reconcile_action_window,
+)
 
 type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, JSONValue]
-
-_OVERLAP_DAYS = 7
-
 
 class JsonTransport(Protocol):
     def get_json(
@@ -34,8 +35,16 @@ class JsonTransport(Protocol):
 class DividendIngestionResult:
     bronze_payload: str
     silver_records: tuple[DividendEvent, ...]
+    added_count: int
+    removed_count: int
     correction_count: int
     retraction_count: int
+
+    @property
+    def change_set_count(self) -> int:
+        """Return the number of added and removed event keys."""
+
+        return self.added_count + self.removed_count
 
 
 def ingest_dividends(
@@ -48,8 +57,9 @@ def ingest_dividends(
     """Fetch history and reconcile authoritative event sets by content-addressed key."""
 
     params: dict[str, str | int | float] = {}
-    if last_event_date is not None:
-        params["from"] = (last_event_date - timedelta(days=_OVERLAP_DAYS)).isoformat()
+    boundary = action_overlap_start(last_event_date)
+    if boundary is not None:
+        params["from"] = boundary.isoformat()
     payload = transport.get_json(f"div/{listing.code}.{listing.exchange}", params or None)
     if not isinstance(payload, list):
         raise ValueError("EODHD dividend response must be a JSON array")
@@ -65,19 +75,14 @@ def ingest_dividends(
     active_previous = tuple(
         record for record in previous_records if record.status is ActionStatus.ACTIVE
     )
-    previous_by_key = _by_event_key(active_previous)
-    current_by_key = _by_event_key(current)
-    reconciled: list[DividendEvent] = list(current_by_key.values())
-    removed_keys = tuple(sorted(previous_by_key.keys() - current_by_key.keys()))
-    added_keys = current_by_key.keys() - previous_by_key.keys()
-    corrections = min(len(removed_keys), len(added_keys))
-    retractions = len(removed_keys) - corrections
-
-    for event_key in removed_keys:
-        reconciled.append(retract_dividend(previous_by_key[event_key]))
 
     bronze_rows.sort(key=_canonical_row)
-    reconciled.sort(key=lambda event: (event.event_date, event.event_key, event.status.value))
+    reconciliation = reconcile_action_window(
+        active_previous,
+        current,
+        last_event_date=last_event_date,
+        retract=retract_dividend,
+    )
     return DividendIngestionResult(
         bronze_payload=json.dumps(
             bronze_rows,
@@ -86,9 +91,11 @@ def ingest_dividends(
             separators=(",", ":"),
             default=str,
         ),
-        silver_records=tuple(reconciled),
-        correction_count=corrections,
-        retraction_count=retractions,
+        silver_records=reconciliation.records,
+        added_count=reconciliation.added_count,
+        removed_count=reconciliation.removed_count,
+        correction_count=reconciliation.correction_count,
+        retraction_count=reconciliation.retraction_count,
     )
 
 
@@ -108,13 +115,6 @@ def _normalize_dividend(
         record_date=_optional_date(row.get("recordDate")),
         payment_date=_optional_date(row.get("paymentDate")),
     )
-
-
-def _by_event_key(records: Iterable[DividendEvent]) -> dict[str, DividendEvent]:
-    result: dict[str, DividendEvent] = {}
-    for record in records:
-        result[record.event_key] = record
-    return result
 
 
 def _required_text(row: Mapping[str, JSONValue], key: str) -> str:

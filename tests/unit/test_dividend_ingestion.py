@@ -55,6 +55,13 @@ def _same_date_payload(first: float = 1.25, second: float = 2.5) -> JSONValue:
     ]
 
 
+def _dated_payload() -> JSONValue:
+    return [
+        {"date": "2026-08-10", "value": 0.75, "currency": "EUR"},
+        {"date": "2026-08-20", "value": 1.25, "currency": "EUR"},
+    ]
+
+
 def test_full_history_and_overlap_requests() -> None:
     full_transport = FixtureTransport(_payload())
     ingest_dividends(full_transport, _listing())
@@ -129,3 +136,44 @@ def test_same_date_events_reconcile_as_a_content_addressed_set() -> None:
     assert removed.correction_count == 0
     assert removed.retraction_count == 1
     assert sum(event.status is ActionStatus.RETRACTED for event in removed.silver_records) == 1
+
+
+def test_bounded_response_preserves_history_before_overlap_boundary() -> None:
+    first = ingest_dividends(FixtureTransport(_dated_payload()), _listing())
+    bounded = ingest_dividends(
+        FixtureTransport(_payload()),
+        _listing(),
+        last_event_date=date(2026, 8, 22),
+        previous_records=first.silver_records,
+    )
+
+    assert {event.event_date for event in bounded.silver_records} == {
+        date(2026, 8, 10),
+        date(2026, 8, 20),
+    }
+    assert bounded.removed_count == 1
+    assert bounded.correction_count == 1
+    assert bounded.retraction_count == 0
+    assert all(
+        event.status is ActionStatus.ACTIVE
+        for event in bounded.silver_records
+        if event.event_date == date(2026, 8, 10)
+    )
+
+
+def test_unrelated_add_and_remove_are_not_counted_as_one_correction() -> None:
+    first = ingest_dividends(FixtureTransport(_dated_payload()), _listing())
+    current = FixtureTransport(
+        [{"date": "2026-08-21", "value": 2.0, "currency": "EUR"}]
+    )
+    result = ingest_dividends(
+        current,
+        _listing(),
+        previous_records=first.silver_records,
+    )
+
+    assert result.added_count == 1
+    assert result.removed_count == 2
+    assert result.change_set_count == 3
+    assert result.correction_count == 0
+    assert result.retraction_count == 2
