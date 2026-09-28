@@ -1,4 +1,4 @@
-Last reviewed: 2026-09-26
+Last reviewed: 2026-09-28
 
 # XETRA Data Loader — Atomic Parallel Backlog
 
@@ -612,6 +612,422 @@ Status: closed as superseded. The external audit branch proposed removing the
 approved PR069 train-fold contract and changing the already merged feature-view
 and role semantics. Its final disposition is recorded here; the current
 backlog and `origin/main` remain authoritative.
+
+## 0.1 Post-PR078 corrective audit wave — reviewed 2026-09-28
+
+Audit target: `origin/main@aae18d8043366ee842ffe16694b7f0c164a15d16`
+(after the merged XDL-PR078 RSI scalability change). This audit reviewed the
+current contracts, ingestion/reconciliation path, Gold publication, PostgreSQL
+authoritative sync, feature formulas/catalog metadata, independent feature QA,
+runtime resource settings, and duplicate serving DTOs.
+
+This section is corrective authority for findings that remain open after the
+merged feature-serving program. It does not silently change existing numerical
+semantics; each semantic change below requires explicit tests and a catalog or
+contract version change where applicable.
+
+Recent work-order inventory that was missing from this authority file:
+
+- XDL-PR071 `xdl-pr071-current-repository-documentation`: merged via GitHub PR
+  #75, commit `19f005ad`;
+- XDL-PR072 through XDL-PR075: no repository work-order commits were found and
+  these identifiers remain unused rather than being inferred;
+- XDL-PR076 `xdl-pr076-feature-view-deployment`: merged via GitHub PR #76,
+  commit `358e2c23`;
+- XDL-PR077 `xdl-pr077-feature-schema-inventory`: merged via GitHub PR #77,
+  commit `ea8764c5`;
+- XDL-PR078 `xdl-pr078-stable-rsi-feature-view`: merged via GitHub PR #78,
+  commit `aae18d80`.
+
+### Confirmed audit findings
+
+1. **Critical — corporate-action overlap reconciliation can retract history
+   outside the requested overlap.** Weekly runtime passes the complete prior
+   listing history into dividend/split ingestion while the provider request is
+   bounded to `last_event_date - 7 days`. Ingestion compares that bounded
+   provider result with all prior active events, so every older event absent
+   from the bounded response is classified as removed. The subsequent
+   `_replace_action_window` merge lets those generated tombstones overwrite
+   the retained active events. This can remove valid historical dividends or
+   splits from Silver, Gold, and PostgreSQL and can trigger unnecessary full
+   quote-history refreshes.
+
+2. **High — feature minimum-observation metadata is not a faithful null-boundary
+   contract.** `FeatureSpec.min_observations` mixes source-row counts and
+   derived-input counts. In particular the 5-observation high-low and intraday
+   features are catalogued with minimum 1, and the 5-observation overnight gap
+   is catalogued with minimum 2 although its SQL requires five valid gaps. A
+   rolling window of five one-observation log returns requires six valid price
+   levels; a 14-period RSI requires fifteen valid price levels. The catalog
+   must make the counting domain explicit rather than using one ambiguous
+   integer.
+
+3. **High — RSI currently converts invalid adjusted-close transitions into flat
+   returns.** `rsi_arrays` and `wilder_rsi` coalesce missing gains/losses to
+   zero. Because `adjusted_close` is nullable and non-positive prices are
+   rejected only at feature-calculation time, a missing/non-positive transition
+   can be interpreted as zero gain and zero loss instead of producing/resetting
+   NULL state. The flat-series edge is also ambiguous: both average gain and
+   average loss equal zero, while the current implementation returns 100 solely
+   because average loss is zero.
+
+4. **High — the independent cross-sectional QA oracle assumes identical trading
+   calendars.** `tests/qa/feature_reference.py` indexes every instrument's
+   return vector by the positional index of the global date vector. Staggered
+   listing histories or missing quote dates therefore mis-associate returns
+   with dates or can index past the end of a series. The production SQL groups
+   by actual `trade_date`, so the current positive-path fixture does not test
+   an important production condition.
+
+5. **Medium — feature refresh embeds a fixed `work_mem = '1GB'`.** PostgreSQL
+   `work_mem` is a per-operation/per-worker budget, not a transaction-wide
+   memory cap. The feature query has multiple sorts/windows and full-instrument
+   RSI arrays, so hard-coding 1 GB in both DDL and the SECURITY DEFINER refresh
+   function can multiply memory consumption and makes deployment behavior
+   host-dependent.
+
+6. **High — authoritative sync APIs do not prove snapshot completeness before
+   destructive reconciliation.** Quote, dividend, and split publication delete
+   database rows absent from the supplied Gold object. This is correct only for
+   a complete authoritative snapshot, but the public function signatures accept
+   the same result type for any caller. A partial/per-listing Gold object can
+   therefore be interpreted as the complete desired state and delete unrelated
+   rows. This falls short of the PR050 requirement that only complete merged
+   Gold state be accepted for authoritative publication.
+
+7. **Medium — serving-domain models duplicate contracts with divergent
+   invariants.** `xetra_loader.market.models` duplicates listing/quote/action
+   DTOs while the live pipeline uses `contracts/*`. `ListingRow` does not
+   contain `is_active`, and `QuoteRow` does not enforce the finite,
+   non-negative and OHLC-range checks enforced by `QuoteRecord`. Keeping both
+   representations creates schema drift risk and ambiguous ownership of
+   validation.
+
+8. **Medium — duplicate listing identities are silently last-write-wins before
+   Gold validation.** Active provider rows are normalized and then collapsed
+   through a dict keyed by `(isin, exchange, code)`. If the provider emits two
+   rows with the same identity but conflicting metadata, provider ordering can
+   choose the surviving semantic row instead of failing closed. Gold duplicate
+   detection cannot catch this because the duplicate has already been
+   collapsed.
+
+The `*_return_geom_*obs_pct` numerical implementation is **not** to be
+multiplied by 100 in this wave. The canonical macro-loader contract uses the
+same suffix for a decimal fraction (`0.05` means 5%). XETRA must document that
+unit explicitly in the catalog so the name cannot be misread.
+
+### Corrective dependency graph
+
+```text
+PR079  post-PR078 corrective backlog (this planning PR)
+  ├─ PR080  corporate-action overlap scope
+  ├─ PR081  feature window/null-boundary contract v2
+  │    └─ PR082  RSI invalid/flat-series semantics
+  │         ├─ PR083  sparse-calendar independent feature oracle
+  │         └─ PR084  bounded feature-refresh memory policy
+  ├─ PR085  authoritative sync snapshot guard
+  ├─ PR086  serving-domain model consolidation
+  └─ PR087  duplicate listing identity guard
+
+PR080 + PR081 + PR082 + PR083 + PR084 + PR085 + PR086 + PR087
+  └─ PR088  corrective complete-run acceptance gate
+```
+
+### PR079 — xdl-pr079-post-pr078-corrective-backlog
+
+Branch `docs/xdl-pr079-post-pr078-corrective-backlog`; commit scope
+`docs(xdl-pr079-post-pr078-corrective-backlog): ...`; depends on XDL-PR078.
+
+Owned path: `BACKLOG.md` only.
+
+Tasks:
+
+- record the post-PR078 findings without changing runtime code;
+- restore the missing merged XDL-PR071/XDL-PR076/XDL-PR077/XDL-PR078 status
+  inventory and explicitly leave XDL-PR072..075 unused;
+- define atomic corrective work orders and dependencies;
+- distinguish confirmed defects from semantic choices that require a frozen
+  contract.
+
+Acceptance:
+
+- every finding above maps to exactly one implementation work order;
+- no production SQL/Python behavior changes in this PR;
+- branch, commit and PR title satisfy repository work-order policy.
+
+### PR080 — xdl-pr080-corporate-action-overlap-scope
+
+Branch `fix/xdl-pr080-corporate-action-overlap-scope`; commit scope
+`fix(xdl-pr080-corporate-action-overlap-scope): ...`; depends on PR079.
+
+Owned paths: dividend/split ingestion, weekly action-window merge, directly
+related unit/integration tests, and sanitized acceptance evidence.
+
+Tasks:
+
+- define one correction-window boundary and reuse it for request construction,
+  previous-event comparison, and merge replacement;
+- compare a bounded provider response only with prior events inside that same
+  authoritative window;
+- preserve every active event strictly before the overlap boundary unless a
+  full-history fetch explicitly proves its removal;
+- prevent generated retraction rows from overwriting retained out-of-window
+  active rows;
+- replace the current
+  `min(len(removed_keys), len(added_keys))` correction heuristic with
+  deterministic added/retracted/change-set metrics; do not label unrelated
+  add/remove pairs as one correction;
+- retain the existing behavior that a genuine corporate-action change marks the
+  listing for a full adjusted-close quote refresh.
+
+Acceptance:
+
+- with last event date 2026-08-22, an event dated 2026-08-10 remains active when
+  the bounded provider response begins 2026-08-15;
+- an event inside the authoritative overlap that disappears is retracted;
+- a corrected in-window event yields deterministic old-key retraction plus
+  new-key activation;
+- same-date multiple events remain distinct and order-independent;
+- Silver, Gold and PostgreSQL all preserve out-of-window history;
+- unchanged bounded replay is a semantic no-op and does not trigger a full
+  quote-history refresh;
+- regression coverage exercises dividends and splits end to end.
+
+### PR081 — xdl-pr081-feature-window-contract-v2
+
+Branch `fix/xdl-pr081-feature-window-contract-v2`; commit scope
+`fix(xdl-pr081-feature-window-contract-v2): ...`; depends on PR079.
+
+Owned paths: feature catalog/version, contract documentation, catalog/schema
+tests, and boundary fixtures. Do not change RSI recurrence in this PR.
+
+Tasks:
+
+- replace ambiguous `min_observations` metadata with an explicit counting
+  contract that distinguishes source rows/levels from valid derived inputs;
+- freeze exact first-valid-row/null boundaries for every family;
+- encode at minimum: lag-`n` log return and ROC require `n+1` valid price
+  levels; an `n`-window of one-observation returns requires `n+1` valid price
+  levels; high-low/intraday `n` require `n` valid rows; overnight gap `n`
+  requires `n+1` valid rows; RSI period `n` requires `n+1` valid price
+  levels; SMA/drawdown/volume windows require their explicit window lengths;
+- define daily breadth minimum one valid instrument return and daily dispersion
+  minimum two valid instrument returns; rolling cross-sectional windows count
+  actual valid market dates;
+- document `*_return_geom_*obs_pct` as a decimal fraction, matching
+  macro-loader, with no numerical x100 conversion;
+- bump the feature catalog version/fingerprint because contract metadata is
+  semantic.
+
+Acceptance:
+
+- tests assert every catalog family/window against its first valid source row;
+- five one-observation returns cannot appear before six valid price levels;
+- `high_low_range_5obs` and `intraday_return_5obs` require five valid rows;
+- `overnight_gap_5obs` requires six valid rows;
+- `adjusted_close_rsi_14obs` cannot be valid before fifteen valid levels;
+- catalog, SQL comment, README/docs and QA fixtures report the same version and
+  units.
+
+### PR082 — xdl-pr082-rsi-null-and-zero-loss-semantics
+
+Branch `fix/xdl-pr082-rsi-null-and-zero-loss-semantics`; commit scope
+`fix(xdl-pr082-rsi-null-and-zero-loss-semantics): ...`; depends on PR081.
+
+Owned paths: RSI helper/SQL, RSI catalog formula text, independent reference
+implementation, RSI-specific tests and acceptance evidence.
+
+Tasks:
+
+- stop coercing invalid/missing gain/loss observations to zero;
+- define an invalid adjusted-close transition as a break in the Wilder state;
+  output NULL until a fresh run contains the full period of consecutive valid
+  changes, then seed and resume the Wilder recurrence;
+- preserve the mathematical limit RSI=100 when average loss is zero and
+  average gain is positive, and RSI=0 when average gain is zero and average
+  loss is positive;
+- define the `average_gain = average_loss = 0` flat-series case as NULL rather
+  than 100 because the relative-strength ratio is undefined;
+- keep implementation causal and bounded enough for full-history production
+  refreshes.
+
+Acceptance:
+
+- SQL and the independent Python reference agree on monotone up, monotone down,
+  flat, missing, zero, and recovery-after-gap fixtures;
+- no NULL/invalid transition is silently replaced with a zero return;
+- changing any future observation cannot alter an earlier RSI;
+- complete positive input reproduces the pre-PR082 Wilder values within the
+  existing numerical tolerance;
+- production-scale refresh remains within the resource gate defined by PR084.
+
+### PR083 — xdl-pr083-sparse-calendar-feature-oracle
+
+Branch `test/xdl-pr083-sparse-calendar-feature-oracle`; commit scope
+`test(xdl-pr083-sparse-calendar-feature-oracle): ...`; depends on PR082.
+
+Owned paths: `tests/qa/feature_reference.py`, feature-calculation fixtures,
+feature QA tests and sanitized report generation only.
+
+Tasks:
+
+- key reference returns by `(code, trade_date)` instead of positional index in
+  a global date array;
+- compute breadth/dispersion from instruments that actually have a valid return
+  on that date;
+- support staggered listing starts, missing quote dates and unequal instrument
+  history lengths without IndexError or date misalignment;
+- add sparse-calendar fixtures that differ from the production SQL
+  implementation structurally enough to remain an independent oracle.
+
+Acceptance:
+
+- a late-starting instrument contributes only after it has a valid prior price;
+- an instrument missing one date does not shift later returns onto the wrong
+  global dates;
+- cross-sectional sample dispersion uses exactly the valid instruments for each
+  date;
+- the oracle and PostgreSQL agree on sparse/staggered fixtures and existing
+  complete-grid fixtures.
+
+### PR084 — xdl-pr084-feature-refresh-memory-policy
+
+Branch `refactor/xdl-pr084-feature-refresh-memory-policy`; commit scope
+`refactor(xdl-pr084-feature-refresh-memory-policy): ...`; depends on PR082.
+
+Owned paths: feature refresh SQL/runtime configuration, deployment
+documentation and performance/resource acceptance tests.
+
+Tasks:
+
+- remove the unconditional 1 GB `work_mem` override from DDL and the refresh
+  SECURITY DEFINER function;
+- make memory policy deployment-configurable or rely on an explicitly
+  documented PostgreSQL setting with a conservative default;
+- measure refresh wall time and peak database memory on a representative
+  full-history fixture before accepting a replacement setting;
+- ensure the RSI implementation does not create an unbounded
+  all-universe-in-memory aggregation.
+
+Acceptance:
+
+- no SQL function hard-codes `work_mem = '1GB'`;
+- the configured budget is visible in deployment documentation and has a
+  fail-closed validation path;
+- feature values/fingerprints are unchanged by memory-policy configuration;
+- representative refresh completes without OOM and without violating the
+  numerical QA gate.
+
+### PR085 — xdl-pr085-authoritative-sync-snapshot-guard
+
+Branch `fix/xdl-pr085-authoritative-sync-snapshot-guard`; commit scope
+`fix(xdl-pr085-authoritative-sync-snapshot-guard): ...`; depends on PR079.
+
+Owned paths: Gold-to-PostgreSQL publication boundary, sync APIs, completeness
+proof/token, and destructive-reconciliation tests.
+
+Tasks:
+
+- introduce an explicit complete-authoritative-snapshot type/proof produced only
+  after complete Gold validation;
+- require that proof before quote/dividend/split reconciliation may delete rows
+  absent from the desired state;
+- make partial/per-listing publication either non-destructive and scoped or
+  reject it before any mutation;
+- tie the proof to dataset identity/fingerprint so it cannot be reused for a
+  different snapshot;
+- preserve PR050 exact-state reconciliation for validated complete snapshots.
+
+Acceptance:
+
+- passing a one-listing subset of a multi-listing Gold dataset cannot delete
+  unrelated PostgreSQL rows;
+- a partial snapshot fails before DML unless an explicit non-destructive scoped
+  API is used;
+- a valid complete snapshot still inserts, updates and deletes to exact Gold
+  state atomically;
+- row-digest/sync-state verification remains consistent with the guarded
+  snapshot fingerprint.
+
+### PR086 — xdl-pr086-serving-domain-model-consolidation
+
+Branch `refactor/xdl-pr086-serving-domain-model-consolidation`; commit scope
+`refactor(xdl-pr086-serving-domain-model-consolidation): ...`; depends on PR079.
+
+Owned paths: `src/xetra_loader/market/*`, contract imports, typed-model tests,
+and documentation describing the single validation authority.
+
+Tasks:
+
+- remove or consolidate duplicate DTOs so one model layer owns serving
+  invariants;
+- ensure listing lifecycle includes `is_active` everywhere it is represented;
+- ensure quote models share finite/non-negative numeric validation, volume
+  validation and OHLC ordering constraints instead of implementing different
+  subsets;
+- eliminate unused compatibility types rather than maintaining two drifting
+  contracts.
+
+Acceptance:
+
+- one documented type is authoritative for each listing/quote/dividend/split
+  semantic row;
+- no duplicate model omits `is_active` or weakens quote invariants;
+- current ingestion, Gold, sync and test call sites use the consolidated
+  contract without semantic fingerprint changes.
+
+### PR087 — xdl-pr087-duplicate-listing-identity-guard
+
+Branch `fix/xdl-pr087-duplicate-listing-identity-guard`; commit scope
+`fix(xdl-pr087-duplicate-listing-identity-guard): ...`; depends on PR079.
+
+Owned paths: listing normalization/lifecycle merge and listing contract tests.
+
+Tasks:
+
+- detect duplicate `(isin, exchange, code)` identities before dict collapse;
+- permit exact duplicate rows only if explicitly documented as provider
+  deduplication, otherwise reject duplicates; conflicting metadata must always
+  fail closed;
+- make active-vs-delisted precedence explicit and deterministic;
+- ensure provider input order cannot change the resulting Silver semantic row.
+
+Acceptance:
+
+- two conflicting active rows with one identity fail deterministically;
+- reversing provider row order cannot change Silver or Gold fingerprints;
+- active/delisted overlap follows one documented precedence rule;
+- normal unique provider payload behavior remains unchanged.
+
+### PR088 — xdl-pr088-corrective-complete-run-gate
+
+Branch `test/xdl-pr088-corrective-complete-run-gate`; commit scope
+`test(xdl-pr088-corrective-complete-run-gate): ...`; depends on
+PR080+PR081+PR082+PR083+PR084+PR085+PR086+PR087.
+
+Owned paths: production-like acceptance tests and sanitized evidence only.
+
+Tasks:
+
+- run one complete multi-listing history with old and recent corporate actions,
+  sparse quote calendars, missing/zero adjusted-close edge cases and feature
+  refresh;
+- exercise restart from checkpoints before and after corporate-action stages;
+- publish to real PostgreSQL test service through the guarded authoritative
+  snapshot path;
+- compare every feature column against the corrected independent oracle;
+- record row counts, key equality, feature catalog version/fingerprint and
+  resource-gate evidence without credentials or raw provider payloads.
+
+Acceptance:
+
+- historical corporate actions outside the overlap survive an incremental run;
+- only proved in-window removals become tombstones;
+- sparse-calendar breadth/dispersion and RSI edge fixtures match the reference;
+- no partial authoritative sync can erase unrelated rows;
+- repeated identical complete run is a semantic no-op;
+- lint, type, unit, integration, policy, push-gate and merge-gate all pass;
+- sanitized corrective acceptance artifact reports `PASS`.
 
 ## 1. Status authority
 
