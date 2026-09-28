@@ -1,0 +1,13 @@
+{
+  "work_order": "xdl-pr082-rsi-null-and-zero-loss-semantics",
+  "status": "PASS",
+  "checks": {
+    "monotone_up_is_100": true,
+    "monotone_down_is_0": true,
+    "flat_series_is_null": true,
+    "invalid_transition_resets_state": true,
+    "zero_and_negative_price_transitions_are_invalid": true,
+    "sql_and_python_edge_semantics_agree": true
+  },
+  "secrets_included": false
+}
