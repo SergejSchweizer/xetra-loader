@@ -13,5 +13,6 @@ build/
 .env
 config.yaml
 artifacts/cron/*.log
+.logs/
 .data/
 lake/

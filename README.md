@@ -87,6 +87,12 @@ The view deliberately contains no `open_level`, `high_level`, `low_level`, or
 values are used only for high-low range, intraday return, and overnight gap.
 
 The deployed scheduler is Sunday `08:00` in `Europe/Vienna` and invokes the
-restart-safe `xdl-weekly` runner. The real-target acceptance run remains an
+restart-safe `xdl-weekly` runner. Provider fetches use up to 32 bounded
+workers (`weekly.workers`); the quote publication uses set-based `COPY` and
+UPSERT operations, while dividends and splits publish concurrently on
+independent writer connections after the quote transaction. The feature-view
+refresh remains one atomic PostgreSQL operation so that consumers never see a
+partially refreshed feature set. Debug output is written to the ignored
+`.logs/xdl-weekly.log` file. The real-target acceptance run remains an
 operational deployment step and requires valid access to the configured
 PostgreSQL instance.

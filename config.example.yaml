@@ -15,3 +15,7 @@ postgres:
 
 medallion:
   root: "./lake"
+
+weekly:
+  # Bounded concurrent EODHD fetches; PostgreSQL publication remains serialized.
+  workers: 32

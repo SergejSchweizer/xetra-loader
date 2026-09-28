@@ -44,3 +44,14 @@ def test_weekly_runner_uses_medallion_root_for_lock_and_checkpoint(tmp_path: Pat
     ]
     assert (tmp_path / "weekly.lock").exists()
     assert not (tmp_path / "weekly.checkpoint.json").exists()
+
+
+def test_weekly_runner_writes_debug_log(tmp_path: Path, monkeypatch) -> None:
+    log_dir = tmp_path / "logs"
+    monkeypatch.setenv("XDL_LOG_DIR", str(log_dir))
+
+    assert main(stages_factory=lambda: _stages([]), medallion_root=tmp_path / "lake") == 0
+
+    log = (log_dir / "xdl-weekly.log").read_text(encoding="utf-8")
+    assert "weekly_start" in log
+    assert "stage_success name=verification" in log
