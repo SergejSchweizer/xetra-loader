@@ -43,7 +43,7 @@ from xetra_loader.ops.reset import build_reset_plan, execute_reset
 from xetra_loader.sync import connect_postgres
 from xetra_loader.sync.core import SyncOutcome
 from xetra_loader.sync.dividends import sync_dividends
-from xetra_loader.sync.listings import sync_listings
+from xetra_loader.sync.listings import prune_stale_listings, sync_listings
 from xetra_loader.sync.quotes import sync_quotes
 from xetra_loader.sync.splits import sync_splits
 
@@ -161,6 +161,7 @@ class BootstrapRuntime(Protocol):
     """Provider, persistence, publication, and verification boundary for bootstrap."""
 
     def reset_owned_state(self) -> None: ...
+    def database_worker(self) -> BootstrapRuntime: ...
     def fetch_listings(self) -> FetchBatch[ListingRecord]: ...
     def fetch_quotes(
         self,
@@ -295,9 +296,7 @@ def run_full_bootstrap(
         "dividends": _publish_dividends(
             runtime, dividend_gold, dividend_fetch_times, authoritative_snapshot
         ),
-        "splits": _publish_splits(
-            runtime, split_gold, split_fetch_times, authoritative_snapshot
-        ),
+        "splits": _publish_splits(runtime, split_gold, split_fetch_times, authoritative_snapshot),
     }
     verification = runtime.verify(
         listing_gold,
@@ -499,12 +498,18 @@ class _AttemptCounter:
 
 class _MeasuredTransport:
     def __init__(self, token: str | None = None) -> None:
+        self._token = resolve_eodhd_token(token)
         self._opener = _AttemptCounter()
         self._transport = EodhdTransport(
-            token=resolve_eodhd_token(token),
+            token=self._token,
             opener=self._opener.open,
         )
         self.logical_requests = 0
+
+    def clone(self) -> _MeasuredTransport:
+        """Create an independent HTTP counter/connection seam for one fetch worker."""
+
+        return _MeasuredTransport(self._token)
 
     @property
     def attempts(self) -> int:
@@ -575,6 +580,33 @@ class PostgresEodhdBootstrapRuntime:
             connection=self._connection,
         )
         self._initialize_database()
+
+    def fetch_worker(self) -> PostgresEodhdBootstrapRuntime:
+        """Return a fetch-only worker with independent HTTP state.
+
+        Fetch methods write only listing-specific Bronze/Silver partitions. The
+        shared PostgreSQL connection is intentionally used only by the parent
+        runtime during serialized publication.
+        """
+
+        return type(self)(
+            connection=self._connection,
+            transport=self._transport.clone(),
+            medallion_root=self._layout.root,
+            repository_root=self._repository_root,
+            quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
+        )
+
+    def database_worker(self) -> PostgresEodhdBootstrapRuntime:
+        """Return a publication worker with an independent writer connection."""
+
+        return type(self)(
+            connection=connect_postgres(require_non_superuser=True),
+            transport=self._transport.clone(),
+            medallion_root=self._layout.root,
+            repository_root=self._repository_root,
+            quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
+        )
 
     def fetch_listings(self) -> FetchBatch[ListingRecord]:
         before = self._measurement_start()
@@ -717,6 +749,11 @@ class PostgresEodhdBootstrapRuntime:
         fetched_at_by_key: Mapping[tuple[str, str, str], datetime] | None = None,
     ) -> SyncOutcome:
         return sync_listings(self._connection, gold, fetched_at_by_key=fetched_at_by_key)
+
+    def prune_stale_listings(self, gold: ListingGoldResult) -> int:
+        """Prune listing identities only after dependent datasets are published."""
+
+        return prune_stale_listings(self._connection, gold)
 
     def publish_quotes(
         self,

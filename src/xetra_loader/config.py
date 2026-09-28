@@ -29,6 +29,9 @@ _FEATURE_WORK_MEM_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>kB|MB|GB)$"
 _FEATURE_WORK_MEM_DEFAULT = "256MB"
 _FEATURE_WORK_MEM_MIN_BYTES = 16 * 1024 * 1024
 _FEATURE_WORK_MEM_MAX_BYTES = 4 * 1024 * 1024 * 1024
+_WEEKLY_WORKERS_DEFAULT = 32
+_WEEKLY_WORKERS_MIN = 1
+_WEEKLY_WORKERS_MAX = 32
 
 
 def load_file_configuration(path: Path | None = None) -> FileConfiguration:
@@ -143,6 +146,30 @@ def resolve_feature_work_mem(explicit: str | None = None) -> str:
     return _validate_feature_work_mem(configured or _FEATURE_WORK_MEM_DEFAULT)
 
 
+def resolve_weekly_workers(explicit: int | str | None = None) -> int:
+    """Resolve bounded concurrent provider fetches for the weekly runner."""
+
+    configured: object = explicit or os.getenv("XDL_WEEKLY_WORKERS")
+    if configured is None:
+        configured = _section(load_file_configuration().values, "weekly").get("workers")
+    if configured is None:
+        return _WEEKLY_WORKERS_DEFAULT
+    if isinstance(configured, bool):
+        raise ConfigurationError("weekly.workers must be an integer from 1 through 32")
+    if isinstance(configured, int):
+        workers = configured
+    elif isinstance(configured, str):
+        try:
+            workers = int(configured)
+        except ValueError as exc:
+            raise ConfigurationError("weekly.workers must be an integer from 1 through 32") from exc
+    else:
+        raise ConfigurationError("weekly.workers must be an integer from 1 through 32")
+    if not _WEEKLY_WORKERS_MIN <= workers <= _WEEKLY_WORKERS_MAX:
+        raise ConfigurationError("weekly.workers must be an integer from 1 through 32")
+    return workers
+
+
 def _section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     section = values.get(name)
     return cast(Mapping[str, Any], section) if isinstance(section, Mapping) else {}
@@ -188,7 +215,5 @@ def _validate_feature_work_mem(value: object) -> str:
     multiplier = {"kB": 1024, "MB": 1024**2, "GB": 1024**3}[match["unit"]]
     size_bytes = int(match["amount"]) * multiplier
     if not _FEATURE_WORK_MEM_MIN_BYTES <= size_bytes <= _FEATURE_WORK_MEM_MAX_BYTES:
-        raise ConfigurationError(
-            "postgres.feature_work_mem must be between 16MB and 4GB"
-        )
+        raise ConfigurationError("postgres.feature_work_mem must be between 16MB and 4GB")
     return candidate

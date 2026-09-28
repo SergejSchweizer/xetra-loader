@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
+import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -12,11 +14,14 @@ from types import TracebackType
 from typing import TextIO
 
 from xetra_loader.pipeline.orchestrator import (
+    PipelineStageError,
     PipelineStages,
     PipelineSummary,
     run_weekly_pipeline,
 )
 from xetra_loader.sync.core import JSONValue
+
+_LOGGER = logging.getLogger(__name__)
 
 type RestartStage = Callable[[], Mapping[str, JSONValue] | None]
 type WrappedStage = Callable[[], dict[str, JSONValue]]
@@ -98,7 +103,27 @@ def run_restartable_pipeline(
                 raise ValueError("checkpoint requires a runtime rehydration hook")
             stages.rehydrate(checkpoint.details)
         wrapped = _wrap_stages(stages, checkpoint, checkpoint_path)
-        summary = run_weekly_pipeline(wrapped)
+        try:
+            summary = run_weekly_pipeline(wrapped)
+        except PipelineStageError as exc:
+            if exc.stage == "verification" and checkpoint_path.exists():
+                persisted = _read_checkpoint(checkpoint_path)
+                publication_start = _STAGE_NAMES.index("postgres_listings_sync")
+                prefix = tuple(
+                    name for name in _STAGE_NAMES[:publication_start] if name in persisted.completed
+                )
+                _write_checkpoint(
+                    checkpoint_path,
+                    RestartCheckpoint(
+                        prefix,
+                        {name: persisted.details[name] for name in prefix},
+                    ),
+                )
+                _LOGGER.warning(
+                    "verification_failed checkpoint_rewound completed=%s",
+                    ",".join(prefix),
+                )
+            raise
         checkpoint_path.unlink(missing_ok=True)
         return summary
 
@@ -114,8 +139,15 @@ def _wrap_stages(
     def wrap(name: str, stage: RestartStage) -> WrappedStage:
         def run() -> dict[str, JSONValue]:
             if name in completed:
+                _LOGGER.debug("stage_checkpoint_skip name=%s", name)
                 return {"restart": "checkpoint-skip"}
-            details = stage()
+            started = time.perf_counter()
+            _LOGGER.debug("stage_start name=%s", name)
+            try:
+                details = stage()
+            except Exception:
+                _LOGGER.exception("stage_failed name=%s", name)
+                raise
             completed.add(name)
             stage_details = {} if details is None else dict(details)
             details_by_stage[name] = stage_details
@@ -123,6 +155,11 @@ def _wrap_stages(
             _write_checkpoint(
                 checkpoint_path,
                 RestartCheckpoint(ordered_completed, details_by_stage),
+            )
+            _LOGGER.debug(
+                "stage_success name=%s elapsed_seconds=%.3f",
+                name,
+                time.perf_counter() - started,
             )
             return stage_details
 

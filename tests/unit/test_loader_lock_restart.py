@@ -1,3 +1,4 @@
+import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import replace
@@ -129,3 +130,24 @@ def test_checkpoint_without_fresh_runtime_rehydration_fails_closed(tmp_path: Pat
             checkpoint_path=checkpoint_path,
         )
     assert calls["splits"] == 0
+
+
+def test_verification_failure_rewinds_publication_stages(tmp_path: Path) -> None:
+    calls: Counter[str] = Counter()
+    checkpoint_path = tmp_path / "checkpoint.json"
+    with pytest.raises(PipelineStageError):
+        run_restartable_pipeline(
+            _stages(calls, {"verification"}),
+            lock_path=tmp_path / "loader.lock",
+            checkpoint_path=checkpoint_path,
+        )
+
+    assert checkpoint_path.exists()
+    assert calls["verification"] == 1
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["completed"] == [
+        "listings",
+        "dividends",
+        "splits",
+        "quotes",
+        "gold_validation",
+    ]
