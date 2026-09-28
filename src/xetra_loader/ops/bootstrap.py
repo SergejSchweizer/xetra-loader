@@ -26,6 +26,7 @@ from xetra_loader.gold.dividends import DividendGoldResult, build_dividend_gold
 from xetra_loader.gold.listings import ListingGoldResult, build_listing_gold
 from xetra_loader.gold.quotes import QuoteGoldResult, build_quote_gold
 from xetra_loader.gold.splits import SplitGoldResult, build_split_gold
+from xetra_loader.gold.validation import GoldValidationSummary, validate_complete_gold
 from xetra_loader.ingestion.dividends import ingest_dividends
 from xetra_loader.ingestion.listings import ingest_xetra_listings
 from xetra_loader.ingestion.quotes import ingest_quotes
@@ -204,18 +205,21 @@ class BootstrapRuntime(Protocol):
         gold: QuoteGoldResult,
         *,
         fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None = None,
+        authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome: ...
     def publish_dividends(
         self,
         gold: DividendGoldResult,
         *,
         fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
+        authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome: ...
     def publish_splits(
         self,
         gold: SplitGoldResult,
         *,
         fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
+        authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome: ...
 
     def verify(
@@ -278,13 +282,22 @@ def run_full_bootstrap(
     quote_gold = build_quote_gold(quotes)
     dividend_gold = build_dividend_gold(dividends)
     split_gold = build_split_gold(splits)
+    authoritative_snapshot = validate_complete_gold(
+        listing_gold, quote_gold, dividend_gold, split_gold
+    )
     _persist_all_gold(runtime, listing_gold, quote_gold, dividend_gold, split_gold)
 
     sync_outcomes = {
         "listings": _publish_listings(runtime, listing_gold, listing_fetch_times),
-        "eod_quotes": _publish_quotes(runtime, quote_gold, quote_fetch_times),
-        "dividends": _publish_dividends(runtime, dividend_gold, dividend_fetch_times),
-        "splits": _publish_splits(runtime, split_gold, split_fetch_times),
+        "eod_quotes": _publish_quotes(
+            runtime, quote_gold, quote_fetch_times, authoritative_snapshot
+        ),
+        "dividends": _publish_dividends(
+            runtime, dividend_gold, dividend_fetch_times, authoritative_snapshot
+        ),
+        "splits": _publish_splits(
+            runtime, split_gold, split_fetch_times, authoritative_snapshot
+        ),
     }
     verification = runtime.verify(
         listing_gold,
@@ -387,11 +400,16 @@ def _publish_quotes(
     runtime: BootstrapRuntime,
     gold: QuoteGoldResult,
     fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime],
+    authoritative_snapshot: GoldValidationSummary,
 ) -> SyncOutcome:
     return (
-        runtime.publish_quotes(gold, fetched_at_by_key=fetched_at_by_key)
+        runtime.publish_quotes(
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
         if fetched_at_by_key
-        else runtime.publish_quotes(gold)
+        else runtime.publish_quotes(gold, authoritative_snapshot=authoritative_snapshot)
     )
 
 
@@ -399,11 +417,16 @@ def _publish_dividends(
     runtime: BootstrapRuntime,
     gold: DividendGoldResult,
     fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime],
+    authoritative_snapshot: GoldValidationSummary,
 ) -> SyncOutcome:
     return (
-        runtime.publish_dividends(gold, fetched_at_by_key=fetched_at_by_key)
+        runtime.publish_dividends(
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
         if fetched_at_by_key
-        else runtime.publish_dividends(gold)
+        else runtime.publish_dividends(gold, authoritative_snapshot=authoritative_snapshot)
     )
 
 
@@ -411,11 +434,16 @@ def _publish_splits(
     runtime: BootstrapRuntime,
     gold: SplitGoldResult,
     fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime],
+    authoritative_snapshot: GoldValidationSummary,
 ) -> SyncOutcome:
     return (
-        runtime.publish_splits(gold, fetched_at_by_key=fetched_at_by_key)
+        runtime.publish_splits(
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
         if fetched_at_by_key
-        else runtime.publish_splits(gold)
+        else runtime.publish_splits(gold, authoritative_snapshot=authoritative_snapshot)
     )
 
 
@@ -695,24 +723,42 @@ class PostgresEodhdBootstrapRuntime:
         gold: QuoteGoldResult,
         *,
         fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None = None,
+        authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome:
-        return sync_quotes(self._connection, gold, fetched_at_by_key=fetched_at_by_key)
+        return sync_quotes(
+            self._connection,
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
 
     def publish_dividends(
         self,
         gold: DividendGoldResult,
         *,
         fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
+        authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome:
-        return sync_dividends(self._connection, gold, fetched_at_by_key=fetched_at_by_key)
+        return sync_dividends(
+            self._connection,
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
 
     def publish_splits(
         self,
         gold: SplitGoldResult,
         *,
         fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
+        authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome:
-        return sync_splits(self._connection, gold, fetched_at_by_key=fetched_at_by_key)
+        return sync_splits(
+            self._connection,
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            authoritative_snapshot=authoritative_snapshot,
+        )
 
     def verify(
         self,

@@ -1,6 +1,7 @@
 """Transactional PostgreSQL synchronization primitives."""
 
 from xetra_loader.sync.core import (
+    AuthoritativeSnapshotRequired,
     SyncCounters,
     SyncOutcome,
     connect_postgres,
@@ -18,6 +19,7 @@ from xetra_loader.sync.row_digests import (
 
 __all__ = [
     "SyncCounters",
+    "AuthoritativeSnapshotRequired",
     "SyncOutcome",
     "connect_postgres",
     "run_sync",

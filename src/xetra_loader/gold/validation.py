@@ -24,6 +24,14 @@ class GoldValidationSummary:
     row_counts: Mapping[str, int]
     semantic_fingerprints: Mapping[str, str]
 
+    def matches(self, dataset: str, *, row_count: int, semantic_fingerprint: str) -> bool:
+        """Return whether this proof belongs to the exact Gold dataset being published."""
+
+        return (
+            self.row_counts.get(dataset) == row_count
+            and self.semantic_fingerprints.get(dataset) == semantic_fingerprint
+        )
+
     def as_dict(self) -> dict[str, JSONValue]:
         return {
             "row_counts": dict(sorted(self.row_counts.items())),

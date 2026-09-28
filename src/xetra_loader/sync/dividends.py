@@ -10,7 +10,14 @@ from typing import Any, cast
 from psycopg import Connection, Cursor
 
 from xetra_loader.gold.dividends import DividendGoldResult
-from xetra_loader.sync.core import JSONValue, SyncCounters, SyncOutcome, run_sync
+from xetra_loader.gold.validation import GoldValidationSummary
+from xetra_loader.sync.core import (
+    AuthoritativeSnapshotRequired,
+    JSONValue,
+    SyncCounters,
+    SyncOutcome,
+    run_sync,
+)
 
 DividendSemantic = tuple[
     date,
@@ -30,11 +37,13 @@ def sync_dividends(
     run_id: str | None = None,
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
+    authoritative_snapshot: GoldValidationSummary | None = None,
 ) -> SyncOutcome:
     """Apply active dividend events and tombstone retractions in one transaction."""
 
     published_at = published_at_utc or datetime.now(UTC)
     _require_utc(published_at)
+    _validate_snapshot(authoritative_snapshot, gold.row_count, gold.semantic_fingerprint)
     semantic_rows: list[dict[str, JSONValue]] = list(gold.semantic_rows())
     semantic_rows.extend(
         {
@@ -117,7 +126,19 @@ def sync_dividends(
         semantic_rows=semantic_rows,
         mutate=mutate,
         run_id=run_id,
+        authoritative_snapshot=authoritative_snapshot,
     )
+
+
+def _validate_snapshot(
+    snapshot: GoldValidationSummary | None,
+    row_count: int,
+    semantic_fingerprint: str,
+) -> None:
+    if snapshot is not None and not snapshot.matches(
+        "dividends", row_count=row_count, semantic_fingerprint=semantic_fingerprint
+    ):
+        raise AuthoritativeSnapshotRequired("Gold snapshot proof does not match dividends")
 
 
 def _require_utc(value: datetime) -> None:

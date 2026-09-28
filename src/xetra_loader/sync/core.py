@@ -18,6 +18,7 @@ from xetra_loader.config import (
     resolve_postgres_admin_dsn,
     resolve_postgres_writer_dsn,
 )
+from xetra_loader.gold.validation import GoldValidationSummary
 
 type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, JSONValue]
 type SemanticRow = Mapping[str, JSONValue]
@@ -63,6 +64,10 @@ class SyncOutcome:
     @property
     def changed(self) -> bool:
         return self.status == "applied"
+
+
+class AuthoritativeSnapshotRequired(RuntimeError):
+    """Raised when destructive reconciliation lacks a validated Gold proof."""
 
 
 def connect_postgres(
@@ -111,6 +116,7 @@ def run_sync(
     mutate: Mutator,
     run_id: str | None = None,
     now: Callable[[], datetime] | None = None,
+    authoritative_snapshot: GoldValidationSummary | None = None,
 ) -> SyncOutcome:
     """Couple serving mutations and sync-state advance in one PostgreSQL transaction."""
 

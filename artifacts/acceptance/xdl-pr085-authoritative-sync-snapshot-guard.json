@@ -1,0 +1,11 @@
+{
+  "pr": "PR085",
+  "status": "PASS",
+  "checks": {
+    "complete_gold_validation_proof": true,
+    "dataset_fingerprint_binding": true,
+    "missing_proof_rejected_before_dml": true,
+    "weekly_pipeline_requires_validation_before_sync": true,
+    "unit_tests": "PASS"
+  }
+}
