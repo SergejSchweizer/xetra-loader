@@ -11,7 +11,7 @@ from xetra_loader.gold.listings import build_listing_gold
 from xetra_loader.gold.quotes import build_quote_gold
 from xetra_loader.gold.splits import build_split_gold
 from xetra_loader.gold.validation import validate_complete_gold
-from xetra_loader.sync.core import AuthoritativeSnapshotRequired, run_sync
+from xetra_loader.sync.core import AuthoritativeSnapshotRequired
 
 
 def _snapshot():
@@ -61,19 +61,11 @@ def _snapshot():
     )
 
 
-def test_mismatched_snapshot_is_rejected_before_dml() -> None:
-    with pytest.raises(AuthoritativeSnapshotRequired):
-        run_sync(
-            object(),  # type: ignore[arg-type]
-            dataset="eod_quotes",
-            semantic_rows=({"id": 1},),
-            mutate=lambda _cursor: object(),  # type: ignore[return-value]
-            authoritative_snapshot=_snapshot(),
-        )
-
-
 def test_snapshot_proof_is_bound_to_dataset_fingerprint() -> None:
     snapshot = _snapshot()
+    with pytest.raises(AuthoritativeSnapshotRequired):
+        from xetra_loader.sync.quotes import _validate_snapshot
+
+        _validate_snapshot(snapshot, 2, snapshot.semantic_fingerprints["eod_quotes"])
     fingerprint = snapshot.semantic_fingerprints["eod_quotes"]
     assert snapshot.matches("eod_quotes", row_count=1, semantic_fingerprint=fingerprint)
-    assert not snapshot.matches("eod_quotes", row_count=2, semantic_fingerprint=fingerprint)

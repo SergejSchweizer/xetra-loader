@@ -11,7 +11,13 @@ from psycopg import Connection, Cursor
 
 from xetra_loader.gold.splits import SplitGoldResult
 from xetra_loader.gold.validation import GoldValidationSummary
-from xetra_loader.sync.core import JSONValue, SyncCounters, SyncOutcome, run_sync
+from xetra_loader.sync.core import (
+    AuthoritativeSnapshotRequired,
+    JSONValue,
+    SyncCounters,
+    SyncOutcome,
+    run_sync,
+)
 
 
 def sync_splits(
@@ -27,6 +33,7 @@ def sync_splits(
 
     published_at = published_at_utc or datetime.now(UTC)
     _require_utc(published_at)
+    _validate_snapshot(authoritative_snapshot, gold.row_count, gold.semantic_fingerprint)
     semantic_rows: list[dict[str, JSONValue]] = list(gold.semantic_rows())
     semantic_rows.extend(
         {
@@ -104,6 +111,17 @@ def sync_splits(
         run_id=run_id,
         authoritative_snapshot=authoritative_snapshot,
     )
+
+
+def _validate_snapshot(
+    snapshot: GoldValidationSummary | None,
+    row_count: int,
+    semantic_fingerprint: str,
+) -> None:
+    if snapshot is not None and not snapshot.matches(
+        "splits", row_count=row_count, semantic_fingerprint=semantic_fingerprint
+    ):
+        raise AuthoritativeSnapshotRequired("Gold snapshot proof does not match splits")
 
 
 def _require_utc(value: datetime) -> None:

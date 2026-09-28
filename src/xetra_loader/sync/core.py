@@ -124,12 +124,6 @@ def run_sync(
         raise ValueError("dataset must be non-empty")
     materialized_rows = tuple(semantic_rows)
     fingerprint, row_count = semantic_fingerprint(materialized_rows)
-    if authoritative_snapshot is not None and not authoritative_snapshot.matches(
-        dataset, row_count=row_count, semantic_fingerprint=fingerprint
-    ):
-        raise AuthoritativeSnapshotRequired(
-            f"Gold snapshot proof does not match dataset {dataset!r}"
-        )
     serving_row_count = sum(
         1 for row in materialized_rows if not bool(row.get("retracted", False))
     )

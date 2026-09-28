@@ -10,7 +10,12 @@ from psycopg import Connection, Cursor
 
 from xetra_loader.gold.quotes import QuoteGoldResult
 from xetra_loader.gold.validation import GoldValidationSummary
-from xetra_loader.sync.core import SyncCounters, SyncOutcome, run_sync
+from xetra_loader.sync.core import (
+    AuthoritativeSnapshotRequired,
+    SyncCounters,
+    SyncOutcome,
+    run_sync,
+)
 
 
 def sync_quotes(
@@ -26,6 +31,7 @@ def sync_quotes(
 
     published_at = published_at_utc or datetime.now(UTC)
     _require_utc(published_at)
+    _validate_snapshot(authoritative_snapshot, gold.row_count, gold.semantic_fingerprint)
 
     def mutate(cursor: Cursor[Any]) -> SyncCounters:
         _copy_desired_quotes(cursor, gold, fetched_at_by_key, published_at)
@@ -44,6 +50,17 @@ def sync_quotes(
         run_id=run_id,
         authoritative_snapshot=authoritative_snapshot,
     )
+
+
+def _validate_snapshot(
+    snapshot: GoldValidationSummary | None,
+    row_count: int,
+    semantic_fingerprint: str,
+) -> None:
+    if snapshot is not None and not snapshot.matches(
+        "eod_quotes", row_count=row_count, semantic_fingerprint=semantic_fingerprint
+    ):
+        raise AuthoritativeSnapshotRequired("Gold snapshot proof does not match eod_quotes")
 
 
 def _require_utc(value: datetime) -> None:
