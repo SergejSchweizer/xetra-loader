@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,12 @@ class FileConfiguration:
 
     values: Mapping[str, Any]
     path: Path
+
+
+_FEATURE_WORK_MEM_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>kB|MB|GB)$")
+_FEATURE_WORK_MEM_DEFAULT = "256MB"
+_FEATURE_WORK_MEM_MIN_BYTES = 16 * 1024 * 1024
+_FEATURE_WORK_MEM_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
 
 def load_file_configuration(path: Path | None = None) -> FileConfiguration:
@@ -119,6 +126,23 @@ def resolve_medallion_root(explicit: str | None = None) -> str:
     return root.strip()
 
 
+def resolve_feature_work_mem(explicit: str | None = None) -> str:
+    """Resolve and validate the PostgreSQL feature-refresh memory budget.
+
+    ``work_mem`` is a per-operation/per-worker budget, so an intentionally
+    conservative default is used.  Invalid values fail before a database
+    mutation can start.
+    """
+
+    configured = explicit or os.getenv("XDL_FEATURE_WORK_MEM")
+    if not configured:
+        configured = _string(
+            _section(load_file_configuration().values, "postgres"),
+            "feature_work_mem",
+        )
+    return _validate_feature_work_mem(configured or _FEATURE_WORK_MEM_DEFAULT)
+
+
 def _section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     section = values.get(name)
     return cast(Mapping[str, Any], section) if isinstance(section, Mapping) else {}
@@ -148,3 +172,23 @@ def _port(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         raise ConfigurationError("postgres.port must be an integer between 1 and 65535")
     return value
+
+
+def _validate_feature_work_mem(value: object) -> str:
+    if not isinstance(value, str):
+        raise ConfigurationError(
+            "postgres.feature_work_mem must be an integer size from 16MB through 4GB"
+        )
+    candidate = value.strip()
+    match = _FEATURE_WORK_MEM_RE.fullmatch(candidate)
+    if match is None:
+        raise ConfigurationError(
+            "postgres.feature_work_mem must be an integer size from 16MB through 4GB"
+        )
+    multiplier = {"kB": 1024, "MB": 1024**2, "GB": 1024**3}[match["unit"]]
+    size_bytes = int(match["amount"]) * multiplier
+    if not _FEATURE_WORK_MEM_MIN_BYTES <= size_bytes <= _FEATURE_WORK_MEM_MAX_BYTES:
+        raise ConfigurationError(
+            "postgres.feature_work_mem must be between 16MB and 4GB"
+        )
+    return candidate

@@ -10,6 +10,8 @@ postgres:
   writer_dsn: "postgresql://xetra_data_loader_writer:replace-writer-password@10.10.1.3:54321/xetra_loader"
   # Bootstrap, migrations and controlled reset only; never used by xdl-weekly.
   admin_dsn: "postgresql://dbadmin:replace-admin-password@10.10.1.3:54321/xetra_loader"
+  # Feature refresh budget per PostgreSQL operation/worker; valid range 16MB-4GB.
+  feature_work_mem: "256MB"
 
 medallion:
   root: "./lake"
