@@ -1938,6 +1938,7 @@ finished work.
 | PR086 | `e676056` | merged; canonical serving-domain model aliases |
 | PR087 | `8e2cc26` | merged; conflicting listing identity rejection and deterministic lifecycle precedence |
 | PR088 | `0651e69` | merged; corrective complete-run QA gate and sanitized PASS evidence |
+| PR089 | `6dc5421` | merged; final status ledger, feature-refresh memory documentation and repository contract inventory |
 
 Final repository status at the completion checkpoint:
 
@@ -1946,6 +1947,8 @@ Final repository status at the completion checkpoint:
 - `config.yaml` is ignored and no credentials are present in tracked files;
 - `artifacts/cron/xdl-weekly.log` is an ignored operational log and is
   preserved locally, not committed;
+- the target PostgreSQL instance has an externally provisioned `xetra_loader`
+  `NOLOGIN` reader role with SELECT-only access to `xetra_loader.xetra_features`;
 - the deployed contract is Sunday 08:00 Europe/Vienna, 52 materialized-view
   columns, 48 catalog feature columns, two exposed base levels, and no
   `average_correlation_*` columns.
