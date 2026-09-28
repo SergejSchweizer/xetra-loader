@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 
 from xetra_loader.config import (
+    ConfigurationError,
     resolve_eodhd_token,
+    resolve_feature_work_mem,
     resolve_medallion_root,
     resolve_postgres_admin_dsn,
     resolve_postgres_dsn,
@@ -22,6 +24,7 @@ postgres:
   user: loader
   password: p@ss/word
   database: market
+  feature_work_mem: 512MB
 medallion:
   root: /tmp/medallion
 """,
@@ -51,6 +54,7 @@ def test_ignored_yaml_config_resolves_loader_values(
         "postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market"
     )
     assert resolve_medallion_root() == "/tmp/medallion"
+    assert resolve_feature_work_mem() == "512MB"
 
 
 def test_environment_values_override_yaml_config(
@@ -69,3 +73,21 @@ def test_environment_values_override_yaml_config(
     assert resolve_postgres_dsn() == "postgresql://env-dsn"
     assert resolve_postgres_admin_dsn() == "postgresql://admin-dsn"
     assert resolve_medallion_root() == "/env/medallion"
+
+
+@pytest.mark.parametrize("value", ["15MB", "5GB", "0MB", "512", "not-a-size"])
+def test_feature_work_mem_validation_fails_closed(value: str) -> None:
+    with pytest.raises(ConfigurationError):
+        resolve_feature_work_mem(value)
+
+
+def test_feature_work_mem_environment_overrides_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("XDL_FEATURE_WORK_MEM", "1GB")
+
+    assert resolve_feature_work_mem() == "1GB"

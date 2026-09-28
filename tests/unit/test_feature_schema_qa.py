@@ -46,3 +46,9 @@ def test_schema_qa_has_repeatable_privilege_contract_and_catalog_version() -> No
     )
     assert "REVOKE ALL ON xetra_loader.xetra_features FROM PUBLIC" in VIEW_SQL
     assert "GRANT EXECUTE ON FUNCTION xetra_loader.refresh_xetra_features()" in VIEW_SQL
+
+
+def test_schema_qa_uses_validated_configurable_refresh_memory_policy() -> None:
+    assert "work_mem = '1GB'" not in VIEW_SQL
+    assert "xetra_loader.resolve_feature_work_mem()" in VIEW_SQL
+    assert "16MB and 4GB" in VIEW_SQL

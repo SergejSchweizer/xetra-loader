@@ -13,7 +13,11 @@ from uuid import uuid4
 import psycopg
 from psycopg import Connection, Cursor
 
-from xetra_loader.config import resolve_postgres_admin_dsn, resolve_postgres_writer_dsn
+from xetra_loader.config import (
+    resolve_feature_work_mem,
+    resolve_postgres_admin_dsn,
+    resolve_postgres_writer_dsn,
+)
 
 type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, JSONValue]
 type SemanticRow = Mapping[str, JSONValue]
@@ -71,6 +75,11 @@ def connect_postgres(
 
     resolved = resolve_postgres_admin_dsn(dsn) if admin else resolve_postgres_writer_dsn(dsn)
     connection = psycopg.connect(resolved, autocommit=False)
+    connection.execute(
+        "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
+        (resolve_feature_work_mem(),),
+    )
+    connection.commit()
     if require_non_superuser:
         row = connection.execute(
             "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"

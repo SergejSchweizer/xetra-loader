@@ -1,8 +1,37 @@
 BEGIN;
 SET LOCAL TIME ZONE 'UTC';
--- The view uses several causal window frames. Keep their sort work bounded to
--- this build/refresh transaction instead of relying on the cluster default.
-SET LOCAL work_mem = '1GB';
+
+CREATE OR REPLACE FUNCTION xetra_loader.resolve_feature_work_mem()
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, xetra_loader
+AS $$
+DECLARE
+    configured text := current_setting('xetra_loader.feature_work_mem', true);
+    size_bytes bigint;
+BEGIN
+    configured := coalesce(nullif(btrim(configured), ''), '256MB');
+    BEGIN
+        size_bytes := pg_size_bytes(configured);
+    EXCEPTION WHEN others THEN
+        RAISE EXCEPTION 'invalid xetra_loader.feature_work_mem setting';
+    END;
+    IF size_bytes < 16::bigint * 1024 * 1024
+       OR size_bytes > 4::bigint * 1024 * 1024 * 1024 THEN
+        RAISE EXCEPTION
+            'xetra_loader.feature_work_mem must be between 16MB and 4GB';
+    END IF;
+    RETURN configured;
+END
+$$;
+
+-- work_mem is a per-operation/per-worker budget. The deployment/runtime sets
+-- the custom GUC; the helper validates it and supplies the documented default.
+SELECT set_config(
+    'work_mem', xetra_loader.resolve_feature_work_mem(), true
+);
 
 CREATE OR REPLACE FUNCTION xetra_loader.wilder_rsi(
     gains double precision[],
@@ -256,6 +285,10 @@ ALTER FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], i
     OWNER TO "xetra-data-loader";
 REVOKE ALL ON FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], integer) FROM PUBLIC;
 
+ALTER FUNCTION xetra_loader.resolve_feature_work_mem()
+    OWNER TO "xetra-data-loader";
+REVOKE ALL ON FUNCTION xetra_loader.resolve_feature_work_mem() FROM PUBLIC;
+
 COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
     'XETRA feature view; catalog version=2; base levels=adjusted_close_level,volume_level';
 
@@ -269,7 +302,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, xetra_loader
 AS $$
 BEGIN
-    PERFORM set_config('work_mem', '1GB', true);
+    PERFORM set_config('work_mem', xetra_loader.resolve_feature_work_mem(), true);
     REFRESH MATERIALIZED VIEW xetra_loader.xetra_features;
 END
 $$;

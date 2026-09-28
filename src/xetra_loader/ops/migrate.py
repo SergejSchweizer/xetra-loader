@@ -9,6 +9,7 @@ from typing import Any
 
 from psycopg import Connection
 
+from xetra_loader.config import resolve_feature_work_mem
 from xetra_loader.sync import connect_postgres
 
 SCHEMA_FILES: tuple[str, ...] = (
@@ -36,6 +37,10 @@ def apply_postgres_schema(
     own_connection = connection is None
     db: Connection[Any] = connection or connect_postgres(admin=True)
     try:
+        db.execute(
+            "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
+            (resolve_feature_work_mem(),),
+        )
         for relative in SCHEMA_FILES:
             sql = (root / relative).read_text(encoding="utf-8")
             db.execute(sql)

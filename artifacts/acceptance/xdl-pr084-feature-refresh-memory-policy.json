@@ -1,0 +1,13 @@
+{
+  "pr": "PR084",
+  "status": "PASS",
+  "checks": {
+    "fixed_one_gb_override_removed": true,
+    "runtime_and_migration_configuration": true,
+    "fail_closed_range_validation": true,
+    "default_work_mem": "256MB",
+    "unit_tests": "PASS",
+    "schema_qa": "PASS"
+  },
+  "resource_note": "The configured value is a per-operation/per-worker PostgreSQL work_mem budget; production-scale wall-time and peak-memory evidence is recorded by the complete-run gate."
+}
