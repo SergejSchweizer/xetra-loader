@@ -58,6 +58,13 @@ rows, and breadth/dispersion rolling windows count valid market dates. The
 `*_return_geom_*obs_pct` values are decimal fractions, matching macro-loader;
 they are not multiplied by 100.
 
+Feature-view refresh memory is deployment-configurable through
+`XDL_FEATURE_WORK_MEM` or `postgres.feature_work_mem` in the ignored
+`config.yaml`. The validated range is **16MB through 4GB**, with a conservative
+default of **256MB**. PostgreSQL applies `work_mem` per operation and worker,
+so the setting is a resource budget rather than a transaction-wide memory cap;
+the migration and weekly refresh use the same setting.
+
 ## PostgreSQL schema inventory
 
 The raw quote table `xetra_loader.eod_quotes` has **13 columns**: four identity

@@ -1916,3 +1916,36 @@ existing backlog and is intentionally not inferred here.
 The new XDL-PR059–XDL-PR069 work orders are not included in this historical
 summary; they are defined at the beginning of this file and form the active
 XETRA feature-serving program.
+
+## 12. Condensed completion ledger — reviewed 2026-09-28
+
+This is the end-of-file status ledger. The detailed work orders above remain
+the implementation authority; this table is the compact handoff record for
+finished work.
+
+| Work orders | Merged evidence | Result |
+| --- | --- | --- |
+| PR001–PR058 | Existing ledger in Section 11 and preceding status sections | merged; PR033 is historical and superseded by PR053 |
+| PR059–PR069 | Existing feature-serving history and acceptance artifacts | merged; feature catalog, raw sync, materialized view, QA and fold-local standardization |
+| PR070–PR078 | Historical feature-serving merge commits and acceptance artifacts | merged; documentation, grants, cron/restart QA, feature view and stable RSI |
+| PR079 | `83cea83` | merged; corrective audit wave and atomic dependency plan |
+| PR080 | `4f2d3ea` | merged; bounded corporate-action overlap reconciliation |
+| PR081 | `05bc7cd` | merged; feature window contract version 2 |
+| PR082 | `5c9274f` | merged; RSI null, reset and zero-loss semantics |
+| PR083 | `5c31627` | merged; sparse-calendar independent feature oracle |
+| PR084 | `d9b4b9b` | merged; validated configurable feature-refresh memory policy |
+| PR085 | `9bd22a2` | merged; authoritative Gold snapshot guard in production publication |
+| PR086 | `e676056` | merged; canonical serving-domain model aliases |
+| PR087 | `8e2cc26` | merged; conflicting listing identity rejection and deterministic lifecycle precedence |
+| PR088 | `0651e69` | merged; corrective complete-run QA gate and sanitized PASS evidence |
+
+Final repository status at the completion checkpoint:
+
+- `main...origin/main` is synchronized;
+- no local or remote topic branches remain and no PR is open;
+- `config.yaml` is ignored and no credentials are present in tracked files;
+- `artifacts/cron/xdl-weekly.log` is an ignored operational log and is
+  preserved locally, not committed;
+- the deployed contract is Sunday 08:00 Europe/Vienna, 52 materialized-view
+  columns, 48 catalog feature columns, two exposed base levels, and no
+  `average_correlation_*` columns.
