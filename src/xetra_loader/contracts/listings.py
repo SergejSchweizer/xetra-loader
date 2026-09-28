@@ -71,14 +71,23 @@ def normalize_listings(
     *,
     is_active: bool = True,
 ) -> tuple[ListingRecord, ...]:
-    """Normalize and deterministically order the complete retained listing universe."""
+    """Normalize and order listings, rejecting conflicting identity collapse.
 
-    records = [
-        record
-        for row in provider_rows
-        if (record := normalize_listing(row, is_active=is_active)) is not None
-    ]
-    return tuple(sorted(records, key=lambda record: record.key))
+    EODHD may repeat an identical row in a response; those exact semantic
+    duplicates are explicitly treated as provider deduplication. Rows with
+    the same identity but different metadata fail closed.
+    """
+
+    unique: dict[tuple[str, str, str], ListingRecord] = {}
+    for row in provider_rows:
+        record = normalize_listing(row, is_active=is_active)
+        if record is None:
+            continue
+        previous = unique.get(record.key)
+        if previous is not None and previous != record:
+            raise ValueError(f"conflicting listing rows for identity: {record.key}")
+        unique[record.key] = record
+    return tuple(sorted(unique.values(), key=lambda record: record.key))
 
 
 def serialize_listings(records: Iterable[ListingRecord]) -> str:
@@ -155,7 +164,11 @@ def merge_listing_lifecycle(
     delisted: Iterable[ListingRecord],
     previous_records: Iterable[ListingRecord] = (),
 ) -> tuple[ListingRecord, ...]:
-    """Merge active and delisted provider views while retaining vanished identities inactive."""
+    """Merge lifecycle views with active-provider precedence.
+
+    If an identity appears in both provider responses, the active row wins;
+    prior identities absent from both current responses are retained inactive.
+    """
 
     merged = {record.key: replace(record, is_active=True) for record in active}
     for record in delisted:
