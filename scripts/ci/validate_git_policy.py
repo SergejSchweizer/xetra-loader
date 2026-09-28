@@ -52,6 +52,25 @@ def validate_policy(
     *, branch: str, commit_subjects: Sequence[str], pr_title: str | None = None
 ) -> None:
     """Validate branch, all introduced commits, and optional PR title."""
+    review_match = REVIEW_BRANCH_RE.fullmatch(branch.strip())
+    if review_match is not None:
+        review_date = review_match.group("date")
+        expected_commit = f"docs(review): weekly repository review {review_date}"
+        expected_title = f"Weekly repository review -- {review_date}"
+        if not commit_subjects:
+            raise PolicyError("at least one introduced commit subject is required")
+        for subject in commit_subjects:
+            if subject.strip() != expected_commit:
+                raise PolicyError(
+                    f"invalid weekly review commit subject: {subject!r}; "
+                    f"expected {expected_commit!r}"
+                )
+        if pr_title is not None and pr_title.strip() != expected_title:
+            raise PolicyError(
+                f"invalid weekly review PR title: {pr_title!r}; expected {expected_title!r}"
+            )
+        return
+
     work_order = work_order_from_branch(branch)
     if not commit_subjects:
         raise PolicyError("at least one introduced commit subject is required")
