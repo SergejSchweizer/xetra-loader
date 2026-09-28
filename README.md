@@ -50,6 +50,14 @@ downstream operation documented in
 [`docs/train-fold-standardization.md`](docs/train-fold-standardization.md); it
 never changes Gold or the global feature view.
 
+The feature catalog is currently version **2**. Its window metadata declares
+the counting domain explicitly: price lag/return/ROC/RSI windows count valid
+price levels (`n + 1` levels for an `n`-lag or period), high-low and intraday
+windows count valid source rows, overnight gaps count `n + 1` valid source
+rows, and breadth/dispersion rolling windows count valid market dates. The
+`*_return_geom_*obs_pct` values are decimal fractions, matching macro-loader;
+they are not multiplied by 100.
+
 ## PostgreSQL schema inventory
 
 The raw quote table `xetra_loader.eod_quotes` has **13 columns**: four identity

@@ -39,7 +39,7 @@ def test_schema_qa_scopes_raw_ohlc_to_approved_intraday_families() -> None:
 
 def test_schema_qa_has_repeatable_privilege_contract_and_catalog_version() -> None:
     assert "COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features" in VIEW_SQL
-    assert "catalog version=1" in VIEW_SQL
+    assert "catalog version=2" in VIEW_SQL
     assert (
         'GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app'
         in VIEW_SQL
