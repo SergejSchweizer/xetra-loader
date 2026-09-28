@@ -52,6 +52,22 @@ def make_fixture(days: int = 65) -> tuple[FixtureQuote, ...]:
     return tuple(rows)
 
 
+def make_sparse_fixture(days: int = 65) -> tuple[FixtureQuote, ...]:
+    """Create staggered histories with a deliberate missing quote date."""
+
+    complete = make_fixture(days)
+    start = date(2026, 1, 2)
+    return tuple(
+        row
+        for row in complete
+        if row.code != "BBB"
+        or (
+            row.trade_date >= start + timedelta(days=3)
+            and row.trade_date != start + timedelta(days=20)
+        )
+    )
+
+
 def reference_features(
     rows: tuple[FixtureQuote, ...],
 ) -> dict[tuple[str, date], dict[str, float | None]]:
@@ -64,13 +80,13 @@ def reference_features(
         )
 
     output: dict[tuple[str, date], dict[str, float | None]] = {}
-    returns_by_code: dict[str, list[float | None]] = {}
+    returns_by_code: dict[tuple[str, date], float | None] = {}
     for code, quotes in by_code.items():
         adjusted = [row.adjusted_close for row in quotes]
         volumes = [float(row.volume) for row in quotes]
         log_returns = [_lagged_log_return(adjusted, index, 1) for index in range(len(quotes))]
-        returns_by_code[code] = log_returns
         for index, row in enumerate(quotes):
+            returns_by_code[(code, row.trade_date)] = log_returns[index]
             features: dict[str, float | None] = {
                 "adjusted_close_level": row.adjusted_close,
                 "volume_level": float(row.volume),
@@ -159,11 +175,12 @@ def reference_features(
     dates = tuple(sorted({row.trade_date for row in rows}))
     daily_breadth: list[float | None] = []
     daily_dispersion: list[float | None] = []
-    for index, _ in enumerate(dates):
+    for _index, trade_date in enumerate(dates):
         daily_returns = [
-            returns_by_code[code][index]
+            returns_by_code[(code, trade_date)]
             for code in sorted(by_code)
-            if returns_by_code[code][index] is not None
+            if (code, trade_date) in returns_by_code
+            and returns_by_code[(code, trade_date)] is not None
         ]
         daily_breadth.append(
             None
@@ -179,6 +196,8 @@ def reference_features(
             window: _mean(_window(daily_dispersion, index, window)) for window in (5, 10, 20)
         }
         for code in by_code:
+            if (code, trade_date) not in output:
+                continue
             features = output[(code, trade_date)]
             features["breadth_daily"] = daily_breadth[index]
             features["dispersion_daily"] = daily_dispersion[index]

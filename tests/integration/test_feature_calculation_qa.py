@@ -8,7 +8,12 @@ from typing import Any
 
 import pytest
 from psycopg import Connection
-from tests.qa.feature_reference import FixtureQuote, make_fixture, reference_features
+from tests.qa.feature_reference import (
+    FixtureQuote,
+    make_fixture,
+    make_sparse_fixture,
+    reference_features,
+)
 
 from xetra_loader.features.catalog import feature_columns
 from xetra_loader.sync import connect_postgres
@@ -166,5 +171,23 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
         _write_report(report_path, checks)
         report = json.loads(report_path.read_text(encoding="utf-8"))
         assert report["status"] == "PASS", json.dumps(report, sort_keys=True)
+    finally:
+        connection.close()
+
+
+def test_feature_calculations_match_sparse_calendar_reference() -> None:
+    if DSN is None:
+        pytest.skip("XDL_TEST_POSTGRES_DSN is not configured")
+    fixture = make_sparse_fixture()
+    _apply_sql("sql/schema/001_xetra_loader.sql")
+    _apply_sql("sql/schema/002_roles.sql")
+    _apply_sql("sql/sync/001_xetra_loader_sync.sql")
+    _apply_sql("sql/schema/004_xetra_features.sql")
+    connection = connect_postgres(DSN)
+    try:
+        with connection.transaction():
+            _insert_fixture(connection, fixture)
+            connection.execute("SELECT xetra_loader.refresh_xetra_features()")
+        _assert_expected(_feature_rows(connection), reference_features(fixture))
     finally:
         connection.close()
