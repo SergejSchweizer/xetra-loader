@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -19,6 +19,7 @@ from xetra_loader.gold.listings import ListingGoldResult, build_listing_gold
 from xetra_loader.gold.quotes import QuoteGoldResult, build_quote_gold
 from xetra_loader.gold.splits import SplitGoldResult, build_split_gold
 from xetra_loader.gold.validation import validate_complete_gold
+from xetra_loader.ingestion.corporate_actions import action_overlap_start
 from xetra_loader.medallion.core import JSONValue, Layer, Manifest, MedallionLayout, canonical_json
 from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime
 from xetra_loader.pipeline.orchestrator import PipelineStages
@@ -642,7 +643,9 @@ def _replace_action_window[T: DividendEvent | SplitEvent](
 ) -> tuple[T, ...]:
     if last_date is None:
         return refreshed
-    start = last_date - timedelta(days=7)
+    start = action_overlap_start(last_date)
+    if start is None:
+        return refreshed
     retained = (record for record in previous if record.event_date < start)
     by_key = {record.key: record for record in retained}
     by_key.update({record.key: record for record in refreshed})
