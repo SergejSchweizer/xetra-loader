@@ -1,0 +1,12 @@
+{
+  "work_order": "xdl-pr083-sparse-calendar-feature-oracle",
+  "status": "PASS",
+  "checks": {
+    "staggered_listing_starts_are_date_keyed": true,
+    "missing_quote_dates_do_not_shift_returns": true,
+    "breadth_uses_only_valid_instrument_returns": true,
+    "dispersion_uses_valid_cross_section_per_date": true,
+    "complete_grid_reference_regression_preserved": true
+  },
+  "secrets_included": false
+}
