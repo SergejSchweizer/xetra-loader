@@ -1,47 +1,37 @@
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import Decimal
 
 import pytest
 
 from xetra_loader.market import DividendRow, ListingRow, QuoteRow
 
-UTC_NOW = datetime(2026, 8, 22, 20, 0, tzinfo=UTC)
+
+def test_listing_contract_carries_active_lifecycle_state() -> None:
+    assert ListingRow("DE0000000001", "XETRA", "AAA", is_active=False).is_active is False
 
 
-def test_listing_rejects_naive_datetime() -> None:
-    with pytest.raises(ValueError, match="timezone-aware"):
-        ListingRow(
-            isin="DE0000000001",
-            exchange="XETRA",
-            code="AAA",
-            fetched_at_utc=datetime(2026, 8, 22, 20, 0),
-            published_at_utc=UTC_NOW,
-        )
-
-
-def test_quote_requires_utc_midnight_anchor() -> None:
-    with pytest.raises(ValueError, match="00:00:00 UTC"):
+def test_quote_rejects_invalid_ohlc_order() -> None:
+    with pytest.raises(ValueError, match="between low and high"):
         QuoteRow(
             isin="DE0000000001",
             exchange="XETRA",
             code="AAA",
             trade_date=date(2026, 8, 22),
-            timestamp_eod=datetime(2026, 8, 22, 17, 30, tzinfo=UTC),
+            open=Decimal("8"),
+            high=Decimal("12"),
+            low=Decimal("9"),
             close=Decimal("10.25"),
-            fetched_at_utc=UTC_NOW,
-            published_at_utc=UTC_NOW,
+            adjusted_close=Decimal("10.25"),
+            volume=100,
         )
 
 
-def test_event_key_must_be_sha256_hex() -> None:
-    with pytest.raises(ValueError, match="SHA-256"):
-        DividendRow(
-            isin="DE0000000001",
-            exchange="XETRA",
-            code="AAA",
-            event_key="not-a-hash",
-            event_date=date(2026, 8, 1),
-            value=Decimal("1.25"),
-            fetched_at_utc=UTC_NOW,
-            published_at_utc=UTC_NOW,
-        )
+def test_event_contract_generates_a_sha256_identity() -> None:
+    event = DividendRow(
+        isin="DE0000000001",
+        exchange="XETRA",
+        code="AAA",
+        event_date=date(2026, 8, 1),
+        value=Decimal("1.25"),
+    )
+    assert len(event.event_key) == 64
