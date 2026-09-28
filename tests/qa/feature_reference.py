@@ -220,16 +220,41 @@ def _sample_std(values: list[float] | None) -> float | None:
     return None if values is None or len(values) < 2 else statistics.stdev(values)
 
 
-def _wilder_rsi(values: list[float], index: int, period: int) -> float | None:
-    if index < period:
+def _wilder_rsi(values: list[float | None], index: int, period: int) -> float | None:
+    """Calculate causal Wilder RSI after resetting on invalid transitions."""
+
+    if index < 1 or period < 1:
         return None
-    gains = [max(values[position] - values[position - 1], 0.0) for position in range(1, index + 1)]
-    losses = [max(values[position - 1] - values[position], 0.0) for position in range(1, index + 1)]
-    average_gain = statistics.fmean(gains[:period])
-    average_loss = statistics.fmean(losses[:period])
-    for position in range(period, index):
-        average_gain = (average_gain * (period - 1) + gains[position]) / period
-        average_loss = (average_loss * (period - 1) + losses[position]) / period
+    valid_changes: list[tuple[float, float]] = []
+    for position in range(1, index + 1):
+        current = values[position]
+        previous = values[position - 1]
+        if (
+            current is None
+            or previous is None
+            or current <= 0
+            or previous <= 0
+        ):
+            valid_changes.clear()
+            continue
+        valid_changes.append(
+            (
+                max(current - previous, 0.0),
+                max(previous - current, 0.0),
+            )
+        )
+    if len(valid_changes) < period:
+        return None
+
+    average_gain = statistics.fmean(gain for gain, _ in valid_changes[:period])
+    average_loss = statistics.fmean(loss for _, loss in valid_changes[:period])
+    for gain, loss in valid_changes[period:]:
+        average_gain = (average_gain * (period - 1) + gain) / period
+        average_loss = (average_loss * (period - 1) + loss) / period
+    if average_gain == 0 and average_loss == 0:
+        return None
     if average_loss == 0:
         return 100.0
+    if average_gain == 0:
+        return 0.0
     return 100.0 - 100.0 / (1.0 + average_gain / average_loss)

@@ -19,9 +19,12 @@ DECLARE
     result double precision[];
     average_gain double precision := 0.0;
     average_loss double precision := 0.0;
+    valid_run integer := 0;
     position integer;
+    seed_start integer;
+    seed_position integer;
 BEGIN
-    IF period < 1 OR observations < period + 1 THEN
+    IF period < 1 OR observations = 0 THEN
         RETURN CASE
             WHEN observations = 0 THEN ARRAY[]::double precision[]
             ELSE array_fill(NULL::double precision, ARRAY[observations])
@@ -29,22 +32,35 @@ BEGIN
     END IF;
 
     result := array_fill(NULL::double precision, ARRAY[observations]);
-    FOR position IN 2..period + 1 LOOP
-        average_gain := average_gain + coalesce(gains[position], 0.0);
-        average_loss := average_loss + coalesce(losses[position], 0.0);
-    END LOOP;
-    average_gain := average_gain / period;
-    average_loss := average_loss / period;
-    result[period + 1] := CASE
-        WHEN average_loss = 0 THEN 100.0
-        ELSE 100.0 - 100.0 / (1.0 + average_gain / average_loss)
-    END;
+    FOR position IN 2..observations LOOP
+        IF gains[position] IS NULL OR losses[position] IS NULL THEN
+            valid_run := 0;
+            average_gain := 0.0;
+            average_loss := 0.0;
+            CONTINUE;
+        END IF;
 
-    FOR position IN period + 2..observations LOOP
-        average_gain := (average_gain * (period - 1) + coalesce(gains[position], 0.0)) / period;
-        average_loss := (average_loss * (period - 1) + coalesce(losses[position], 0.0)) / period;
+        valid_run := valid_run + 1;
+        IF valid_run < period THEN
+            CONTINUE;
+        ELSIF valid_run = period THEN
+            average_gain := 0.0;
+            average_loss := 0.0;
+            seed_start := position - period + 1;
+            FOR seed_position IN seed_start..position LOOP
+                average_gain := average_gain + gains[seed_position];
+                average_loss := average_loss + losses[seed_position];
+            END LOOP;
+            average_gain := average_gain / period;
+            average_loss := average_loss / period;
+        ELSE
+            average_gain := (average_gain * (period - 1) + gains[position]) / period;
+            average_loss := (average_loss * (period - 1) + losses[position]) / period;
+        END IF;
         result[position] := CASE
+            WHEN average_gain = 0 AND average_loss = 0 THEN NULL
             WHEN average_loss = 0 THEN 100.0
+            WHEN average_gain = 0 THEN 0.0
             ELSE 100.0 - 100.0 / (1.0 + average_gain / average_loss)
         END;
     END LOOP;
@@ -96,13 +112,13 @@ WITH ordered AS (
 ), rsi_arrays AS (
     SELECT r.isin, r.exchange, r.code,
         xetra_loader.wilder_rsi(
-            array_agg(coalesce(r.gain, 0.0) ORDER BY r.observation_number),
-            array_agg(coalesce(r.loss, 0.0) ORDER BY r.observation_number),
+            array_agg(r.gain ORDER BY r.observation_number),
+            array_agg(r.loss ORDER BY r.observation_number),
             7
         ) AS rsi_7,
         xetra_loader.wilder_rsi(
-            array_agg(coalesce(r.gain, 0.0) ORDER BY r.observation_number),
-            array_agg(coalesce(r.loss, 0.0) ORDER BY r.observation_number),
+            array_agg(r.gain ORDER BY r.observation_number),
+            array_agg(r.loss ORDER BY r.observation_number),
             14
         ) AS rsi_14
     FROM returns AS r
