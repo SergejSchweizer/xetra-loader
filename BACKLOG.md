@@ -49,6 +49,12 @@ migrations, and executable tests rather than these retired plans.
 | PR055–PR058 | Dedicated database configuration and follow-up safety/data-quality fixes | Merged per the prior status ledger |
 | PR059–PR078 | Feature contract and materialized view, raw-sync integration, grants, calculation/operational QA, fold-local standardization and follow-up feature fixes | Merged per the prior completion ledger |
 | PR079–PR089 | Corrective audit, overlap/window/RSI/oracle/memory/snapshot/identity fixes, complete-run QA and final repository ledger | Merged per the prior completion ledger |
+| PR090 | Provision the `xetra_loader` feature-view reader role | Closed unmerged; no merged implementation status inferred |
+| PR091 | Close the completion-ledger gap | Merged |
+| PR092 | Parallelize and harden weekly delta sync | Closed unmerged; superseded by PR093 |
+| PR093 | Final parallel sync hardening and PostgreSQL verification | Merged |
+| PR094 | First gated weekly repository-review workflow | Closed unmerged; superseded by PR095 |
+| PR095 | Gated weekly repository-review automation | Merged |
 
 PR029 and PR033 are retained only to explain superseded decisions. PR054 is
 shown as a numbering gap, not as planned or completed work. No detailed PR

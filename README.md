@@ -11,6 +11,7 @@ Bronze/Silver/Gold datasets, PostgreSQL publication, and the Sunday schedule in
 - [Lake storage format](#lake-storage-format)
 - [API and durable weekly worker](#api-and-durable-weekly-worker)
 - [Feature catalog](#feature-catalog)
+- [Feature benchmark](#feature-benchmark)
 - [PostgreSQL schema inventory](#postgresql-schema-inventory)
 - [Schedule and resource limits](#schedule-and-resource-limits)
 - [Validation](#validation)
@@ -70,10 +71,11 @@ control files.
 
 The one-time migration reads the previous `versions/<storage_version>/`
 snapshots and old row JSON, writes and validates canonical Parquet artifacts,
-then moves legacy JSON row files into a timestamped recoverable backup. Legacy
-versioned Parquet files are left in place as recovery copies; the normal
-runtime reader refuses to fall back to that retired layout and requires the
-migration to have published a canonical manifest first.
+then archives legacy `data.json` and `retractions.json` row artifacts into a
+timestamped recoverable backup. Manifests and restart metadata remain JSON
+control files. Legacy versioned Parquet files are left in place as recovery
+copies. The normal runtime reader refuses to fall back to that retired layout
+and requires the migration to have published a canonical manifest first.
 
 To migrate an existing JSON lake, first let any active writer finish, then run:
 
@@ -150,10 +152,18 @@ controlled one-off local run; the deployed Sunday cron uses the API queue.
 ## Feature catalog
 
 The current catalog version is **4** and defines **98 derived features**.
-Together with the two exposed level columns and four identity columns, the
-`xetra_loader.xetra_features` materialized view has **104 columns**. The
-catalog names and formulas are tested against an independent calculation
-reference and PostgreSQL integration fixtures.
+The catalog names and formulas are tested against an independent calculation
+reference and PostgreSQL integration fixtures. The complete view column count
+is recorded once in the PostgreSQL inventory below.
+
+## Feature benchmark
+
+Run `scripts/quality/benchmark_features.py` to compare one global Polars window
+plan with per-instrument Polars plans on the same synthetic input. The script
+checks both implementations against each other and against the independent
+feature reference before reporting median timings. The reproducible baseline
+uses 100,000 rows, 100 instruments, five timed rounds, and a six-core budget;
+its command is listed with the other local quality gates below.
 
 ## PostgreSQL schema inventory
 
@@ -201,6 +211,8 @@ Run local quality gates with the repository's pinned interpreter:
 .venv/bin/ruff check --no-cache src tests scripts
 .venv/bin/mypy --cache-dir=/tmp/xdl-mypy-cache
 .venv/bin/python -m pytest -p no:cacheprovider --import-mode=importlib
+.venv/bin/python scripts/quality/benchmark_features.py \
+  --rows 100000 --instruments 100 --rounds 5 --cores 6
 ```
 
 PostgreSQL integration tests require `XDL_TEST_POSTGRES_DSN`; they should use a
