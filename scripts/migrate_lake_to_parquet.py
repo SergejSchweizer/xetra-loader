@@ -8,21 +8,28 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 from collections.abc import Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
+from xetra_loader.config import resolve_cores, resolve_medallion_root
+
+os.environ["POLARS_MAX_THREADS"] = str(resolve_cores())
+
 import polars as pl
 
-from xetra_loader.config import resolve_medallion_root
 from xetra_loader.medallion.core import (
     BronzePartition,
     JSONValue,
     Layer,
     MedallionLayout,
     canonical_json,
+    read_dataset_rows,
     read_legacy_dataset_rows,
     read_legacy_snapshot_retractions,
     read_parquet_rows,
@@ -32,6 +39,12 @@ from xetra_loader.medallion.core import (
 from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime, SnapshotWrite
 from xetra_loader.ops.verify_postgres_sync import DATASETS, load_gold_snapshots
 from xetra_loader.pipeline.restart import LoaderLock
+
+
+@dataclass(frozen=True, slots=True)
+class _BronzeMigrationContext:
+    layout: MedallionLayout
+    instrument_types: Mapping[tuple[str, str, str], str]
 
 
 def _json_value(value: object) -> JSONValue:
@@ -62,8 +75,37 @@ def _frame_rows(frame: pl.DataFrame) -> Iterator[dict[str, JSONValue]]:
 
 def _convert_bronze_partitions(root: Path) -> int:
     layout = MedallionLayout(root)
-    sources = _legacy_bronze_sources(root)
-    converted = sum(_convert_bronze_source(layout, source) for source in sources)
+    listing_manifest = layout.manifest_path(Layer.SILVER, "listings")
+    listing_rows = (
+        read_dataset_rows(layout, Layer.SILVER, "listings")
+        if listing_manifest.exists()
+        else read_legacy_dataset_rows(layout, Layer.SILVER, "listings")
+    )
+    instrument_types = _listing_instrument_types(listing_rows)
+    context = _BronzeMigrationContext(layout, instrument_types)
+    groups = _group_bronze_sources(_legacy_bronze_sources(root))
+    cores = resolve_cores()
+    converted = 0
+    with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-bronze-migrate") as pool:
+        results = pool.map(
+            _convert_bronze_sources,
+            ((context, group) for group in groups),
+        )
+        for index, written in enumerate(results, start=1):
+            converted += written
+            if index % 100 == 0 or index == len(groups):
+                print(
+                    canonical_json(
+                        {
+                            "stage": "bronze-migration",
+                            "source_groups": index,
+                            "source_groups_total": len(groups),
+                            "parquet_files_written": converted,
+                        }
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     listings = root / Layer.BRONZE.value / "listings" / "data.json"
     if listings.exists():
@@ -91,25 +133,62 @@ def _legacy_bronze_sources(root: Path) -> list[Path]:
     )
 
 
-def _convert_bronze_source(layout: MedallionLayout, source: Path) -> int:
-    payload: object = (
-        read_parquet_rows(source)
-        if source.suffix == ".parquet"
-        else json.loads(source.read_text(encoding="utf-8"))
-    )
-    if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
-        raise ValueError(f"invalid Bronze partition: {source}")
-    dataset = source.parent.parent.name
-    fallback_date = datetime.fromtimestamp(source.stat().st_mtime, UTC).date()
-    grouped: dict[Path, list[dict[str, JSONValue]]] = {}
-    for outer in cast(list[dict[str, JSONValue]], payload):
-        for item in _provider_payload_rows(outer):
-            path, normalized = _bronze_entry(layout, dataset, outer, item, fallback_date)
-            grouped.setdefault(path, []).append(normalized)
+def _group_bronze_sources(sources: list[Path]) -> list[list[Path]]:
+    groups: dict[tuple[str, str, str], list[Path]] = {}
+    for source in sources:
+        dataset = source.parent.parent.name
+        identity = source.stem.split("!")
+        key = (dataset, identity[0], identity[1]) if len(identity) == 3 else (dataset, "raw", "")
+        groups.setdefault(key, []).append(source)
+    return [groups[key] for key in sorted(groups)]
+
+
+def _listing_instrument_types(
+    listing_rows: list[dict[str, JSONValue]],
+) -> dict[tuple[str, str, str], str]:
+    instrument_types: dict[tuple[str, str, str], str] = {}
+    for row in listing_rows:
+        identity = tuple(row.get(field) for field in ("isin", "exchange", "code"))
+        instrument_type = row.get("instrument_type")
+        if all(isinstance(value, str) for value in identity) and isinstance(
+            instrument_type, str
+        ):
+            instrument_types[cast(tuple[str, str, str], identity)] = instrument_type.lower()
+    return instrument_types
+
+
+def _convert_bronze_sources(
+    job: tuple[_BronzeMigrationContext, list[Path]],
+) -> int:
+    context, sources = job
+    grouped: dict[Path, dict[str, dict[str, JSONValue]]] = {}
+    for source in sources:
+        payload: object = (
+            read_parquet_rows(source)
+            if source.suffix == ".parquet"
+            else json.loads(source.read_text(encoding="utf-8"))
+        )
+        if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
+            raise ValueError(f"invalid Bronze partition: {source}")
+        dataset = source.parent.parent.name
+        fallback_date = datetime.fromtimestamp(source.stat().st_mtime, UTC).date()
+        for outer in cast(list[dict[str, JSONValue]], payload):
+            for item in _provider_payload_rows(outer):
+                path, normalized = _bronze_entry(
+                    context,
+                    dataset,
+                    outer,
+                    item,
+                    fallback_date,
+                )
+                unique_key = canonical_json(cast(JSONValue, normalized))
+                grouped.setdefault(path, {})[unique_key] = normalized
+
     written = 0
-    for path, rows in grouped.items():
+    for path, incoming in grouped.items():
         prior = read_parquet_rows(path) if path.exists() else []
-        unique = {canonical_json(cast(JSONValue, row)): row for row in (*prior, *rows)}
+        unique = {canonical_json(cast(JSONValue, row)): row for row in prior}
+        unique.update(incoming)
         ordered = [unique[key] for key in sorted(unique)]
         if ordered != prior:
             write_parquet_rows(path, ordered)
@@ -132,7 +211,7 @@ def _provider_payload_rows(outer: Mapping[str, JSONValue]) -> list[dict[str, JSO
 
 
 def _bronze_entry(
-    layout: MedallionLayout,
+    context: _BronzeMigrationContext,
     dataset: str,
     outer: Mapping[str, JSONValue],
     item: Mapping[str, JSONValue],
@@ -146,11 +225,15 @@ def _bronze_entry(
         symbol = f"unidentified-{digest[:16]}"
     exchange = exchange or "unknown"
     type_value = _first_text(item.get("Type"), item.get("type"), outer.get("instrument_type"))
-    instrument_type = type_value.lower() if type_value is not None else "unknown"
+    instrument_type = (
+        type_value.lower()
+        if type_value is not None
+        else context.instrument_types.get((isin or "", exchange, symbol), "unknown")
+    )
     raw_date = _first_text(item.get("date"), item.get("event_date"))
     partition_date = date.fromisoformat(raw_date[:10]) if raw_date else fallback_date
     timeframe = _dataset_timeframe(dataset)
-    path = layout.bronze_path(
+    path = context.layout.bronze_path(
         BronzePartition(
             dataset_type=dataset,
             exchange=exchange,
@@ -227,7 +310,6 @@ def _convert_snapshot(
         snapshot=SnapshotWrite(
             semantic_metadata=semantic_metadata,
             retractions=retractions,
-            presorted=True,
         ),
     )
     return True
@@ -278,14 +360,16 @@ def _gold_migration_metadata(
 
 
 def _archive_json_artifacts(root: Path, backup_root: Path) -> int:
-    backup_root.mkdir(parents=True, mode=0o700, exist_ok=False)
-    os.chmod(backup_root, 0o700)
     sources = sorted(
         path
         for path in root.rglob("*.json")
         if path.name in {"data.json", "retractions.json"}
         or (path.parent.name == "partitions")
     )
+    if not sources:
+        return 0
+    backup_root.mkdir(parents=True, mode=0o700, exist_ok=False)
+    os.chmod(backup_root, 0o700)
     for source in sources:
         relative = source.relative_to(root)
         destination = backup_root / relative
@@ -298,15 +382,34 @@ def migrate_lake(root: Path, backup_root: Path) -> dict[str, JSONValue]:
     """Publish and validate Parquet snapshots before moving JSON originals to backup."""
 
     resolved_root = root.resolve()
+    resolved_backup_root = backup_root.resolve()
+    if not resolved_root.is_dir() or not all(
+        (resolved_root / layer.value).is_dir() for layer in Layer
+    ):
+        raise ValueError("migration root must contain bronze, silver, and gold directories")
+    if resolved_backup_root == resolved_root or resolved_root in resolved_backup_root.parents:
+        raise ValueError("JSON backup root must be outside the lake root")
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = MedallionLayout(resolved_root)
-    with LoaderLock(resolved_root / "authoritative-rewrite.lock"):
+    with LoaderLock(resolved_root / "weekly.lock"):
         bronze_partitions = _convert_bronze_partitions(resolved_root)
         converted_snapshots = 0
         for dataset in DATASETS:
             for layer in (Layer.SILVER, Layer.GOLD):
                 converted_snapshots += int(
                     _convert_snapshot(runtime, runtime._layout, layer, dataset)
+                )
+                print(
+                    canonical_json(
+                        {
+                            "stage": "snapshot-migration",
+                            "dataset": dataset,
+                            "layer": layer.value,
+                            "converted": converted_snapshots,
+                        }
+                    ),
+                    file=sys.stderr,
+                    flush=True,
                 )
 
         snapshots = load_gold_snapshots(resolved_root)
@@ -317,7 +420,7 @@ def migrate_lake(root: Path, backup_root: Path) -> dict[str, JSONValue]:
             raise ValueError(f"Parquet Gold fingerprint validation failed: {', '.join(invalid)}")
 
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        actual_backup = backup_root / stamp
+        actual_backup = resolved_backup_root / stamp
         archived = _archive_json_artifacts(resolved_root, actual_backup)
         return {
             "status": "PASS",
@@ -326,7 +429,7 @@ def migrate_lake(root: Path, backup_root: Path) -> dict[str, JSONValue]:
             "silver_gold_snapshots": converted_snapshots,
             "datasets_fingerprint_valid": len(snapshots),
             "json_artifacts_archived": archived,
-            "json_backup": str(actual_backup),
+            "json_backup": str(actual_backup) if archived else None,
         }
 
 

@@ -6,7 +6,11 @@ from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
-from scripts.migrate_lake_to_parquet import _convert_snapshot, migrate_lake
+from scripts.migrate_lake_to_parquet import (
+    _archive_json_artifacts,
+    _convert_snapshot,
+    migrate_lake,
+)
 
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord
@@ -107,7 +111,11 @@ def _legacy_lake(root: Path) -> MedallionLayout:
         encoding="utf-8",
     )
 
-    bronze_partition = layout.partition_path(Layer.BRONZE, "eod_quotes", "AAA!XETRA!ISIN")
+    bronze_partition = (
+        layout.dataset_path(Layer.BRONZE, "eod_quotes")
+        / "partitions"
+        / "AAA!XETRA!ISIN.parquet"
+    )
     bronze_partition.parent.mkdir(parents=True, exist_ok=True)
     bronze_partition.with_suffix(".json").write_text(
         '[{"isin":"ISIN","exchange":"XETRA","code":"AAA","payload":{"close":12}}]\n',
@@ -131,6 +139,7 @@ def test_migration_writes_polars_parquet_and_archives_json(tmp_path: Path) -> No
     assert not (root / "silver" / "eod_quotes" / "data.json").exists()
     assert not (root / "gold" / "dividends" / "data.json").exists()
     assert not list(root.rglob("partitions/*.json"))
+    assert not list(root.rglob("versions/*/partitions/*.parquet"))
 
     assert read_dataset_rows(layout, Layer.SILVER, "eod_quotes") == read_dataset_rows(
         layout, Layer.GOLD, "eod_quotes"
@@ -215,3 +224,12 @@ def test_migration_repartitions_existing_versioned_parquet(tmp_path: Path) -> No
 
     assert read_dataset_rows(layout, Layer.SILVER, dataset) == rows
     assert legacy_partition.exists()
+
+
+def test_empty_json_archive_does_not_create_backup_directory(tmp_path: Path) -> None:
+    root = tmp_path / "lake"
+    backup = tmp_path / "backup"
+    root.mkdir()
+
+    assert _archive_json_artifacts(root, backup) == 0
+    assert not backup.exists()

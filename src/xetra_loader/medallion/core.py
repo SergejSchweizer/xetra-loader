@@ -146,25 +146,9 @@ class MedallionLayout:
     def legacy_retractions_path(self, layer: Layer, dataset: str) -> Path:
         return self.dataset_path(layer, dataset) / "retractions.json"
 
-    def partition_path(self, layer: Layer, dataset: str, partition: str) -> Path:
-        _validate_component(partition)
-        return self.dataset_path(layer, dataset) / "partitions" / f"{partition}.parquet"
-
     def snapshot_version_path(self, layer: Layer, dataset: str, version: str) -> Path:
         _validate_component(version)
         return self.dataset_path(layer, dataset) / "versions" / version
-
-    def current_version_path(self, layer: Layer, dataset: str) -> Path:
-        manifest = self.manifest_path(layer, dataset)
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-        run_metadata = payload.get("run_metadata")
-        version = run_metadata.get("storage_version") if isinstance(run_metadata, dict) else None
-        if not isinstance(version, str):
-            raise ValueError(f"{layer.value} manifest has no storage version for {dataset}")
-        return self.snapshot_version_path(layer, dataset, version)
-
-    def current_partitions_path(self, layer: Layer, dataset: str) -> Path:
-        return self.current_version_path(layer, dataset) / "partitions"
 
 
 def atomic_write_parquet(path: Path, frame: pl.DataFrame) -> None:
