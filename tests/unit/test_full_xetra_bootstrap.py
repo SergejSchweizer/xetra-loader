@@ -1,16 +1,21 @@
+from __future__ import annotations
+
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.contracts.quotes import QuoteRecord
+from xetra_loader.medallion.core import MedallionLayout
 from xetra_loader.ops.bootstrap import (
     BootstrapVerification,
     DestructiveConfirmationRequired,
     FetchBatch,
     FetchMetrics,
+    PostgresEodhdBootstrapRuntime,
     run_full_bootstrap,
 )
 from xetra_loader.sync.core import SyncCounters, SyncOutcome
@@ -156,6 +161,34 @@ class FixtureRuntime:
 
     def close(self) -> None:
         self.calls.append("close")
+
+
+def test_fetch_worker_cannot_close_the_parent_database_connection(tmp_path: Path) -> None:
+    class ConnectionStub:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class TransportStub:
+        def clone(self) -> TransportStub:
+            return TransportStub()
+
+    runtime = object.__new__(PostgresEodhdBootstrapRuntime)
+    connection = ConnectionStub()
+    runtime._connection = connection
+    runtime._owns_connection = True
+    runtime._transport = TransportStub()
+    runtime._layout = MedallionLayout(tmp_path)
+    runtime._repository_root = tmp_path
+    runtime._quarantine_invalid_ohlc = False
+
+    worker = runtime.fetch_worker()
+    worker.close()
+    assert not connection.closed
+
+    runtime.close()
+    assert connection.closed
 
 
 def test_absent_confirmation_performs_zero_runtime_calls() -> None:

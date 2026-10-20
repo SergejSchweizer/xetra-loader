@@ -1,8 +1,16 @@
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from xetra_loader.medallion import Layer, Manifest, MedallionLayout
+from xetra_loader.medallion.core import (
+    BronzePartition,
+    GoldArtifact,
+    SilverPartition,
+    read_dataset_rows,
+    read_legacy_dataset_rows,
+)
 
 
 def test_layout_resolves_each_layer() -> None:
@@ -10,7 +18,36 @@ def test_layout_resolves_each_layer() -> None:
     assert layout.dataset_path(Layer.BRONZE, "listings") == Path("/data/xetra/bronze/listings")
     assert layout.dataset_path(Layer.SILVER, "quotes") == Path("/data/xetra/silver/quotes")
     assert layout.manifest_path(Layer.GOLD, "splits") == Path(
-        "/data/xetra/gold/splits/manifest.json"
+        "/data/xetra/gold/_metadata/dataset_type=splits/manifest.json"
+    )
+
+
+def test_layout_resolves_required_partition_paths() -> None:
+    layout = MedallionLayout(Path("/data/xetra"))
+    assert layout.bronze_path(
+        BronzePartition("eod_quotes", "XETRA", "etf", "AAA", "1d", date(2026, 8, 21))
+    ) == Path(
+        "/data/xetra/bronze/dataset_type=eod_quotes/exchange=XETRA/"
+        "instrument_type=etf/symbol=AAA/timeframe=1d/year=2026/month=2026-08/"
+        "date=2026-08-21/data.parquet"
+    )
+    assert layout.silver_path(SilverPartition("eod_quotes", "XETRA", "AAA", "1d", 2026, 8)) == Path(
+        "/data/xetra/silver/dataset_type=eod_quotes/exchange=XETRA/symbol=AAA/"
+        "timeframe=1d/year=2026/month=2026-08/AAA-2026-08.parquet"
+    )
+    assert layout.gold_path(
+        GoldArtifact(
+            "xetra-eod-quotes-gold-v1",
+            "v1.0.0",
+            "XETRA",
+            "AAA",
+            "a" * 64,
+            "b" * 64,
+        )
+    ) == Path(
+        "/data/xetra/gold/dataset_id=xetra-eod-quotes-gold-v1/"
+        "dataset_type=gold_symbol_dataset/feature_set_version=v1.0.0/"
+        "exchange=XETRA/symbol=AAA/AAA_GOLD_" + "a" * 64 + "_" + "b" * 64 + ".parquet"
     )
 
 
@@ -18,6 +55,19 @@ def test_layout_resolves_each_layer() -> None:
 def test_layout_rejects_invalid_dataset_path(dataset: str) -> None:
     with pytest.raises(ValueError):
         MedallionLayout(Path("/data/xetra")).dataset_path(Layer.GOLD, dataset)
+
+
+def test_runtime_reader_rejects_legacy_json_and_migration_reader_can_read_it(
+    tmp_path: Path,
+) -> None:
+    layout = MedallionLayout(tmp_path)
+    legacy_file = layout.dataset_path(Layer.SILVER, "eod_quotes") / "data.json"
+    legacy_file.parent.mkdir(parents=True)
+    legacy_file.write_text('[{"code":"AAA"}]', encoding="utf-8")
+
+    assert read_legacy_dataset_rows(layout, Layer.SILVER, "eod_quotes") == [{"code": "AAA"}]
+    with pytest.raises(ValueError, match="requires migration"):
+        read_dataset_rows(layout, Layer.SILVER, "eod_quotes")
 
 
 def test_semantic_fingerprint_ignores_run_metadata() -> None:

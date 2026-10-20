@@ -29,9 +29,9 @@ _FEATURE_WORK_MEM_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>kB|MB|GB)$"
 _FEATURE_WORK_MEM_DEFAULT = "256MB"
 _FEATURE_WORK_MEM_MIN_BYTES = 16 * 1024 * 1024
 _FEATURE_WORK_MEM_MAX_BYTES = 4 * 1024 * 1024 * 1024
-_WEEKLY_WORKERS_DEFAULT = 32
-_WEEKLY_WORKERS_MIN = 1
-_WEEKLY_WORKERS_MAX = 32
+_CORES_DEFAULT = 6
+_CORES_MIN = 1
+_CORES_MAX = 64
 
 
 def load_file_configuration(path: Path | None = None) -> FileConfiguration:
@@ -146,28 +146,54 @@ def resolve_feature_work_mem(explicit: str | None = None) -> str:
     return _validate_feature_work_mem(configured or _FEATURE_WORK_MEM_DEFAULT)
 
 
-def resolve_weekly_workers(explicit: int | str | None = None) -> int:
-    """Resolve bounded concurrent provider fetches for the weekly runner."""
+def resolve_cores(explicit: int | str | None = None) -> int:
+    """Resolve the single bounded CPU/concurrency budget for a loader run."""
 
-    configured: object = explicit or os.getenv("XDL_WEEKLY_WORKERS")
+    configured: object = explicit if explicit is not None else os.getenv("XDL_CORES")
     if configured is None:
-        configured = _section(load_file_configuration().values, "weekly").get("workers")
+        configured = _section(load_file_configuration().values, "weekly").get("cores")
     if configured is None:
-        return _WEEKLY_WORKERS_DEFAULT
+        return _CORES_DEFAULT
     if isinstance(configured, bool):
-        raise ConfigurationError("weekly.workers must be an integer from 1 through 32")
+        raise ConfigurationError("weekly.cores must be an integer from 1 through 64")
     if isinstance(configured, int):
-        workers = configured
+        cores = configured
     elif isinstance(configured, str):
         try:
-            workers = int(configured)
+            cores = int(configured)
         except ValueError as exc:
-            raise ConfigurationError("weekly.workers must be an integer from 1 through 32") from exc
+            raise ConfigurationError("weekly.cores must be an integer from 1 through 64") from exc
     else:
-        raise ConfigurationError("weekly.workers must be an integer from 1 through 32")
-    if not _WEEKLY_WORKERS_MIN <= workers <= _WEEKLY_WORKERS_MAX:
-        raise ConfigurationError("weekly.workers must be an integer from 1 through 32")
-    return workers
+        raise ConfigurationError("weekly.cores must be an integer from 1 through 64")
+    if not _CORES_MIN <= cores <= _CORES_MAX:
+        raise ConfigurationError("weekly.cores must be an integer from 1 through 64")
+    return cores
+
+
+def resolve_api_token(explicit: str | None = None) -> str:
+    """Resolve the bearer token required for mutating or reading API jobs."""
+
+    token = explicit or os.getenv("XDL_API_TOKEN")
+    if not token:
+        token = _string(_section(load_file_configuration().values, "api"), "token")
+    if not token or not token.strip():
+        raise ConfigurationError("api.token or XDL_API_TOKEN is required")
+    resolved = token.strip()
+    if resolved == "replace-with-a-long-random-api-token" or len(resolved) < 32:
+        raise ConfigurationError("api.token must be a replaced secret of at least 32 characters")
+    return resolved
+
+
+def resolve_api_base_url(explicit: str | None = None) -> str:
+    """Resolve the local API base URL used by the scheduled enqueue client."""
+
+    configured = explicit or os.getenv("XDL_API_BASE_URL")
+    if not configured:
+        configured = _string(_section(load_file_configuration().values, "api"), "base_url")
+    candidate = (configured or "http://127.0.0.1:8765").strip().rstrip("/")
+    if not candidate.startswith(("http://", "https://")):
+        raise ConfigurationError("api.base_url must use http:// or https://")
+    return candidate
 
 
 def _section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:

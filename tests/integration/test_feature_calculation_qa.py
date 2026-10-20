@@ -8,13 +8,13 @@ from typing import Any
 
 import pytest
 from psycopg import Connection
+
 from tests.qa.feature_reference import (
     FixtureQuote,
     make_fixture,
     make_sparse_fixture,
     reference_features,
 )
-
 from xetra_loader.features.catalog import feature_columns
 from xetra_loader.sync import connect_postgres
 
@@ -81,7 +81,7 @@ def _feature_rows(connection: Connection[Any]) -> dict[tuple[str, object], dict[
 
 def _assert_expected(
     actual: dict[tuple[str, object], dict[str, object]],
-    expected: dict[tuple[str, object], dict[str, float | None]],
+    expected: dict[tuple[str, object], dict[str, float | bool | None]],
 ) -> None:
     assert set(actual) == set(expected)
     for identity, expected_features in expected.items():
@@ -113,13 +113,16 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
     _apply_sql("sql/schema/002_roles.sql")
     _apply_sql("sql/sync/001_xetra_loader_sync.sql")
     _apply_sql("sql/schema/004_xetra_features.sql")
-    fixture = make_fixture()
+    fixture = make_fixture(days=220)
     expected = reference_features(fixture)
     connection = connect_postgres(DSN)
     try:
         with connection.transaction():
             _insert_fixture(connection, fixture)
             connection.execute("SELECT xetra_loader.refresh_xetra_features()")
+            configured_parallel_workers = connection.execute(
+                "SELECT current_setting('max_parallel_workers_per_gather')"
+            ).fetchone()[0]
         initial = _feature_rows(connection)
         _assert_expected(initial, expected)
 
@@ -161,6 +164,7 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
         )
         checks = {
             "all_catalog_features_match_independent_reference": True,
+            "refresh_respects_six_core_budget": configured_parallel_workers == "5",
             "boundary_nulls_and_minimum_windows": boundary_nulls,
             "instrument_partitioning": partitioned,
             "no_future_observation_leakage": no_lookahead,

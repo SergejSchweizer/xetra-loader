@@ -17,9 +17,9 @@ from xetra_loader.gold.splits import build_split_gold
 from xetra_loader.medallion.core import (
     JSONValue,
     Layer,
-    Manifest,
     MedallionLayout,
     canonical_json,
+    write_parquet_rows,
 )
 from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime
 from xetra_loader.ops.verify_postgres_sync import (
@@ -86,36 +86,19 @@ def _write_dataset(
     fingerprint: str,
     retracted_keys: list[list[str]] | None = None,
 ) -> None:
+    runtime = object.__new__(PostgresEodhdBootstrapRuntime)
+    runtime._layout = layout
     for layer in (Layer.SILVER, Layer.GOLD):
-        directory = layout.dataset_path(layer, dataset)
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "data.json").write_text(
-            canonical_json(rows),
-            encoding="utf-8",
-        )
-    semantic_metadata: dict[str, JSONValue] = {
-        "row_count": len(rows),
-        "builder_semantic_fingerprint": fingerprint,
-    }
-    if dataset in {"dividends", "splits"}:
-        sidecar = retracted_keys or []
-        layout.retractions_path(Layer.GOLD, dataset).write_text(
-            canonical_json(sidecar) + "\n",
-            encoding="utf-8",
-        )
-        semantic_metadata["retractions_fingerprint"] = hashlib.sha256(
-            canonical_json(sidecar).encode("utf-8")
-        ).hexdigest()
-    manifest = Manifest(
-        dataset=dataset,
-        layer=Layer.GOLD,
-        semantic_metadata=semantic_metadata,
-        run_metadata={},
-    )
-    layout.manifest_path(Layer.GOLD, dataset).write_text(
-        manifest.to_json(),
-        encoding="utf-8",
-    )
+        if layer is Layer.SILVER:
+            runtime.persist_silver(dataset, rows)
+        else:
+            runtime.persist_gold(
+                dataset,
+                rows,
+                row_count=len(rows),
+                semantic_fingerprint=fingerprint,
+                retracted_keys=tuple(tuple(key) for key in (retracted_keys or [])),
+            )
 
 
 def test_gold_snapshot_recomputes_exact_builder_fingerprints(tmp_path: Path) -> None:
@@ -169,7 +152,17 @@ def test_gold_snapshot_reloads_tombstones_and_rejects_sidecar_tampering(tmp_path
     snapshots = load_gold_snapshots(tmp_path)
     assert snapshots["dividends"].retracted_keys == (tuple(retracted[0]),)
 
-    layout.retractions_path(Layer.GOLD, "dividends").write_text("[]\n", encoding="utf-8")
+    write_parquet_rows(
+        layout.retractions_path(Layer.GOLD, "dividends"),
+        [
+            {
+                "isin": "DE0000000002",
+                "exchange": "XETRA",
+                "code": "AAA",
+                "event_key": "a" * 64,
+            }
+        ],
+    )
     with pytest.raises(ValueError, match="retractions fingerprint mismatch"):
         load_gold_snapshots(tmp_path)
 
@@ -192,8 +185,11 @@ def test_gold_persistence_writes_sorted_tombstone_sidecar(tmp_path: Path) -> Non
         retracted_keys=retracted,
     )
 
-    assert json.loads(layout.retractions_path(Layer.GOLD, "dividends").read_text()) == [
-        list(key) for key in sorted(retracted)
+    from xetra_loader.medallion.core import read_snapshot_retractions
+
+    assert read_snapshot_retractions(layout, Layer.GOLD, "dividends") == [
+        {"isin": key[0], "exchange": key[1], "code": key[2], "event_key": key[3]}
+        for key in sorted(retracted)
     ]
     manifest = json.loads(layout.manifest_path(Layer.GOLD, "dividends").read_text())
     assert manifest["semantic_metadata"]["retractions_fingerprint"] == hashlib.sha256(
@@ -269,6 +265,17 @@ def test_acceptance_report_is_sanitized_and_fails_closed(tmp_path: Path) -> None
     assert "dsn" not in text.lower()
     assert "api_token" not in text.lower()
 
+    full_import_only = replace(
+        passing,
+        replay_mutations={},
+        weekly_replay_performed=False,
+    )
+    assert full_import_only.passed
+    full_import_path = write_production_report(full_import_only, tmp_path / "full-only.json")
+    full_import_report = json.loads(full_import_path.read_text(encoding="utf-8"))
+    assert full_import_report["weekly_replay_performed"] is False
+    assert full_import_report["unchanged_replay_mutations"] == {}
+
     failing = ProductionAcceptanceReport(
         target_host=passing.target_host,
         target_port=passing.target_port,
@@ -286,3 +293,18 @@ def test_acceptance_report_is_sanitized_and_fails_closed(tmp_path: Path) -> None
         replay_mutations=passing.replay_mutations,
     )
     assert not failing.passed
+
+
+def test_full_sync_parser_can_disable_delta_replay() -> None:
+    from xetra_loader.ops.verify_postgres_sync import _parser
+
+    args = _parser().parse_args(
+        [
+            "--execute-full-sync",
+            "--confirm-destructive-reset",
+            "--skip-weekly-replay",
+            "--backup-root",
+            "/tmp/backup",
+        ]
+    )
+    assert args.skip_weekly_replay

@@ -1,2 +1,2 @@
 CRON_TZ=Europe/Vienna
-0 8 * * 0 cd /home/dev_xetra/xetra-loader && .venv/bin/xdl-weekly >> artifacts/cron/xdl-weekly.log 2>&1
+0 11 * * 0 cd /home/dev_xetra/xetra-loader && .venv/bin/xdl-enqueue-weekly >> artifacts/cron/xdl-weekly.log 2>&1

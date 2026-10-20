@@ -18,6 +18,7 @@ SCHEMA_FILES: tuple[str, ...] = (
     "sql/schema/003_listing_lifecycle.sql",
     "sql/sync/001_xetra_loader_sync.sql",
     "sql/schema/004_xetra_features.sql",
+    "sql/schema/006_durable_jobs.sql",
 )
 
 

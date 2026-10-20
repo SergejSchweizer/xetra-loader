@@ -29,6 +29,8 @@ def test_schema_qa_scopes_raw_ohlc_to_approved_intraday_families() -> None:
     assert "range_1 AS range_1obs" in VIEW_SQL
     assert "intraday_1 AS intraday_1obs" in VIEW_SQL
     assert "gap_1 AS gap_1obs" in VIEW_SQL
+    assert "AS stoch_k_5" in VIEW_SQL
+    assert "AS donchian_breakout_up" in VIEW_SQL
     assert "adjusted_close_level" in VIEW_SQL
     assert "volume_level" in VIEW_SQL
     assert (
@@ -39,7 +41,7 @@ def test_schema_qa_scopes_raw_ohlc_to_approved_intraday_families() -> None:
 
 def test_schema_qa_has_repeatable_privilege_contract_and_catalog_version() -> None:
     assert "COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features" in VIEW_SQL
-    assert "catalog version=2" in VIEW_SQL
+    assert "catalog version=4" in VIEW_SQL
     assert (
         'GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app'
         in VIEW_SQL
@@ -52,3 +54,5 @@ def test_schema_qa_uses_validated_configurable_refresh_memory_policy() -> None:
     assert "work_mem = '1GB'" not in VIEW_SQL
     assert "xetra_loader.resolve_feature_work_mem()" in VIEW_SQL
     assert "16MB and 4GB" in VIEW_SQL
+    assert "xetra_loader.compute_cores" in VIEW_SQL
+    assert "max_parallel_workers_per_gather" in VIEW_SQL

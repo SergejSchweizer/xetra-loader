@@ -68,9 +68,9 @@ def make_sparse_fixture(days: int = 65) -> tuple[FixtureQuote, ...]:
     )
 
 
-def reference_features(
+def reference_features(  # noqa: C901, PLR0912, PLR0915 -- one independent oracle pass covers the full contract.
     rows: tuple[FixtureQuote, ...],
-) -> dict[tuple[str, date], dict[str, float | None]]:
+) -> dict[tuple[str, date], dict[str, float | bool | None]]:
     """Calculate the complete catalog independently of the PostgreSQL SQL."""
 
     by_code: dict[str, tuple[FixtureQuote, ...]] = {}
@@ -85,9 +85,55 @@ def reference_features(
         adjusted = [row.adjusted_close for row in quotes]
         volumes = [float(row.volume) for row in quotes]
         log_returns = [_lagged_log_return(adjusted, index, 1) for index in range(len(quotes))]
+        range_values = [
+            (quote.high - quote.low) / quote.close if quote.close > 0 else None
+            for quote in quotes
+        ]
+        intraday_values = [
+            (quote.close - quote.open) / quote.open if quote.open > 0 else None
+            for quote in quotes
+        ]
+        gap_values = [
+            None
+            if position == 0 or quotes[position - 1].close <= 0
+            else (quote.open - quotes[position - 1].close) / quotes[position - 1].close
+            for position, quote in enumerate(quotes)
+        ]
+        rsi_values = {
+            period: [_wilder_rsi(adjusted, index, period) for index in range(len(quotes))]
+            for period in (3, 5, 7, 14, 15)
+        }
+        ema_values = {
+            period: _ema_series(adjusted, period) for period in (5, 9, 12, 21, 26)
+        }
+        macd_line = [
+            None if fast is None or slow is None else fast - slow
+            for fast, slow in zip(ema_values[12], ema_values[26], strict=True)
+        ]
+        macd_signal = _ema_series(macd_line, 9, allow_nonpositive=True)
+        macd_hist_relative = [
+            None
+            if line is None or signal is None or price <= 0
+            else (line - signal) / price
+            for line, signal, price in zip(macd_line, macd_signal, adjusted, strict=True)
+        ]
+        stoch_k = {
+            (period, index): _stochastic_k(quotes, index, period)
+            for period in (5, 14)
+            for index in range(len(quotes))
+        }
+        stoch_k5 = [stoch_k[(5, index)] for index in range(len(quotes))]
+        stoch_k14 = [stoch_k[(14, index)] for index in range(len(quotes))]
+        rolling_volatility = {
+            period: [
+                _sample_std(_window(log_returns, index, period))
+                for index in range(len(quotes))
+            ]
+            for period in (8, 32, 96)
+        }
         for index, row in enumerate(quotes):
             returns_by_code[(code, row.trade_date)] = log_returns[index]
-            features: dict[str, float | None] = {
+            features: dict[str, float | bool | None] = {
                 "adjusted_close_level": row.adjusted_close,
                 "volume_level": float(row.volume),
             }
@@ -105,20 +151,6 @@ def reference_features(
                 features[f"adjusted_close_volatility_{window}obs"] = _sample_std(
                     _window(log_returns, index, window)
                 )
-            range_values = [
-                (quote.high - quote.low) / quote.close if quote.close > 0 else None
-                for quote in quotes
-            ]
-            intraday_values = [
-                (quote.close - quote.open) / quote.open if quote.open > 0 else None
-                for quote in quotes
-            ]
-            gap_values = [
-                None
-                if position == 0 or quotes[position - 1].close <= 0
-                else (quote.open - quotes[position - 1].close) / quotes[position - 1].close
-                for position, quote in enumerate(quotes)
-            ]
             for window in (1, 5):
                 features[f"high_low_range_{window}obs"] = _mean(
                     _window(range_values, index, window)
@@ -170,6 +202,149 @@ def reference_features(
                     if mean_volume is None or std_volume in (None, 0.0)
                     else (volumes[index] - mean_volume) / std_volume
                 )
+
+            for window in (1, 2, 3, 4, 5, 8, 10, 20):
+                features[f"log_return_{window}"] = _lagged_log_return(adjusted, index, window)
+            for window in (4, 8, 16):
+                window_returns = _window(log_returns, index, window)
+                features[f"rolling_cum_return_{window}"] = (
+                    None if window_returns is None else math.exp(sum(window_returns)) - 1
+                )
+            for period in (3, 5, 7, 14):
+                features[f"rsi_{period}"] = rsi_values[period][index]
+            rsi5 = rsi_values[5][index]
+            rsi15 = rsi_values[15][index]
+            rsi5_lag1 = rsi_values[5][index - 1] if index >= 1 else None
+            rsi5_lag3 = rsi_values[5][index - 3] if index >= 3 else None
+            features["rsi_ratio_5_15"] = (
+                None if rsi5 is None or rsi15 in (None, 0.0) else rsi5 / rsi15
+            )
+            features["rsi5_slope_3"] = (
+                None if rsi5 is None or rsi5_lag3 is None else (rsi5 - rsi5_lag3) / 3
+            )
+            features["rsi5_delta_1"] = (
+                None if rsi5 is None or rsi5_lag1 is None else rsi5 - rsi5_lag1
+            )
+
+            for period in (5, 9, 21):
+                ema = ema_values[period][index]
+                features[f"ema{period}_distance"] = (
+                    None if ema is None or adjusted[index] <= 0 else adjusted[index] / ema - 1
+                )
+            sma5 = _mean(_window(adjusted, index, 5))
+            sma15 = _mean(_window(adjusted, index, 15))
+            features["sma_ratio_5_15"] = (
+                None if sma5 is None or sma15 in (None, 0.0) else sma5 / sma15
+            )
+            ema5 = ema_values[5][index]
+            ema9 = ema_values[9][index]
+            ema21 = ema_values[21][index]
+            features["ema5_ema21_spread"] = (
+                None
+                if ema5 is None or ema21 is None or adjusted[index] <= 0
+                else (ema5 - ema21) / adjusted[index]
+            )
+            ema9_lag3 = ema_values[9][index - 3] if index >= 3 else None
+            features["ema9_slope_3"] = (
+                None
+                if ema9 is None or ema9_lag3 is None or adjusted[index] <= 0
+                else (ema9 - ema9_lag3) / (3 * adjusted[index])
+            )
+            ema5_lag1 = ema_values[5][index - 1] if index >= 1 else None
+            ema9_lag1 = ema_values[9][index - 1] if index >= 1 else None
+            features["ema5_ema9_cross"] = (
+                None
+                if ema5 is None or ema9 is None or ema5_lag1 is None or ema9_lag1 is None
+                else (
+                    1
+                    if ema5 > ema9 and ema5_lag1 <= ema9_lag1
+                    else -1
+                    if ema5 < ema9 and ema5_lag1 >= ema9_lag1
+                    else 0
+                )
+            )
+
+            for window in (1, 2, 4, 8):
+                lagged = _lagged(adjusted, index, window)
+                features[f"roc_{window}"] = (
+                    None if lagged in (None, 0.0) else adjusted[index] / lagged - 1
+                )
+            roc4, roc8 = features["roc_4"], features["roc_8"]
+            features["roc_acceleration_4_8"] = (
+                None if roc4 is None or roc8 is None else roc4 - roc8
+            )
+
+            k5, k14 = stoch_k5[index], stoch_k14[index]
+            d5 = _mean(_window(stoch_k5, index, 3))
+            d14 = _mean(_window(stoch_k14, index, 3))
+            features["stoch_k_5"] = k5
+            features["stoch_d_5_3"] = d5
+            features["stoch_k_14"] = k14
+            features["stoch_d_14_3"] = d14
+            features["stoch_kd_spread_5"] = (
+                None if k5 is None or d5 is None else k5 - d5
+            )
+            k5_lag3 = stoch_k5[index - 3] if index >= 3 else None
+            features["stoch_k_slope_3"] = (
+                None if k5 is None or k5_lag3 is None else (k5 - k5_lag3) / 3
+            )
+
+            macd_line_value = macd_line[index]
+            macd_hist_value = macd_hist_relative[index]
+            features["macd_line_relative"] = (
+                None
+                if macd_line_value is None or adjusted[index] <= 0
+                else macd_line_value / adjusted[index]
+            )
+            features["macd_hist_relative"] = macd_hist_value
+            hist_lag3 = macd_hist_relative[index - 3] if index >= 3 else None
+            features["macd_hist_delta_3"] = (
+                None
+                if macd_hist_value is None or hist_lag3 is None
+                else macd_hist_value - hist_lag3
+            )
+
+            previous_quotes = quotes[max(0, index - 20) : index]
+            features["donchian_breakout_up"] = (
+                None
+                if len(previous_quotes) != 20
+                else row.high > max(quote.high for quote in previous_quotes)
+            )
+            features["donchian_breakout_down"] = (
+                None
+                if len(previous_quotes) != 20
+                else row.low < min(quote.low for quote in previous_quotes)
+            )
+            for period in (8, 32, 96):
+                features[f"rolling_volatility_{period}"] = rolling_volatility[period][index]
+            vol8_window = _window(rolling_volatility[8], index, 96)
+            vol8_mean = _mean(vol8_window)
+            vol8_std = _sample_std(vol8_window)
+            features["volatility_zscore_96"] = (
+                None
+                if vol8_mean is None or vol8_std in (None, 0.0)
+                else (rolling_volatility[8][index] - vol8_mean) / vol8_std
+            )
+            level_window = _window(adjusted, index, 96)
+            level_mean = _mean(level_window)
+            level_std = _sample_std(level_window)
+            features["level_zscore_96"] = (
+                None
+                if level_mean is None or level_std in (None, 0.0)
+                else (adjusted[index] - level_mean) / level_std
+            )
+            for lag, window in ((1, 96), (4, 96), (8, 192)):
+                features[f"momentum_autocorr_lag{lag}_window{window}"] = (
+                    _rolling_autocorrelation(log_returns, index, lag, window)
+                )
+            for window in (32, 96):
+                prices = _window(adjusted, index, window)
+                features[f"rolling_drawdown_{window}"] = (
+                    None
+                    if prices is None or max(prices) == 0
+                    else adjusted[index] / max(prices) - 1
+                )
+            features["log_tick_volume"] = math.log1p(volumes[index])
             output[(code, row.trade_date)] = features
 
     dates = tuple(sorted({row.trade_date for row in rows}))
@@ -237,6 +412,78 @@ def _mean(values: list[float] | None) -> float | None:
 
 def _sample_std(values: list[float] | None) -> float | None:
     return None if values is None or len(values) < 2 else statistics.stdev(values)
+
+
+def _ema_series(
+    values: list[float | None],
+    period: int,
+    *,
+    allow_nonpositive: bool = False,
+) -> list[float | None]:
+    """Calculate a causal EMA seeded by the first full SMA window."""
+
+    result: list[float | None] = [None] * len(values)
+    seed: list[float] = []
+    previous: float | None = None
+    alpha = 2.0 / (period + 1)
+    valid_run = 0
+    for index, value in enumerate(values):
+        if value is None or (value <= 0 and not allow_nonpositive):
+            seed.clear()
+            previous = None
+            valid_run = 0
+            continue
+        valid_run += 1
+        if valid_run < period:
+            seed.append(value)
+            continue
+        if valid_run == period:
+            seed.append(value)
+            previous = statistics.fmean(seed)
+        else:
+            assert previous is not None
+            previous = alpha * value + (1 - alpha) * previous
+        result[index] = previous
+    return result
+
+
+def _stochastic_k(
+    quotes: tuple[FixtureQuote, ...],
+    index: int,
+    period: int,
+) -> float | None:
+    if index + 1 < period:
+        return None
+    window = quotes[index - period + 1 : index + 1]
+    highest = max(quote.high for quote in window)
+    lowest = min(quote.low for quote in window)
+    if highest <= lowest:
+        return None
+    return 100 * (quotes[index].close - lowest) / (highest - lowest)
+
+
+def _rolling_autocorrelation(
+    values: list[float | None],
+    index: int,
+    lag: int,
+    window: int,
+) -> float | None:
+    if index + 1 < window:
+        return None
+    positions = range(index - window + 1, index + 1)
+    pairs = [
+        (values[position], values[position - lag])
+        for position in positions
+        if position >= lag
+    ]
+    if len(pairs) != window or any(left is None or right is None for left, right in pairs):
+        return None
+    left_values = [float(left) for left, _right in pairs]
+    right_values = [float(right) for _left, right in pairs]
+    try:
+        return statistics.correlation(left_values, right_values)
+    except statistics.StatisticsError:
+        return None
 
 
 def _wilder_rsi(values: list[float | None], index: int, period: int) -> float | None:

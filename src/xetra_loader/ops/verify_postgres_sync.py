@@ -18,7 +18,7 @@ from typing import Any, cast
 from psycopg import Connection, Cursor, Error
 from psycopg.conninfo import conninfo_to_dict
 
-from xetra_loader.config import resolve_medallion_root, resolve_postgres_admin_dsn
+from xetra_loader.config import resolve_cores, resolve_medallion_root, resolve_postgres_admin_dsn
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.contracts.quotes import QuoteRecord
@@ -26,7 +26,14 @@ from xetra_loader.gold.dividends import DividendGoldResult
 from xetra_loader.gold.listings import ListingGoldResult
 from xetra_loader.gold.quotes import QuoteGoldResult
 from xetra_loader.gold.splits import SplitGoldResult
-from xetra_loader.medallion.core import JSONValue, Layer, MedallionLayout, canonical_json
+from xetra_loader.medallion.core import (
+    JSONValue,
+    Layer,
+    MedallionLayout,
+    canonical_json,
+    read_dataset_rows,
+    read_snapshot_retractions,
+)
 from xetra_loader.ops.bootstrap import (
     BootstrapResult,
     FetchBatch,
@@ -206,6 +213,7 @@ class ProductionAcceptanceReport:
     timestamps: TimestampVerification
     role: RoleVerification
     replay_mutations: Mapping[str, int]
+    weekly_replay_performed: bool = True
 
     @property
     def passed(self) -> bool:
@@ -237,6 +245,7 @@ class ProductionAcceptanceReport:
             "orphan_counts": dict(self.orphan_counts),
             "timestamps": self.timestamps.as_dict(),
             "role": self.role.as_dict(),
+            "weekly_replay_performed": self.weekly_replay_performed,
             "unchanged_replay_mutations": dict(self.replay_mutations),
         }
 
@@ -334,8 +343,9 @@ def execute_production_full_sync_and_verify(
     medallion_root: Path,
     output_path: Path,
     backup_root: Path,
+    weekly_replay: bool = True,
 ) -> ProductionAcceptanceReport:
-    """Destructively bootstrap the real target, replay unchanged state, and verify independently."""
+    """Destructively bootstrap the real target and independently verify publication."""
 
     root = medallion_root.resolve()
     _require_scheduler_disabled()
@@ -368,17 +378,20 @@ def execute_production_full_sync_and_verify(
                 confirmed=True,
                 reset_owned_state=True,
                 parallel_runtime_factory=worker_runtime,
-                max_workers=4,
+                max_workers=resolve_cores(),
             )
         finally:
             runtime.close()
 
-        replay = run_restartable_pipeline(
-            build_weekly_stages(),
-            lock_path=root / "weekly.lock",
-            checkpoint_path=root / "weekly.checkpoint.json",
-        )
-        replay_mutations = _weekly_replay_mutations(replay.as_dict())
+        if weekly_replay:
+            replay = run_restartable_pipeline(
+                build_weekly_stages(),
+                lock_path=root / "weekly.lock",
+                checkpoint_path=root / "weekly.checkpoint.json",
+            )
+            replay_mutations = _weekly_replay_mutations(replay.as_dict())
+        else:
+            replay_mutations = {}
 
         connection = connect_postgres(admin=True)
         try:
@@ -389,6 +402,7 @@ def execute_production_full_sync_and_verify(
                 medallion_root=root,
                 initial=initial,
                 replay_mutations=replay_mutations,
+                weekly_replay_performed=weekly_replay,
             )
         finally:
             connection.close()
@@ -405,6 +419,7 @@ def verify_postgres_sync(
     medallion_root: Path,
     initial: BootstrapResult,
     replay_mutations: Mapping[str, int],
+    weekly_replay_performed: bool = True,
 ) -> ProductionAcceptanceReport:
     """Read PostgreSQL independently and compare it with validated Gold state."""
 
@@ -455,6 +470,7 @@ def verify_postgres_sync(
         timestamps=_verify_timestamps(connection),
         role=_verify_app_role(connection),
         replay_mutations=replay_mutations,
+        weekly_replay_performed=weekly_replay_performed,
     )
 
 
@@ -464,8 +480,8 @@ def load_gold_snapshots(root: Path) -> dict[str, GoldDatasetSnapshot]:
     layout = MedallionLayout(root.resolve())
     result: dict[str, GoldDatasetSnapshot] = {}
     for dataset in DATASETS:
-        source_rows = _read_json_rows(layout.dataset_path(Layer.SILVER, dataset) / "data.json")
-        gold_rows = _read_json_rows(layout.dataset_path(Layer.GOLD, dataset) / "data.json")
+        source_rows = read_dataset_rows(layout, Layer.SILVER, dataset)
+        gold_rows = read_dataset_rows(layout, Layer.GOLD, dataset)
         manifest_path = layout.manifest_path(Layer.GOLD, dataset)
         manifest = cast(dict[str, JSONValue], json.loads(manifest_path.read_text(encoding="utf-8")))
         semantic_metadata = manifest.get("semantic_metadata")
@@ -477,16 +493,16 @@ def load_gold_snapshots(root: Path) -> dict[str, GoldDatasetSnapshot]:
         ordered = tuple(sorted(gold_rows, key=lambda row: _business_key(dataset, row)))
         retracted_keys: tuple[tuple[str, str, str, str], ...] = ()
         if dataset in {"dividends", "splits"}:
-            retractions_path = layout.retractions_path(Layer.GOLD, dataset)
-            if not retractions_path.exists():
-                raise ValueError(f"Gold retractions are missing for {dataset}")
-            decoded_retractions = cast(
-                JSONValue,
-                json.loads(retractions_path.read_text(encoding="utf-8")),
+            decoded_retractions: list[list[str]] = []
+            for row in read_snapshot_retractions(layout, Layer.GOLD, dataset):
+                key = [row.get("isin"), row.get("exchange"), row.get("code"), row.get("event_key")]
+                if not all(isinstance(part, str) for part in key):
+                    raise ValueError(f"Gold retractions for {dataset} contain an invalid key")
+                decoded_retractions.append(cast(list[str], key))
+            retracted_keys = _validated_retracted_keys(
+                dataset,
+                cast(list[JSONValue], decoded_retractions),
             )
-            if not isinstance(decoded_retractions, list):
-                raise ValueError(f"Gold retractions for {dataset} must be a JSON array")
-            retracted_keys = _validated_retracted_keys(dataset, decoded_retractions)
             expected_retraction_fingerprint = semantic_metadata.get("retractions_fingerprint")
             actual_retraction_fingerprint = hashlib.sha256(
                 canonical_json([list(key) for key in retracted_keys]).encode("utf-8")
@@ -1045,6 +1061,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--execute-full-sync", action="store_true")
     parser.add_argument("--confirm-destructive-reset", action="store_true")
     parser.add_argument(
+        "--skip-weekly-replay",
+        action="store_true",
+        help="verify the full import directly without making a subsequent delta request",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("artifacts/acceptance/postgres-full-sync-v2.json"),
@@ -1074,6 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         medallion_root=Path(medallion_root_value),
         output_path=args.output,
         backup_root=args.backup_root,
+        weekly_replay=not args.skip_weekly_replay,
     )
     print(canonical_json(report.as_dict()))
     return 0

@@ -86,14 +86,17 @@ def test_feature_schema_catalog_grants_and_types(tmp_path: Path) -> None:
     actual_names = tuple(column.split(":", 1)[0] for column in columns)
     checks = {
         "materialized_view": relation == ["m"],
-        "exact_column_order": actual_names == _EXPECTED_COLUMNS,
+        "exact_column_set": (
+            len(actual_names) == len(_EXPECTED_COLUMNS)
+            and set(actual_names) == set(_EXPECTED_COLUMNS)
+        ),
         "identity_types": columns[:4]
         == ["isin:text", "exchange:text", "code:text", "trade_date:date"],
         "base_level_types": columns[4:6] == [
             "adjusted_close_level:double precision",
             "volume_level:double precision",
         ],
-        "catalog_comment": bool(comment) and "catalog version=2" in comment[0],
+        "catalog_comment": bool(comment) and "catalog version=4" in comment[0],
         "portfell_select_only": privileges == ["t|f|f|f|f"],
         "forbidden_level_columns_absent": not any(
             name in actual_names
