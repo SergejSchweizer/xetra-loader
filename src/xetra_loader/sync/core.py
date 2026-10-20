@@ -14,11 +14,11 @@ import psycopg
 from psycopg import Connection, Cursor
 
 from xetra_loader.config import (
+    resolve_cores,
     resolve_feature_work_mem,
     resolve_postgres_admin_dsn,
     resolve_postgres_writer_dsn,
 )
-from xetra_loader.gold.validation import GoldValidationSummary
 
 type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, JSONValue]
 type SemanticRow = Mapping[str, JSONValue]
@@ -84,6 +84,11 @@ def connect_postgres(
         "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
         (resolve_feature_work_mem(),),
     )
+    connection.execute(
+        "SELECT set_config('xetra_loader.compute_cores', %s, false)",
+        (str(resolve_cores()),),
+    )
+    connection.commit()
     connection.commit()
     if require_non_superuser:
         row = connection.execute(
@@ -115,8 +120,6 @@ def run_sync(
     semantic_rows: Iterable[SemanticRow],
     mutate: Mutator,
     run_id: str | None = None,
-    now: Callable[[], datetime] | None = None,
-    authoritative_snapshot: GoldValidationSummary | None = None,
 ) -> SyncOutcome:
     """Couple serving mutations and sync-state advance in one PostgreSQL transaction."""
 
@@ -135,8 +138,7 @@ def run_sync(
         else {}
     )
     resolved_run_id = run_id or str(uuid4())
-    clock = now or (lambda: datetime.now(UTC))
-    started_at = _require_utc(clock())
+    started_at = _require_utc(datetime.now(UTC))
 
     with connection.transaction(), connection.cursor() as cursor:
         cursor.execute("SET LOCAL TIME ZONE 'UTC'")
@@ -195,7 +197,7 @@ def run_sync(
                 (dataset, fingerprint, row_count, started_at),
             )
 
-        finished_at = _require_utc(clock())
+        finished_at = _require_utc(datetime.now(UTC))
         status = "noop" if is_noop else "applied"
         cursor.execute(
             "INSERT INTO xetra_loader_sync.loader_runs "

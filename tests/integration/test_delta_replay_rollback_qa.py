@@ -30,7 +30,7 @@ def _apply_sql(path: str) -> None:
     )
 
 
-def _quote(
+def _quote(  # noqa: PLR0913 -- constructs a deliberately explicit OHLCV QA row.
     day: int,
     close: str,
     *,
@@ -96,7 +96,9 @@ def _write_report(path: Path, checks: dict[str, bool], counters: dict[str, int])
     path.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
-def test_delta_replay_and_rollback_converge_without_stale_state(tmp_path: Path) -> None:
+def test_delta_replay_and_rollback_converge_without_stale_state(  # noqa: PLR0915 -- one DB scenario verifies end-to-end rollback.
+    tmp_path: Path,
+) -> None:
     if DSN is None:
         pytest.skip("XDL_TEST_POSTGRES_DSN is not configured")
     _apply_sql("sql/schema/001_xetra_loader.sql")

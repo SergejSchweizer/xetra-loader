@@ -1,0 +1,18 @@
+[Unit]
+Description=XETRA loader REST API and durable job worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dev_xetra
+WorkingDirectory=/home/dev_xetra/xetra-loader
+ExecStart=/home/dev_xetra/xetra-loader/.venv/bin/xdl-api --host 127.0.0.1 --port 8765 --cores 6
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/dev_xetra/xetra-loader/lake /home/dev_xetra/xetra-loader/.logs
+
+[Install]
+WantedBy=multi-user.target

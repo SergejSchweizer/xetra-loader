@@ -4,13 +4,15 @@ import pytest
 
 from xetra_loader.config import (
     ConfigurationError,
+    resolve_api_base_url,
+    resolve_api_token,
+    resolve_cores,
     resolve_eodhd_token,
     resolve_feature_work_mem,
     resolve_medallion_root,
     resolve_postgres_admin_dsn,
     resolve_postgres_dsn,
     resolve_postgres_writer_dsn,
-    resolve_weekly_workers,
 )
 
 
@@ -92,24 +94,72 @@ def test_feature_work_mem_environment_overrides_yaml(
     assert resolve_feature_work_mem() == "1GB"
 
 
-def test_weekly_workers_resolve_from_yaml_and_environment(
+def test_cores_resolve_from_yaml_and_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = tmp_path / "config.yaml"
     _write_config(config_path)
     config_path.write_text(
-        config_path.read_text(encoding="utf-8") + "\nweekly:\n  workers: 6\n",
+        config_path.read_text(encoding="utf-8") + "\nweekly:\n  cores: 5\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
-    monkeypatch.delenv("XDL_WEEKLY_WORKERS", raising=False)
-    assert resolve_weekly_workers() == 6
-    monkeypatch.setenv("XDL_WEEKLY_WORKERS", "4")
-    assert resolve_weekly_workers() == 4
+    monkeypatch.delenv("XDL_CORES", raising=False)
+    assert resolve_cores() == 5
+    monkeypatch.setenv("XDL_CORES", "4")
+    assert resolve_cores() == 4
 
 
-@pytest.mark.parametrize("value", ["0", "33", "not-an-int"])
-def test_weekly_workers_validation_fails_closed(value: str) -> None:
+def test_cores_default_to_six(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
+    monkeypatch.delenv("XDL_CORES", raising=False)
+    assert resolve_cores() == 6
+
+
+@pytest.mark.parametrize("value", ["0", "65", "not-an-int"])
+def test_cores_validation_fails_closed(value: str) -> None:
     with pytest.raises(ConfigurationError):
-        resolve_weekly_workers(value)
+        resolve_cores(value)
+
+
+def test_api_configuration_resolves_token_and_base_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + '\napi:\n  token: "only-for-this-test-12345678901234567890"\n  base_url: "http://127.0.0.1:8765"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
+    monkeypatch.delenv("XDL_API_TOKEN", raising=False)
+    monkeypatch.delenv("XDL_API_BASE_URL", raising=False)
+
+    assert resolve_api_token() == "only-for-this-test-12345678901234567890"
+    assert resolve_api_base_url() == "http://127.0.0.1:8765"
+    monkeypatch.setenv("XDL_API_TOKEN", "environment-token-12345678901234567890")
+    assert resolve_api_token() == "environment-token-12345678901234567890"
+
+
+def test_api_configuration_fails_closed_without_token_or_valid_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
+    monkeypatch.delenv("XDL_API_TOKEN", raising=False)
+    monkeypatch.setenv("XDL_API_BASE_URL", "file:///tmp/no")
+
+    with pytest.raises(ConfigurationError, match="api.token"):
+        resolve_api_token()
+    with pytest.raises(ConfigurationError, match="http"):
+        resolve_api_base_url()

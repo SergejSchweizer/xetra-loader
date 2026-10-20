@@ -1,8 +1,31 @@
 # Repository governance
 
-This repository uses pull-request-only delivery to `main` after XDL-PR006.
+## Contents
 
-## XDL-PR035 repair evidence
+- [Current delivery rules](#current-delivery-rules)
+- [Archived XDL-PR006/XDL-PR035 record](#archived-xdl-pr006xdl-pr035-record)
+
+## Current delivery rules
+
+- Run Ruff, Mypy, unit tests, and the applicable PostgreSQL integration tests
+  locally as documented in `README.md`. GitHub Actions is not a required test
+  runner or a delivery dependency; do not invoke or depend on it.
+- Keep active, explicitly assigned work items isolated on their own branch.
+  `BACKLOG.md` currently contains only obsolete PR history and no active work
+  items.
+- Use Conventional Commit subjects with the assigned work-item scope when one
+  exists. Do not commit secrets, generated market data, or local configuration.
+- The stated delivery target is `origin/main` after local gates pass. Inspect
+  current remote protection before pushing; if it rejects the authorized
+  operation, stop and request maintainer direction rather than force-pushing,
+  weakening protections, or invoking a workflow.
+
+The following records document retired XDL-PR process requirements. They are
+historical evidence, not current delivery instructions.
+
+## Archived XDL-PR006/XDL-PR035 record
+
+### XDL-PR035 repair evidence
 
 Observed before the XDL-PR035 repair (2026-08-24): GitHub returned `404 Branch not
 protected` for `main`, and the repository reported `allow_auto_merge=false`.
@@ -16,7 +39,7 @@ GitHub enforces direct-push rejection through this protection. The enforcement
 configuration above is the safe verification evidence; attempting a known-invalid
 push solely to prove rejection is not part of normal repository operation.
 
-## Required `main` protections
+### Archived required `main` protections
 
 The GitHub repository configuration is part of the XDL-PR006 acceptance contract and must enforce all of the following:
 
@@ -30,7 +53,7 @@ The GitHub repository configuration is part of the XDL-PR006 acceptance contract
 
 The workflows intentionally keep `lint`, `type`, `unit`, `integration`, and `policy` independent. The final `merge-gate` succeeds only if every required job reports `success`.
 
-## Auto-merge procedure
+### Archived auto-merge procedure
 
 1. Create a work-order branch from its exact merged dependency SHA.
 2. Push only commits whose Conventional Commit scope is the exact `xdl-prNNN-*` work-order.
@@ -39,7 +62,7 @@ The workflows intentionally keep `lint`, `type`, `unit`, `integration`, and `pol
 5. Once the PR is review-ready, enable GitHub auto-merge.
 6. Do not manually merge around a failing, cancelled, skipped, or pending `merge-gate`.
 
-## Verification checklist
+### Archived verification checklist
 
 XDL-PR006 is complete only after GitHub reports the repository settings above as active and a representative PR demonstrates both states:
 

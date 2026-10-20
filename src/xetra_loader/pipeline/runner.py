@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -9,10 +10,9 @@ from collections.abc import Callable, Sequence
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from xetra_loader.config import resolve_medallion_root
+from xetra_loader.config import resolve_cores, resolve_medallion_root
 from xetra_loader.pipeline.orchestrator import PipelineStageError, PipelineStages
 from xetra_loader.pipeline.restart import ConcurrentLoaderRunError, run_restartable_pipeline
-from xetra_loader.pipeline.runtime import build_weekly_stages
 
 _LOGGER = logging.getLogger("xetra_loader")
 
@@ -44,25 +44,39 @@ def _configure_logging() -> Path:
     return log_path
 
 
-type StagesFactory = Callable[[], PipelineStages]
+type StagesFactory = Callable[[int], PipelineStages]
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
-    stages_factory: StagesFactory = build_weekly_stages,
+    stages_factory: StagesFactory | None = None,
     medallion_root: Path | None = None,
 ) -> int:
-    """Run exactly one locked weekly pipeline using paths beneath the Medallion root."""
+    """Run one locked pipeline using the same bounded CPU budget for each engine."""
 
-    if argv:
-        raise ValueError("xdl-weekly does not accept command-line arguments")
+    parser = argparse.ArgumentParser(prog="xdl-weekly")
+    parser.add_argument(
+        "--cores",
+        type=int,
+        default=None,
+        help="CPU/concurrency budget (default: weekly.cores or 6)",
+    )
+    arguments = parser.parse_args(argv)
+    cores = resolve_cores(arguments.cores)
+    if stages_factory is None:
+        # Set this before importing Polars; its native pool is initialized once.
+        os.environ["POLARS_MAX_THREADS"] = str(cores)
+        os.environ["XDL_CORES"] = str(cores)
+        from xetra_loader.pipeline.runtime import build_weekly_stages
+
+        stages_factory = build_weekly_stages
     log_path = _configure_logging()
     root = (medallion_root or Path(resolve_medallion_root())).resolve()
-    _LOGGER.info("weekly_start root=%s log=%s", root, log_path)
+    _LOGGER.info("weekly_start root=%s log=%s cores=%d", root, log_path, cores)
     try:
         summary = run_restartable_pipeline(
-            stages_factory(),
+            stages_factory(cores),
             lock_path=root / "weekly.lock",
             checkpoint_path=root / "weekly.checkpoint.json",
         )

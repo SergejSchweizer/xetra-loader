@@ -18,7 +18,7 @@ from xetra_loader.sync.core import (
 )
 
 
-def sync_quotes(
+def sync_quotes(  # noqa: PLR0913 -- explicit timestamps and row provenance are publication inputs.
     connection: Connection[Any],
     gold: QuoteGoldResult,
     *,
@@ -48,7 +48,6 @@ def sync_quotes(
         semantic_rows=gold.semantic_rows(),
         mutate=mutate,
         run_id=run_id,
-        authoritative_snapshot=authoritative_snapshot,
     )
 
 

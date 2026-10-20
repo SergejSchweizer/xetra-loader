@@ -20,7 +20,7 @@ from xetra_loader.sync.core import (
 )
 
 
-def sync_splits(
+def sync_splits(  # noqa: PLR0913 -- explicit timestamps and row provenance are publication inputs.
     connection: Connection[Any],
     gold: SplitGoldResult,
     *,
@@ -109,7 +109,6 @@ def sync_splits(
         semantic_rows=semantic_rows,
         mutate=mutate,
         run_id=run_id,
-        authoritative_snapshot=authoritative_snapshot,
     )
 
 

@@ -17,5 +17,10 @@ medallion:
   root: "./lake"
 
 weekly:
-  # Bounded concurrent EODHD fetches; PostgreSQL publication remains serialized.
-  workers: 32
+  # One bounded CPU/concurrency budget shared by Polars and provider fetches.
+  cores: 6
+
+api:
+  # Required bearer token; keep the real value only in ignored config.yaml.
+  token: "replace-with-a-long-random-api-token"
+  base_url: "http://127.0.0.1:8765"

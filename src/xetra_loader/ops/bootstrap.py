@@ -7,21 +7,28 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from itertools import groupby
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from psycopg import Connection
 
-from xetra_loader.config import resolve_eodhd_token, resolve_medallion_root
+from xetra_loader.config import resolve_cores, resolve_eodhd_token, resolve_medallion_root
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.contracts.quotes import QuoteRecord
-from xetra_loader.eodhd.transport import BinaryResponse, EodhdTransport, JSONValue
+from xetra_loader.eodhd.transport import (
+    BinaryResponse,
+    EodhdTransport,
+    JSONValue,
+    TransportConfig,
+)
 from xetra_loader.gold.dividends import DividendGoldResult, build_dividend_gold
 from xetra_loader.gold.listings import ListingGoldResult, build_listing_gold
 from xetra_loader.gold.quotes import QuoteGoldResult, build_quote_gold
@@ -32,12 +39,16 @@ from xetra_loader.ingestion.listings import ingest_xetra_listings
 from xetra_loader.ingestion.quotes import ingest_quotes
 from xetra_loader.ingestion.splits import ingest_splits
 from xetra_loader.medallion.core import (
+    BronzePartition,
+    GoldArtifact,
     Layer,
     Manifest,
     MedallionLayout,
-    atomic_write,
+    SilverPartition,
     atomic_write_text,
     canonical_json,
+    write_parquet_rows,
+    write_raw_listing_partitions,
 )
 from xetra_loader.ops.reset import build_reset_plan, execute_reset
 from xetra_loader.sync import connect_postgres
@@ -147,6 +158,15 @@ class BootstrapResult:
             },
             "verification": self.verification.as_dict(),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotWrite:
+    """Semantic and execution options for one lake snapshot publication."""
+
+    semantic_metadata: Mapping[str, JSONValue]
+    retractions: Sequence[Mapping[str, JSONValue]] | None = None
+    presorted: bool = False
 
 
 class DestructiveConfirmationRequired(RuntimeError):
@@ -501,8 +521,7 @@ class _MeasuredTransport:
         self._token = resolve_eodhd_token(token)
         self._opener = _AttemptCounter()
         self._transport = EodhdTransport(
-            token=self._token,
-            opener=self._opener.open,
+            TransportConfig(token=self._token, opener=self._opener.open)
         )
         self.logical_requests = 0
 
@@ -541,6 +560,8 @@ class PostgresEodhdBootstrapRuntime:
         self._layout = MedallionLayout(medallion_root.resolve())
         self._repository_root = repository_root.resolve()
         self._quarantine_invalid_ohlc = quarantine_invalid_ohlc
+        self._cores = resolve_cores()
+        self._owns_connection = True
 
     @classmethod
     def from_environment(
@@ -589,13 +610,15 @@ class PostgresEodhdBootstrapRuntime:
         runtime during serialized publication.
         """
 
-        return type(self)(
+        worker = type(self)(
             connection=self._connection,
             transport=self._transport.clone(),
             medallion_root=self._layout.root,
             repository_root=self._repository_root,
             quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
         )
+        worker._owns_connection = False
+        return worker
 
     def database_worker(self) -> PostgresEodhdBootstrapRuntime:
         """Return a publication worker with an independent writer connection."""
@@ -615,7 +638,12 @@ class PostgresEodhdBootstrapRuntime:
         raw = cast(JSONValue, json.loads(result.bronze_payload))
         self._write_layer(Layer.BRONZE, "listings", raw)
         silver = [record.semantic_dict() for record in result.silver_records]
-        self._write_layer(Layer.SILVER, "listings", cast(JSONValue, silver))
+        self._persist_partitioned_snapshot(
+            Layer.SILVER,
+            "listings",
+            silver,
+            snapshot=SnapshotWrite({"row_count": len(silver)}),
+        )
         return FetchBatch(result.silver_records, metrics, datetime.now(UTC))
 
     def fetch_quotes(
@@ -635,12 +663,6 @@ class PostgresEodhdBootstrapRuntime:
         )
         metrics = self._measurement_finish(before, len(result.silver_records))
         self._record_partition_bronze("eod_quotes", listing, result.bronze_payload)
-        self._write_partition(
-            Layer.SILVER,
-            "eod_quotes",
-            listing,
-            [record.semantic_dict() for record in result.silver_records],
-        )
         return FetchBatch(result.silver_records, metrics, datetime.now(UTC))
 
     def fetch_dividends(
@@ -659,12 +681,6 @@ class PostgresEodhdBootstrapRuntime:
         )
         metrics = self._measurement_finish(before, len(result.silver_records))
         self._record_partition_bronze("dividends", listing, result.bronze_payload)
-        self._write_partition(
-            Layer.SILVER,
-            "dividends",
-            listing,
-            [_dividend_silver(event) for event in result.silver_records],
-        )
         return FetchBatch(result.silver_records, metrics, datetime.now(UTC))
 
     def fetch_splits(
@@ -683,12 +699,6 @@ class PostgresEodhdBootstrapRuntime:
         )
         metrics = self._measurement_finish(before, len(result.silver_records))
         self._record_partition_bronze("splits", listing, result.bronze_payload)
-        self._write_partition(
-            Layer.SILVER,
-            "splits",
-            listing,
-            [_split_silver(event) for event in result.silver_records],
-        )
         return FetchBatch(result.silver_records, metrics, datetime.now(UTC))
 
     def persist_gold(
@@ -700,33 +710,35 @@ class PostgresEodhdBootstrapRuntime:
         semantic_fingerprint: str,
         retracted_keys: Sequence[tuple[str, str, str, str]] = (),
     ) -> None:
-        if dataset in {"eod_quotes", "dividends", "splits"}:
-            self._finalize_partitions(dataset)
         rows = [dict(row) for row in semantic_rows]
-        self._write_layer(Layer.GOLD, dataset, cast(JSONValue, rows))
         retractions = [list(key) for key in sorted(retracted_keys)]
         retraction_fingerprint = hashlib.sha256(
             canonical_json(cast(JSONValue, retractions)).encode("utf-8")
         ).hexdigest()
-        retractions_path = self._layout.retractions_path(Layer.GOLD, dataset)
-        if dataset in {"dividends", "splits"}:
-            retractions_path.write_text(
-                canonical_json(cast(JSONValue, retractions)) + "\n",
-                encoding="utf-8",
-            )
-        manifest = Manifest(
-            dataset=dataset,
-            layer=Layer.GOLD,
-            semantic_metadata={
-                "row_count": row_count,
-                "builder_semantic_fingerprint": semantic_fingerprint,
-                "retractions_fingerprint": retraction_fingerprint,
-            },
-            run_metadata={},
-        )
-        atomic_write_text(
-            self._layout.manifest_path(Layer.GOLD, dataset),
-            manifest.to_json() + "\n",
+        self._persist_partitioned_snapshot(
+            Layer.GOLD,
+            dataset,
+            rows,
+            snapshot=SnapshotWrite(
+                semantic_metadata={
+                    "row_count": row_count,
+                    "builder_semantic_fingerprint": semantic_fingerprint,
+                    "retractions_fingerprint": retraction_fingerprint,
+                },
+                retractions=(
+                    [
+                        {
+                            "isin": key[0],
+                            "exchange": key[1],
+                            "code": key[2],
+                            "event_key": key[3],
+                        }
+                        for key in retractions
+                    ]
+                    if dataset in {"dividends", "splits"}
+                    else None
+                ),
+            ),
         )
 
     def persist_silver(
@@ -734,12 +746,13 @@ class PostgresEodhdBootstrapRuntime:
         dataset: str,
         semantic_rows: Sequence[Mapping[str, JSONValue]],
     ) -> None:
-        """Replace the complete normalized Silver state after an incremental merge."""
+        """Atomically publish the complete normalized Silver Parquet snapshot."""
 
-        self._write_layer(
+        self._persist_partitioned_snapshot(
             Layer.SILVER,
             dataset,
-            cast(JSONValue, [dict(row) for row in semantic_rows]),
+            [dict(row) for row in semantic_rows],
+            snapshot=SnapshotWrite({"row_count": len(semantic_rows)}),
         )
 
     def publish_listings(
@@ -850,7 +863,8 @@ class PostgresEodhdBootstrapRuntime:
         )
 
     def close(self) -> None:
-        self._connection.close()
+        if self._owns_connection:
+            self._connection.close()
 
     def _initialize_database(self) -> None:
         for relative in (
@@ -890,41 +904,213 @@ class PostgresEodhdBootstrapRuntime:
         bronze_payload: str,
     ) -> None:
         payload = cast(JSONValue, json.loads(bronze_payload))
-        self._write_partition(
-            Layer.BRONZE,
-            dataset,
-            listing,
-            [
+        if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
+            raise ValueError(f"raw {dataset} response must contain JSON objects")
+        timeframe = "1d" if dataset == "eod_quotes" else "event"
+        fallback_date = datetime.now(UTC).date()
+        grouped: dict[Path, list[dict[str, JSONValue]]] = {}
+        for raw_row in cast(list[dict[str, JSONValue]], payload):
+            raw_date = raw_row.get("date")
+            partition_date = (
+                date.fromisoformat(raw_date) if isinstance(raw_date, str) else fallback_date
+            )
+            path = self._layout.bronze_path(
+                BronzePartition(
+                    dataset_type=dataset,
+                    exchange=listing.exchange,
+                    instrument_type=listing.instrument_type or "unknown",
+                    symbol=listing.code,
+                    timeframe=timeframe,
+                    partition_date=partition_date,
+                )
+            )
+            grouped.setdefault(path, []).append(
                 {
                     "isin": listing.isin,
                     "exchange": listing.exchange,
                     "code": listing.code,
-                    "payload": payload,
+                    "payload_json": canonical_json(raw_row),
                 }
-            ],
-        )
+            )
+        for path, rows in grouped.items():
+            write_parquet_rows(
+                path,
+                sorted(rows, key=lambda row: canonical_json(cast(JSONValue, dict(row)))),
+            )
 
-    def _write_partition(
+    def _persist_partitioned_snapshot(
         self,
         layer: Layer,
         dataset: str,
-        listing: ListingRecord,
-        rows: list[dict[str, JSONValue]],
+        rows: Iterable[Mapping[str, JSONValue]],
+        *,
+        snapshot: SnapshotWrite,
     ) -> None:
-        path = self._layout.partition_path(layer, dataset, _partition_name(listing))
-        content = canonical_json(cast(JSONValue, sorted(rows, key=canonical_json))) + "\n"
-        atomic_write_text(path, content)
+        """Write an immutable Parquet generation and atomically switch its manifest pointer."""
 
-    def _finalize_partitions(self, dataset: str) -> None:
-        for layer in (Layer.BRONZE, Layer.SILVER):
-            directory = self._layout.dataset_path(layer, dataset) / "partitions"
-            partitions = sorted(directory.glob("*.json")) if directory.exists() else []
-            target = self._layout.dataset_path(layer, dataset) / "data.json"
-            _stream_partitions_to_json_array(partitions, target)
+        version = uuid4().hex
+        generation = self._layout.snapshot_version_path(layer, dataset, version)
+        partitions = generation / "partitions"
+
+        def sort_key(row: Mapping[str, JSONValue]) -> tuple[str, str, str]:
+            return (
+                str(row.get("isin", "")),
+                str(row.get("exchange", "")),
+                str(row.get("code", "")),
+            )
+
+        materialized = [dict(row) for row in rows]
+        ordered: Iterable[Mapping[str, JSONValue]] = (
+            materialized if snapshot.presorted else sorted(materialized, key=sort_key)
+        )
+
+        def identity(row: Mapping[str, JSONValue]) -> tuple[str, str, str]:
+            return (
+                str(row.get("code", "")),
+                str(row.get("exchange", "")),
+                str(row.get("isin", "")),
+            )
+
+        seen: set[tuple[str, str, str]] = set()
+        pending: list[Future[None]] = []
+        cores = getattr(self, "_cores", resolve_cores())
+        with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-parquet") as executor:
+            for (code, exchange, isin), group in groupby(ordered, key=identity):
+                current_identity = (code, exchange, isin)
+                if current_identity in seen:
+                    raise ValueError(f"{layer.value} {dataset} rows are not grouped by listing")
+                seen.add(current_identity)
+                if not all((code, exchange, isin)):
+                    raise ValueError(
+                        f"{layer.value} {dataset} row has an incomplete listing identity"
+                    )
+                name = _partition_name_parts(code, exchange, isin)
+                pending.append(
+                    executor.submit(
+                        write_parquet_rows,
+                        partitions / f"{name}.parquet",
+                        list(group),
+                    )
+                )
+                if len(pending) >= 8:
+                    finished = next(as_completed(pending))
+                    finished.result()
+                    pending.remove(finished)
+            for future in as_completed(pending):
+                future.result()
+        if snapshot.retractions is not None:
+            write_parquet_rows(generation / "retractions.parquet", snapshot.retractions)
+        artifact_paths = self._write_canonical_snapshot(layer, dataset, materialized, cores)
+        retractions_path: str | None = None
+        if snapshot.retractions:
+            path = self._layout.retractions_path(layer, dataset)
+            write_parquet_rows(path, snapshot.retractions)
+            retractions_path = path.relative_to(self._layout.root).as_posix()
+        manifest = Manifest(
+            dataset=dataset,
+            layer=layer,
+            semantic_metadata=snapshot.semantic_metadata,
+            run_metadata={
+                "storage_version": version,
+                "artifact_paths": cast(JSONValue, artifact_paths),
+                "retractions_path": retractions_path,
+            },
+        )
+        atomic_write_text(
+            self._layout.manifest_path(layer, dataset),
+            manifest.to_json() + "\n",
+        )
+
+    def _write_canonical_snapshot(
+        self,
+        layer: Layer,
+        dataset: str,
+        rows: Sequence[Mapping[str, JSONValue]],
+        cores: int,
+    ) -> list[str]:
+        """Publish current Parquet rows in the canonical Hive-partitioned layout."""
+
+        ordered = sorted(rows, key=lambda row: _snapshot_sort_key(dataset, row))
+        artifact_paths: list[str] = []
+        jobs: list[tuple[Path, list[dict[str, JSONValue]]]] = []
+        if layer is Layer.SILVER:
+            for (exchange, symbol, year, month), group in groupby(
+                ordered,
+                key=lambda row: _silver_partition_key(dataset, row),
+            ):
+                path = self._layout.silver_path(
+                    SilverPartition(
+                        dataset_type=dataset,
+                        exchange=exchange,
+                        symbol=symbol,
+                        timeframe=_timeframe(dataset),
+                        year=year,
+                        month=month,
+                    )
+                )
+                jobs.append((path, [dict(row) for row in group]))
+        elif layer is Layer.GOLD:
+            feature_set_version = "v1.0.0"
+            schema = sorted({column for row in ordered for column in row})
+            feature_hash = hashlib.sha256(
+                canonical_json(
+                    {
+                        "dataset": dataset,
+                        "feature_set_version": feature_set_version,
+                        "columns": cast(JSONValue, schema),
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            dataset_id = f"xetra-{dataset}-gold-v1"
+            for (exchange, symbol), group in groupby(
+                ordered,
+                key=lambda row: (str(row.get("exchange", "")), str(row.get("code", ""))),
+            ):
+                if not exchange or not symbol:
+                    raise ValueError(f"Gold {dataset} row has an incomplete symbol identity")
+                symbol_rows = [dict(row) for row in group]
+                source_hash = hashlib.sha256(
+                    canonical_json(cast(JSONValue, symbol_rows)).encode("utf-8")
+                ).hexdigest()
+                jobs.append(
+                    (
+                        self._layout.gold_path(
+                            GoldArtifact(
+                                dataset_id=dataset_id,
+                                feature_set_version=feature_set_version,
+                                exchange=exchange,
+                                symbol=symbol,
+                                feature_hash=feature_hash,
+                                source_hash=source_hash,
+                            )
+                        ),
+                        symbol_rows,
+                    )
+                )
+        else:
+            raise ValueError("canonical snapshots support only Silver and Gold")
+
+        with ThreadPoolExecutor(
+            max_workers=cores,
+            thread_name_prefix="xdl-canonical-parquet",
+        ) as pool:
+            futures = [pool.submit(write_parquet_rows, path, group) for path, group in jobs]
+            for (path, _), future in zip(jobs, futures, strict=True):
+                future.result()
+                artifact_paths.append(path.relative_to(self._layout.root).as_posix())
+        return sorted(artifact_paths)
 
     def _write_layer(self, layer: Layer, dataset: str, payload: JSONValue) -> None:
-        directory = self._layout.dataset_path(layer, dataset)
-        atomic_write_text(directory / "data.json", canonical_json(payload) + "\n")
+        if layer is not Layer.BRONZE or dataset != "listings" or not isinstance(payload, list):
+            raise ValueError("raw listing Parquet writer received an unsupported dataset")
+        if not all(isinstance(row, dict) for row in payload):
+            raise ValueError("raw listing payload must contain JSON objects")
+        write_raw_listing_partitions(
+            self._layout,
+            dataset,
+            cast(list[Mapping[str, JSONValue]], payload),
+            snapshot_date=datetime.now(UTC).date(),
+        )
 
     def _count(self, table: str) -> int:
         row = self._connection.execute(f'SELECT count(*) FROM xetra_loader."{table}"').fetchone()
@@ -972,29 +1158,60 @@ def _split_silver(event: SplitEvent) -> dict[str, JSONValue]:
 def _partition_name(listing: ListingRecord) -> str:
     """Return a deterministic, path-safe identity partition ordered by listing key."""
 
-    return "!".join(
-        quote(value, safe="") for value in (listing.code, listing.exchange, listing.isin)
+    return _partition_name_parts(listing.code, listing.exchange, listing.isin)
+
+
+def _partition_name_parts(code: str, exchange: str, isin: str) -> str:
+    return "!".join(quote(value, safe="") for value in (code, exchange, isin))
+
+
+def _timeframe(dataset: str) -> str:
+    if dataset == "eod_quotes":
+        return "1d"
+    if dataset == "listings":
+        return "static"
+    return "event"
+
+
+def _partition_date(dataset: str, row: Mapping[str, JSONValue]) -> date:
+    field = "trade_date" if dataset == "eod_quotes" else "event_date"
+    if dataset == "listings":
+        return datetime.now(UTC).date()
+    raw = row.get(field)
+    if not isinstance(raw, str):
+        raise ValueError(f"{dataset} row has no {field} for lake partitioning")
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError as exc:
+        raise ValueError(f"{dataset} row has invalid {field} for lake partitioning") from exc
+
+
+def _silver_partition_key(
+    dataset: str,
+    row: Mapping[str, JSONValue],
+) -> tuple[str, str, int, int]:
+    exchange = row.get("exchange")
+    symbol = row.get("code")
+    if not isinstance(exchange, str) or not exchange or not isinstance(symbol, str) or not symbol:
+        raise ValueError(f"Silver {dataset} row has an incomplete symbol identity")
+    partition_date = _partition_date(dataset, row)
+    return exchange, symbol, partition_date.year, partition_date.month
+
+
+def _snapshot_sort_key(
+    dataset: str,
+    row: Mapping[str, JSONValue],
+) -> tuple[str, str, int, int, str, str, str]:
+    partition_date = _partition_date(dataset, row)
+    return (
+        str(row.get("exchange", "")),
+        str(row.get("code", "")),
+        partition_date.year,
+        partition_date.month,
+        partition_date.isoformat(),
+        str(row.get("isin", "")),
+        canonical_json(cast(JSONValue, dict(row))),
     )
-
-
-def _stream_partitions_to_json_array(partitions: Sequence[Path], target: Path) -> None:
-    """Flatten already-bounded listing partitions without retaining the full universe."""
-
-    def write(handle: Any) -> None:
-        handle.write("[")
-        first = True
-        for partition in partitions:
-            payload = cast(JSONValue, json.loads(partition.read_text(encoding="utf-8")))
-            if not isinstance(payload, list):
-                raise ValueError(f"invalid medallion partition: {partition}")
-            for row in payload:
-                if not first:
-                    handle.write(",")
-                handle.write(canonical_json(row))
-                first = False
-        handle.write("]\n")
-
-    atomic_write(target, write)
 
 
 def _bounds(values: Iterable[date]) -> tuple[date | None, date | None]:
@@ -1020,7 +1237,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     runtime = PostgresEodhdBootstrapRuntime.from_admin_environment()
     try:
-        result = run_full_bootstrap(runtime, confirmed=True, reset_owned_state=True)
+        result = run_full_bootstrap(
+            runtime,
+            confirmed=True,
+            reset_owned_state=True,
+            parallel_runtime_factory=runtime.fetch_worker,
+            max_workers=resolve_cores(),
+        )
     finally:
         runtime.close()
     print(canonical_json(result.as_dict()))

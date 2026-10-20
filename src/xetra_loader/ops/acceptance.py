@@ -34,7 +34,7 @@ class LoaderAcceptanceReport:
             and self.database_timezone == "UTC"
             and self.app_role_select_only
             and self.scheduler_timezone == "Europe/Vienna"
-            and self.scheduler_expression == "0 8 * * 0"
+            and self.scheduler_expression == "0 11 * * 0"
             and self.portfell_imports == 0
         )
 

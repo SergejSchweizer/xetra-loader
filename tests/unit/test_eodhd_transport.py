@@ -8,6 +8,7 @@ from urllib.request import Request
 import pytest
 
 from xetra_loader.eodhd import EodhdTransport, RetryPolicy, scrub_url
+from xetra_loader.eodhd.transport import TransportConfig
 
 
 class FakeResponse:
@@ -38,7 +39,9 @@ def test_typed_get_uses_fixture_seam() -> None:
         seen.append(request.full_url)
         return FakeResponse(b'{"ok":true,"rows":2}')
 
-    transport = EodhdTransport(token="top-secret", timeout_seconds=5.0, opener=opener)
+    transport = EodhdTransport(
+        TransportConfig(token="top-secret", timeout_seconds=5.0, opener=opener)
+    )
     assert transport.get_json("exchange-symbol-list/XETRA", {"limit": 2}) == {
         "ok": True,
         "rows": 2,
@@ -51,7 +54,9 @@ def test_transport_decodes_provider_decimals_without_binary_float_round_trip() -
         del request, timeout
         return FakeResponse(b'[{"value":1.0000000000000000001}]')
 
-    payload = EodhdTransport(token="secret", opener=opener).get_json("div/AAA.XETRA")
+    payload = EodhdTransport(TransportConfig(token="secret", opener=opener)).get_json(
+        "div/AAA.XETRA"
+    )
     assert isinstance(payload, list)
     assert payload == [{"value": Decimal("1.0000000000000000001")}]
 
@@ -67,12 +72,12 @@ def test_network_retries_are_bounded() -> None:
             raise URLError("temporary")
         return FakeResponse(b"[]")
 
-    transport = EodhdTransport(
+    transport = EodhdTransport(TransportConfig(
         token="secret",
         opener=opener,
         sleeper=sleeps.append,
         retry_policy=RetryPolicy(max_attempts=3, base_delay_seconds=0.1, max_delay_seconds=1.0),
-    )
+    ))
     assert transport.get_json("eod/AAA.XETRA") == []
     assert attempts == 3
     assert sleeps == [0.1, 0.2]
@@ -103,11 +108,11 @@ def test_provider_failures_never_retain_or_render_token(
             raise URLError(request.full_url)
         return FakeResponse(b"not-json")
 
-    transport = EodhdTransport(
+    transport = EodhdTransport(TransportConfig(
         token=token,
         opener=opener,
         retry_policy=RetryPolicy(max_attempts=1),
-    )
+    ))
     with pytest.raises(RuntimeError) as captured:
         transport.get_json("eod/AAA.XETRA")
 

@@ -37,12 +37,37 @@ def test_catalog_contains_requested_windows() -> None:
         "breadth_20obs",
         "dispersion_daily",
         "dispersion_10obs",
+        "log_return_2",
+        "log_return_4",
+        "log_return_8",
+        "rolling_cum_return_16",
+        "rsi_3",
+        "rsi_ratio_5_15",
+        "ema5_distance",
+        "ema5_ema21_spread",
+        "ema5_ema9_cross",
+        "roc_acceleration_4_8",
+        "stoch_d_14_3",
+        "macd_hist_delta_3",
+        "donchian_breakout_up",
+        "rolling_volatility_96",
+        "volatility_zscore_96",
+        "level_zscore_96",
+        "momentum_autocorr_lag8_window192",
+        "rolling_drawdown_96",
+        "log_tick_volume",
     )
     assert set(expected_fragments) <= names
 
 
-def test_only_three_feature_families_may_use_internal_ohlc() -> None:
-    allowed = {"high_low_range", "intraday_return", "overnight_gap"}
+def test_only_approved_feature_families_may_use_internal_ohlc() -> None:
+    allowed = {
+        "high_low_range",
+        "intraday_return",
+        "overnight_gap",
+        "stoch",
+        "donchian",
+    }
     for spec in FEATURE_SPECS:
         if set(spec.source_columns) & {"open", "high", "low", "close"}:
             assert any(spec.name.startswith(prefix) for prefix in allowed)
@@ -50,7 +75,7 @@ def test_only_three_feature_families_may_use_internal_ohlc() -> None:
 
 def test_catalog_fingerprint_is_stable_and_train_fold_fit_is_not_global() -> None:
     validate_feature_catalog()
-    assert FEATURE_CATALOG_VERSION == 2
+    assert FEATURE_CATALOG_VERSION == 4
     assert len(FEATURE_CATALOG_FINGERPRINT) == 64
     assert feature_catalog_payload()["train_fold_standardization"] == {
         "scope": "downstream_fold_aware_operation",
@@ -71,6 +96,11 @@ def test_catalog_declares_unambiguous_window_count_domains() -> None:
     assert specs["intraday_return_5obs"].minimum_count == 5
     assert specs["overnight_gap_5obs"].minimum_count == 6
     assert specs["adjusted_close_rsi_14obs"].minimum_count == 15
+    assert specs["momentum_autocorr_lag1_window96"].minimum_count == 99
+    assert specs["momentum_autocorr_lag4_window96"].minimum_count == 102
+    assert specs["momentum_autocorr_lag8_window192"].minimum_count == 202
+    assert specs["volatility_zscore_96"].minimum_count == 104
+    assert specs["donchian_breakout_up"].minimum_count == 21
     assert specs["breadth_daily"].count_domain is ObservationCountDomain.VALID_INSTRUMENT_RETURNS
     assert specs["dispersion_daily"].minimum_count == 2
     assert specs["breadth_20obs"].count_domain is ObservationCountDomain.VALID_MARKET_DATES

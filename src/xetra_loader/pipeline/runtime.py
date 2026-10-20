@@ -14,7 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
-from xetra_loader.config import resolve_weekly_workers
+from xetra_loader.config import resolve_cores
 from xetra_loader.contracts.corporate_actions import ActionStatus, DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord, deserialize_listings
 from xetra_loader.contracts.quotes import QuoteRecord, overlap_start
@@ -24,19 +24,24 @@ from xetra_loader.gold.quotes import QuoteGoldResult, build_quote_gold
 from xetra_loader.gold.splits import SplitGoldResult, build_split_gold
 from xetra_loader.gold.validation import GoldValidationSummary, validate_complete_gold
 from xetra_loader.ingestion.corporate_actions import action_overlap_start
-from xetra_loader.medallion.core import JSONValue, Layer, Manifest, MedallionLayout, canonical_json
+from xetra_loader.medallion.core import (
+    JSONValue,
+    Layer,
+    Manifest,
+    MedallionLayout,
+    canonical_json,
+    read_dataset_rows,
+    read_snapshot_retractions,
+)
 from xetra_loader.ops.bootstrap import FetchBatch, PostgresEodhdBootstrapRuntime
 from xetra_loader.pipeline.orchestrator import PipelineStages
 from xetra_loader.sync.core import SyncCounters, SyncOutcome
 
 _LOGGER = logging.getLogger(__name__)
-_PROVIDER_STABLE_WORKERS = 8
-
-
 @dataclass(slots=True)
 class _WeeklyState:
     runtime: PostgresEodhdBootstrapRuntime
-    max_workers: int = 1
+    cores: int = 1
     listings: ListingGoldResult | None = None
     quotes: QuoteGoldResult | None = None
     dividends: DividendGoldResult | None = None
@@ -74,46 +79,39 @@ class _WeeklyState:
         for record in previous:
             previous_by_listing.setdefault(record.key[:3], []).append(record)
         records: list[QuoteRecord] = []
-        jobs: list[tuple[ListingRecord, tuple[QuoteRecord, ...], date | None, bool]] = []
+        jobs: list[tuple[ListingRecord, tuple[QuoteRecord, ...], bool]] = []
         requests = 0
         for listing in listings.rows:
             listing_previous = tuple(previous_by_listing.get(listing.key, ()))
-            last_date = _latest_date(listing_previous)
             if not listing.is_active:
                 records.extend(listing_previous)
                 continue
             action_changed = listing.key in self.action_changed_listings
-            jobs.append((listing, listing_previous, last_date, action_changed))
+            jobs.append((listing, listing_previous, action_changed))
 
         _LOGGER.info(
-            "provider_stage_start dataset=eod_quotes jobs=%d workers=%d",
+            "provider_stage_start dataset=eod_quotes jobs=%d cores=%d",
             len(jobs),
-            self.max_workers,
+            self.cores,
         )
         batches = _parallel_fetch(
             self.runtime,
             jobs,
             lambda worker, job: worker.fetch_quotes(
                 job[0],
-                last_business_date=None if job[3] else job[2],
-                previous_records=() if job[3] else job[1],
+                last_business_date=None,
+                previous_records=job[1],
             ),
-            self.max_workers,
+            self.cores,
         )
         for job, batch in zip(jobs, batches, strict=True):
-            listing, listing_previous, last_date, action_changed = job
-            records.extend(
-                _replace_quote_window(
-                    listing_previous,
-                    batch.rows,
-                    None if action_changed else last_date,
-                )
-            )
+            listing, listing_previous, action_changed = job
+            records.extend(_replace_quote_window(listing_previous, batch.rows, None))
             self._record_fetch_times("eod_quotes", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
             _LOGGER.debug(
                 "provider_fetch_complete dataset=eod_quotes code=%s exchange=%s "
-                "rows=%d requests=%d action_changed=%s",
+                "rows=%d requests=%d history_mode=full_snapshot action_changed=%s",
                 listing.code,
                 listing.exchange,
                 len(batch.rows),
@@ -131,10 +129,13 @@ class _WeeklyState:
             "eod_quotes",
             [record.semantic_dict() for record in self.quotes.rows],
         )
-        return self._with_fetch_provenance(
+        details = self._with_fetch_provenance(
             "eod_quotes",
             _ingest_details(self.quotes.row_count, requests, self.quotes.semantic_fingerprint),
         )
+        details["source_fetch_mode"] = "full_history"
+        details["publication_mode"] = "semantic_delta"
+        return details
 
     def ingest_dividends(self) -> dict[str, JSONValue]:
         listings = self._require_listings()
@@ -145,39 +146,39 @@ class _WeeklyState:
         for event in previous:
             previous_by_listing.setdefault(event.key[:3], []).append(event)
         records: list[DividendEvent] = []
-        jobs: list[tuple[ListingRecord, tuple[DividendEvent, ...], date | None]] = []
+        jobs: list[tuple[ListingRecord, tuple[DividendEvent, ...]]] = []
         requests = 0
         for listing in listings.rows:
             listing_previous = tuple(previous_by_listing.get(listing.key, ()))
-            last_date = _latest_date(listing_previous)
             if not listing.is_active:
                 records.extend(listing_previous)
                 continue
-            jobs.append((listing, listing_previous, last_date))
+            jobs.append((listing, listing_previous))
 
         _LOGGER.info(
-            "provider_stage_start dataset=dividends jobs=%d workers=%d",
+            "provider_stage_start dataset=dividends jobs=%d cores=%d",
             len(jobs),
-            self.max_workers,
+            self.cores,
         )
         batches = _parallel_fetch(
             self.runtime,
             jobs,
             lambda worker, job: worker.fetch_dividends(
-                job[0], last_event_date=job[2], previous_records=job[1]
+                job[0], last_event_date=None, previous_records=job[1]
             ),
-            self.max_workers,
+            self.cores,
         )
         for job, batch in zip(jobs, batches, strict=True):
-            listing, listing_previous, last_date = job
-            merged = _replace_action_window(listing_previous, batch.rows, last_date)
+            listing, listing_previous = job
+            merged = _replace_action_window(listing_previous, batch.rows, None)
             if _action_set_changed(listing_previous, merged):
                 self.action_changed_listings.add(listing.key)
             records.extend(merged)
             self._record_fetch_times("dividends", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
             _LOGGER.debug(
-                "provider_fetch_complete dataset=dividends code=%s exchange=%s rows=%d requests=%d",
+                "provider_fetch_complete dataset=dividends code=%s exchange=%s "
+                "rows=%d requests=%d history_mode=full_snapshot",
                 listing.code,
                 listing.exchange,
                 len(batch.rows),
@@ -204,6 +205,8 @@ class _WeeklyState:
             ),
         )
         details["changed_listing_keys"] = _changed_listing_keys(self.action_changed_listings)
+        details["source_fetch_mode"] = "full_history"
+        details["publication_mode"] = "semantic_delta"
         return details
 
     def ingest_splits(self) -> dict[str, JSONValue]:
@@ -213,39 +216,39 @@ class _WeeklyState:
         for event in previous:
             previous_by_listing.setdefault(event.key[:3], []).append(event)
         records: list[SplitEvent] = []
-        jobs: list[tuple[ListingRecord, tuple[SplitEvent, ...], date | None]] = []
+        jobs: list[tuple[ListingRecord, tuple[SplitEvent, ...]]] = []
         requests = 0
         for listing in listings.rows:
             listing_previous = tuple(previous_by_listing.get(listing.key, ()))
-            last_date = _latest_date(listing_previous)
             if not listing.is_active:
                 records.extend(listing_previous)
                 continue
-            jobs.append((listing, listing_previous, last_date))
+            jobs.append((listing, listing_previous))
 
         _LOGGER.info(
-            "provider_stage_start dataset=splits jobs=%d workers=%d",
+            "provider_stage_start dataset=splits jobs=%d cores=%d",
             len(jobs),
-            self.max_workers,
+            self.cores,
         )
         batches = _parallel_fetch(
             self.runtime,
             jobs,
             lambda worker, job: worker.fetch_splits(
-                job[0], last_event_date=job[2], previous_records=job[1]
+                job[0], last_event_date=None, previous_records=job[1]
             ),
-            self.max_workers,
+            self.cores,
         )
         for job, batch in zip(jobs, batches, strict=True):
-            listing, listing_previous, last_date = job
-            merged = _replace_action_window(listing_previous, batch.rows, last_date)
+            listing, listing_previous = job
+            merged = _replace_action_window(listing_previous, batch.rows, None)
             if _action_set_changed(listing_previous, merged):
                 self.action_changed_listings.add(listing.key)
             records.extend(merged)
             self._record_fetch_times("splits", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
             _LOGGER.debug(
-                "provider_fetch_complete dataset=splits code=%s exchange=%s rows=%d requests=%d",
+                "provider_fetch_complete dataset=splits code=%s exchange=%s "
+                "rows=%d requests=%d history_mode=full_snapshot",
                 listing.code,
                 listing.exchange,
                 len(batch.rows),
@@ -268,6 +271,8 @@ class _WeeklyState:
             _ingest_details(self.splits.row_count, requests, self.splits.semantic_fingerprint),
         )
         details["changed_listing_keys"] = _changed_listing_keys(self.action_changed_listings)
+        details["source_fetch_mode"] = "full_history"
+        details["publication_mode"] = "semantic_delta"
         return details
 
     def validate_gold(self) -> dict[str, JSONValue]:
@@ -373,7 +378,7 @@ class _WeeklyState:
             return
 
         self._publication_executor = ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=min(2, self.cores),
             thread_name_prefix="xdl-postgres",
         )
         self._publication_futures = {
@@ -403,6 +408,20 @@ class _WeeklyState:
         """Restore completed Gold and sync state, refusing mismatched artifacts."""
 
         root = self.runtime._layout.root
+        self._rehydrate_listing_gold(root, checkpoint)
+        self._rehydrate_quote_gold(root, checkpoint)
+        self._rehydrate_dividend_gold(root, checkpoint)
+        self._rehydrate_split_gold(root, checkpoint)
+        self._rehydrate_sync_outcomes(checkpoint)
+        self._rehydrate_action_changes(checkpoint)
+        self._rehydrate_fetch_times(checkpoint)
+        self._rehydrate_gold_validation(checkpoint)
+
+    def _rehydrate_listing_gold(
+        self,
+        root: Path,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         if "listings" in checkpoint:
             rows, fingerprint, _ = _load_gold_artifact(root, "listings")
             self.listings = build_listing_gold(
@@ -411,12 +430,24 @@ class _WeeklyState:
             _require_checkpoint_fingerprint(
                 "listings", checkpoint, fingerprint, self.listings.semantic_fingerprint
             )
+
+    def _rehydrate_quote_gold(
+        self,
+        root: Path,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         if "quotes" in checkpoint:
             rows, fingerprint, _ = _load_gold_artifact(root, "eod_quotes")
             self.quotes = build_quote_gold(_quotes_from_rows(rows))
             _require_checkpoint_fingerprint(
                 "quotes", checkpoint, fingerprint, self.quotes.semantic_fingerprint
             )
+
+    def _rehydrate_dividend_gold(
+        self,
+        root: Path,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         if "dividends" in checkpoint:
             rows, fingerprint, retracted = _load_gold_artifact(root, "dividends")
             dividend_rows = _dividends_from_rows(rows)
@@ -428,12 +459,23 @@ class _WeeklyState:
                 len(dividend_rows),
                 computed,
             )
+
+    def _rehydrate_split_gold(
+        self,
+        root: Path,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         if "splits" in checkpoint:
             rows, fingerprint, retracted = _load_gold_artifact(root, "splits")
             split_rows = _splits_from_rows(rows)
             computed = _corporate_fingerprint(rows, retracted)
             _require_checkpoint_fingerprint("splits", checkpoint, fingerprint, computed)
             self.splits = SplitGoldResult(split_rows, retracted, len(split_rows), computed)
+
+    def _rehydrate_sync_outcomes(
+        self,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         for stage, dataset in (
             ("postgres_listings_sync", "listings"),
             ("postgres_quotes_sync", "eod_quotes"),
@@ -442,11 +484,21 @@ class _WeeklyState:
         ):
             if stage in checkpoint:
                 self.outcomes[dataset] = _outcome_from_checkpoint(dataset, checkpoint[stage])
+
+    def _rehydrate_action_changes(
+        self,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         for stage in ("dividends", "splits"):
             if stage in checkpoint:
                 self.action_changed_listings.update(
                     _changed_listing_keys_from_checkpoint(checkpoint[stage])
                 )
+
+    def _rehydrate_fetch_times(
+        self,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         for stage, dataset in (
             ("listings", "listings"),
             ("quotes", "eod_quotes"),
@@ -458,6 +510,11 @@ class _WeeklyState:
                     dataset,
                     checkpoint[stage],
                 )
+
+    def _rehydrate_gold_validation(
+        self,
+        checkpoint: Mapping[str, Mapping[str, JSONValue]],
+    ) -> None:
         if "gold_validation" in checkpoint:
             listings, quotes, dividends, splits = self._require_gold()
             self.authoritative_snapshot = validate_complete_gold(
@@ -534,14 +591,14 @@ class _WeeklyState:
         )
 
 
-def build_weekly_stages() -> PipelineStages:
+def build_weekly_stages(cores: int | None = None) -> PipelineStages:
     """Build the concrete factory referenced by the deployed Vienna cron entry."""
 
     state = _WeeklyState(
         PostgresEodhdBootstrapRuntime.from_environment(quarantine_invalid_ohlc=True),
-        max_workers=resolve_weekly_workers(),
+        cores=resolve_cores(cores),
     )
-    _LOGGER.info("weekly_configuration workers=%d", state.max_workers)
+    _LOGGER.info("weekly_configuration cores=%d", state.cores)
     return PipelineStages(
         listings=state.ingest_listings,
         quotes=state.ingest_quotes,
@@ -618,15 +675,17 @@ def _parallel_fetch[JobT, ResultT](
     runtime: PostgresEodhdBootstrapRuntime,
     jobs: Sequence[JobT],
     fetch: Callable[[PostgresEodhdBootstrapRuntime, JobT], FetchBatch[ResultT]],
-    max_workers: int,
+    cores: int,
 ) -> tuple[FetchBatch[ResultT], ...]:
     """Fetch independent provider jobs concurrently while preserving input order."""
 
     def run(job: JobT) -> FetchBatch[ResultT]:
         fetch_worker = getattr(runtime, "fetch_worker", None)
         for attempt in range(1, 4):
+            worker = runtime
             try:
-                worker = runtime if not callable(fetch_worker) else fetch_worker()
+                if callable(fetch_worker):
+                    worker = fetch_worker()
                 return fetch(worker, job)
             except RuntimeError as exc:
                 if attempt == 3:
@@ -637,6 +696,11 @@ def _parallel_fetch[JobT, ResultT](
                     exc,
                 )
                 time.sleep(float(2**attempt))
+            finally:
+                if worker is not runtime:
+                    close_worker = getattr(worker, "close", None)
+                    if callable(close_worker):
+                        close_worker()
         raise AssertionError("provider fetch retry loop exhausted")
 
     def execute(worker_count: int) -> tuple[FetchBatch[ResultT], ...]:
@@ -647,17 +711,7 @@ def _parallel_fetch[JobT, ResultT](
         ) as executor:
             return tuple(executor.map(run, jobs))
 
-    try:
-        return execute(max_workers)
-    except RuntimeError:
-        if max_workers <= _PROVIDER_STABLE_WORKERS:
-            raise
-        _LOGGER.warning(
-            "provider_parallel_fallback requested_workers=%d fallback_workers=%d",
-            max_workers,
-            _PROVIDER_STABLE_WORKERS,
-        )
-        return execute(_PROVIDER_STABLE_WORKERS)
+    return execute(cores)
 
 
 def _changed_listing_keys(keys: set[tuple[str, str, str]]) -> list[JSONValue]:
@@ -729,12 +783,16 @@ def _load_gold_artifact(
     dataset: str,
 ) -> tuple[list[dict[str, JSONValue]], str, tuple[tuple[str, str, str, str], ...]]:
     layout = MedallionLayout(root)
-    payload = cast(
-        JSONValue, json.loads((layout.dataset_path(Layer.GOLD, dataset) / "data.json").read_text())
-    )
-    if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
-        raise ValueError(f"invalid Gold data artifact for {dataset}")
-    rows = cast(list[dict[str, JSONValue]], payload)
+    rows = read_dataset_rows(layout, Layer.GOLD, dataset)
+    semantic_metadata, fingerprint = _load_gold_manifest(layout, dataset)
+    retracted = _load_gold_retractions(layout, dataset, semantic_metadata)
+    return rows, fingerprint, retracted
+
+
+def _load_gold_manifest(
+    layout: MedallionLayout,
+    dataset: str,
+) -> tuple[dict[str, JSONValue], str]:
     manifest_payload = cast(
         JSONValue, json.loads(layout.manifest_path(Layer.GOLD, dataset).read_text())
     )
@@ -753,32 +811,33 @@ def _load_gold_artifact(
     expected_manifest = Manifest(dataset, Layer.GOLD, semantic_metadata, run_metadata)
     if manifest_fingerprint != expected_manifest.semantic_fingerprint():
         raise ValueError(f"Gold manifest semantic fingerprint mismatch for {dataset}")
+    return semantic_metadata, fingerprint
+
+
+def _load_gold_retractions(
+    layout: MedallionLayout,
+    dataset: str,
+    semantic_metadata: Mapping[str, JSONValue],
+) -> tuple[tuple[str, str, str, str], ...]:
+    if dataset not in {"dividends", "splits"}:
+        return ()
     retracted: tuple[tuple[str, str, str, str], ...] = ()
-    if dataset in {"dividends", "splits"}:
-        retracted_payload = cast(
-            JSONValue, json.loads(layout.retractions_path(Layer.GOLD, dataset).read_text())
-        )
-        if not isinstance(retracted_payload, list):
-            raise ValueError(f"invalid Gold retractions for {dataset}")
-        parsed: list[tuple[str, str, str, str]] = []
-        for key in retracted_payload:
-            if (
-                not isinstance(key, list)
-                or len(key) != 4
-                or not all(isinstance(part, str) for part in key)
-            ):
-                raise ValueError(f"invalid Gold retraction key for {dataset}")
-            parsed.append(cast(tuple[str, str, str, str], tuple(key)))
-        if parsed != sorted(set(parsed)):
-            raise ValueError(f"Gold retractions must be unique and sorted for {dataset}")
-        retracted = tuple(parsed)
-        sidecar_fingerprint = semantic_metadata.get("retractions_fingerprint")
-        actual_sidecar_fingerprint = hashlib.sha256(
-            canonical_json([list(key) for key in retracted]).encode("utf-8")
-        ).hexdigest()
-        if sidecar_fingerprint != actual_sidecar_fingerprint:
-            raise ValueError(f"Gold retractions fingerprint mismatch for {dataset}")
-    return rows, fingerprint, retracted
+    parsed: list[tuple[str, str, str, str]] = []
+    for row in read_snapshot_retractions(layout, Layer.GOLD, dataset):
+        key = tuple(row.get(field) for field in ("isin", "exchange", "code", "event_key"))
+        if not all(isinstance(part, str) for part in key):
+            raise ValueError(f"invalid Gold retraction key for {dataset}")
+        parsed.append(cast(tuple[str, str, str, str], key))
+    if parsed != sorted(set(parsed)):
+        raise ValueError(f"Gold retractions must be unique and sorted for {dataset}")
+    retracted = tuple(parsed)
+    sidecar_fingerprint = semantic_metadata.get("retractions_fingerprint")
+    actual_sidecar_fingerprint = hashlib.sha256(
+        canonical_json([list(key) for key in retracted]).encode("utf-8")
+    ).hexdigest()
+    if sidecar_fingerprint != actual_sidecar_fingerprint:
+        raise ValueError(f"Gold retractions fingerprint mismatch for {dataset}")
+    return retracted
 
 
 def _require_checkpoint_fingerprint(
@@ -852,13 +911,7 @@ def _quotes_from_rows(rows: list[dict[str, JSONValue]]) -> tuple[QuoteRecord, ..
 
 
 def _load_silver_rows(root: Path, dataset: str) -> list[dict[str, JSONValue]]:
-    path = MedallionLayout(root).dataset_path(Layer.SILVER, dataset) / "data.json"
-    if not path.exists():
-        return []
-    payload = cast(JSONValue, json.loads(path.read_text(encoding="utf-8")))
-    if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
-        raise ValueError(f"invalid Silver data artifact for {dataset}")
-    return cast(list[dict[str, JSONValue]], payload)
+    return read_dataset_rows(MedallionLayout(root), Layer.SILVER, dataset)
 
 
 def _latest_date(
@@ -890,7 +943,18 @@ def _replace_action_window[T: DividendEvent | SplitEvent](
     last_date: date | None,
 ) -> tuple[T, ...]:
     if last_date is None:
-        return refreshed
+        by_key = {
+            record.key: record
+            for record in previous
+            if record.status is ActionStatus.RETRACTED
+        }
+        by_key.update({record.key: record for record in refreshed})
+        return tuple(
+            sorted(
+                by_key.values(),
+                key=lambda record: (record.event_date, record.key, record.status),
+            )
+        )
     start = action_overlap_start(last_date)
     if start is None:
         return refreshed

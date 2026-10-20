@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 from psycopg import Connection
-from tests.qa.feature_reference import FixtureQuote, make_fixture, reference_features
 
+from tests.qa.feature_reference import FixtureQuote, make_fixture, reference_features
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.contracts.quotes import QuoteRecord
@@ -404,7 +404,7 @@ def test_complete_gold_postgres_feature_acceptance(tmp_path: Path) -> None:
             "permissions_are_read_only_for_consumers": privileges == (True, False, True),
             "utc_contract": timezone == "UTC",
             "cron_contract": cron_timezone == "Europe/Vienna"
-            and cron_expression == "0 8 * * 0",
+            and cron_expression == "0 11 * * 0",
             "restart_safe_weekly_runner": restart.succeeded,
         }
         report = {

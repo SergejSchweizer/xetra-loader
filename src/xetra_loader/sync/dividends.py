@@ -30,7 +30,7 @@ DividendSemantic = tuple[
 ]
 
 
-def sync_dividends(
+def sync_dividends(  # noqa: PLR0913 -- explicit timestamps and row provenance are publication inputs.
     connection: Connection[Any],
     gold: DividendGoldResult,
     *,
@@ -126,7 +126,6 @@ def sync_dividends(
         semantic_rows=semantic_rows,
         mutate=mutate,
         run_id=run_id,
-        authoritative_snapshot=authoritative_snapshot,
     )
 
 

@@ -11,12 +11,15 @@ requires-python = "==3.14.7"
 authors = [{ name = "Sergej Schweizer" }]
 license = { text = "Proprietary" }
 dependencies = [
+  "polars>=1.0,<3",
   "psycopg[binary]>=3.2",
   "PyYAML>=6.0",
 ]
 
 [project.scripts]
 xdl-weekly = "xetra_loader.pipeline.runner:main"
+xdl-api = "xetra_loader.api.runner:main"
+xdl-enqueue-weekly = "xetra_loader.api.enqueue:main"
 xdl-bootstrap = "xetra_loader.ops.bootstrap:main"
 xdl-migrate = "xetra_loader.ops.migrate:main"
 xdl-verify-production-sync = "xetra_loader.ops.verify_postgres_sync:main"
@@ -39,7 +42,22 @@ line-length = 100
 src = ["src", "scripts", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = [
+    "E",
+    "F",
+    "B",
+    "I",
+    "C90", # McCabe complexity
+    "PLR", # Pylint refactoring rules
+    "TID", # Tidy imports
+]
+# Numeric thresholds are domain values and are documented at their call sites;
+# enforcing a named constant for every test fixture and statistical cutoff adds
+# noise without improving the contract.
+ignore = ["PLR2004"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
 
 [tool.mypy]
 python_version = "3.14"

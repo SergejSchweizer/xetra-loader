@@ -1,5 +1,13 @@
 # Train-fold-local standardization
 
+## Contents
+
+- [Purpose and leakage boundary](#purpose-and-leakage-boundary)
+- [Fit/apply flow](#fitapply-flow)
+- [Example](#example)
+
+## Purpose and leakage boundary
+
 `xetra_loader.xetra_features` is a global serving view. It contains the two
 approved levels and derived feature values, but it never contains fit means,
 standard deviations, or fold-dependent values.
@@ -10,6 +18,17 @@ Downstream training code must use
 identities `(isin, exchange, code, trade_date)` into `train`, `validation`, and
 `test`. The adapter rejects rows outside or missing from that partition.
 
+## Fit/apply flow
+
+```text
+feature-view rows ──> explicit train/validation/test split
+                              │
+                         train rows only
+                              │ fit mean/std
+                              ▼
+                    apply same statistics to all folds
+```
+
 The adapter fits each selected catalog-derived feature on non-NULL training
 values only, using the population standard deviation. The fitted statistics are
 then applied unchanged to all three partitions. A missing or zero-variance
@@ -17,7 +36,7 @@ training feature is reported in `FeatureStatistics` and produces `None`, never
 a fabricated standardized value. Validation and test rows cannot influence
 the fit.
 
-Example:
+## Example
 
 ```python
 from xetra_loader.features.standardization import (

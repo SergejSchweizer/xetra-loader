@@ -6,7 +6,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Protocol, cast
 from urllib.error import HTTPError, URLError
@@ -49,30 +49,38 @@ class RetryPolicy:
         return float(min(delay, self.max_delay_seconds))
 
 
+@dataclass(frozen=True, slots=True)
+class TransportConfig:
+    """Provider connection and retry settings, including injectable test seams."""
+
+    token: str | None = None
+    base_url: str = "https://eodhd.com/api"
+    timeout_seconds: float = 30.0
+    retry_policy: RetryPolicy | None = None
+    opener: OpenUrl | None = None
+    sleeper: Sleeper = field(default=time.sleep)
+
+
 class EodhdTransport:
     """Small provider seam with secret-safe errors and deterministic retry behavior."""
 
-    def __init__(
-        self,
-        *,
-        token: str | None = None,
-        base_url: str = "https://eodhd.com/api",
-        timeout_seconds: float = 30.0,
-        retry_policy: RetryPolicy | None = None,
-        opener: OpenUrl | None = None,
-        sleeper: Sleeper = time.sleep,
-    ) -> None:
-        resolved_token = token if token is not None else os.getenv("EODHD_API_TOKEN")
+    def __init__(self, config: TransportConfig | None = None) -> None:
+        resolved_config = config or TransportConfig()
+        resolved_token = (
+            resolved_config.token
+            if resolved_config.token is not None
+            else os.getenv("EODHD_API_TOKEN")
+        )
         if resolved_token is None or not resolved_token.strip():
             raise ValueError("EODHD_API_TOKEN is required")
-        if timeout_seconds <= 0:
+        if resolved_config.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         self._token = resolved_token
-        self._base_url = base_url.rstrip("/")
-        self._timeout_seconds = timeout_seconds
-        self._retry_policy = retry_policy or RetryPolicy()
-        self._opener = opener or _default_open
-        self._sleeper = sleeper
+        self._base_url = resolved_config.base_url.rstrip("/")
+        self._timeout_seconds = resolved_config.timeout_seconds
+        self._retry_policy = resolved_config.retry_policy or RetryPolicy()
+        self._opener = resolved_config.opener or _default_open
+        self._sleeper = resolved_config.sleeper
 
     def get_json(
         self,

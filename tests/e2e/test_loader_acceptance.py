@@ -263,7 +263,7 @@ def test_complete_loader_acceptance_matrix(tmp_path: Path) -> None:
     lock_contract = _lock_contract_holds(tmp_path)
     scheduler_timezone, scheduler_expression = read_scheduler_contract()
     scheduler_contract = (
-        scheduler_timezone == "Europe/Vienna" and scheduler_expression == "0 8 * * 0"
+        scheduler_timezone == "Europe/Vienna" and scheduler_expression == "0 11 * * 0"
     )
     portfell_imports = _count_portfell_imports()
 

@@ -85,7 +85,6 @@ class LoaderLock(AbstractContextManager["LoaderLock"]):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             handle.close()
             self._handle = None
-        return None
 
 
 def run_restartable_pipeline(
