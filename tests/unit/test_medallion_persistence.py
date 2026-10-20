@@ -80,6 +80,7 @@ def test_silver_snapshot_uses_canonical_monthly_partitions(tmp_path: Path) -> No
         runtime._layout.manifest_path(Layer.SILVER, "eod_quotes").read_text(encoding="utf-8")
     )
     artifact_paths = manifest["run_metadata"]["artifact_paths"]
+    assert "storage_version" not in manifest["run_metadata"]
     assert len(artifact_paths) == 2
     assert all(
         path.startswith("silver/dataset_type=eod_quotes/exchange=XETRA/symbol=")
@@ -87,6 +88,7 @@ def test_silver_snapshot_uses_canonical_monthly_partitions(tmp_path: Path) -> No
         for path in artifact_paths
     )
     assert all((tmp_path / path).is_file() for path in artifact_paths)
+    assert not list(tmp_path.rglob("versions"))
     assert read_dataset_rows(runtime._layout, Layer.SILVER, "eod_quotes") == [
         {"isin": "DE0000000001", "exchange": "XETRA", "code": "AAA", "trade_date": "2026-08-21"},
         {"isin": "DE0000000002", "exchange": "XETRA", "code": "BBB", "trade_date": "2026-08-22"},
@@ -125,6 +127,7 @@ def test_gold_snapshot_uses_content_addressed_symbol_layout(tmp_path: Path) -> N
     )
     artifact_paths = manifest["run_metadata"]["artifact_paths"]
     assert len(artifact_paths) == 1
+    assert "storage_version" not in manifest["run_metadata"]
     artifact = Path(artifact_paths[0])
     assert artifact.parts[:6] == (
         "gold",
@@ -137,6 +140,7 @@ def test_gold_snapshot_uses_content_addressed_symbol_layout(tmp_path: Path) -> N
     assert artifact.name.startswith("AAA_GOLD_")
     assert len(artifact.stem.removeprefix("AAA_GOLD_").split("_")) == 2
     assert pl.read_parquet(tmp_path / artifact).height == 2
+    assert not list(tmp_path.rglob("versions"))
 
 
 def test_raw_listings_are_polars_parquet_in_daily_bronze_layout(tmp_path: Path) -> None:

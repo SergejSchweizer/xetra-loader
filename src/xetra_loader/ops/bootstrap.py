@@ -7,15 +7,13 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from itertools import groupby
 from pathlib import Path
 from typing import Any, Protocol, cast
-from urllib.parse import quote
 from urllib.request import Request, urlopen
-from uuid import uuid4
 
 from psycopg import Connection
 
@@ -50,6 +48,7 @@ from xetra_loader.medallion.core import (
     write_parquet_rows,
     write_raw_listing_partitions,
 )
+from xetra_loader.ops.migrate import SCHEMA_FILES
 from xetra_loader.ops.reset import build_reset_plan, execute_reset
 from xetra_loader.sync import connect_postgres
 from xetra_loader.sync.core import SyncOutcome
@@ -166,7 +165,6 @@ class SnapshotWrite:
 
     semantic_metadata: Mapping[str, JSONValue]
     retractions: Sequence[Mapping[str, JSONValue]] | None = None
-    presorted: bool = False
 
 
 class DestructiveConfirmationRequired(RuntimeError):
@@ -560,7 +558,6 @@ class PostgresEodhdBootstrapRuntime:
         self._layout = MedallionLayout(medallion_root.resolve())
         self._repository_root = repository_root.resolve()
         self._quarantine_invalid_ohlc = quarantine_invalid_ohlc
-        self._cores = resolve_cores()
         self._owns_connection = True
 
     @classmethod
@@ -867,13 +864,7 @@ class PostgresEodhdBootstrapRuntime:
             self._connection.close()
 
     def _initialize_database(self) -> None:
-        for relative in (
-            "sql/schema/001_xetra_loader.sql",
-            "sql/schema/002_roles.sql",
-            "sql/schema/003_listing_lifecycle.sql",
-            "sql/sync/001_xetra_loader_sync.sql",
-            "sql/schema/004_xetra_features.sql",
-        ):
+        for relative in SCHEMA_FILES:
             sql = (self._repository_root / relative).read_text(encoding="utf-8")
             self._connection.execute(sql)
 
@@ -946,61 +937,10 @@ class PostgresEodhdBootstrapRuntime:
         *,
         snapshot: SnapshotWrite,
     ) -> None:
-        """Write an immutable Parquet generation and atomically switch its manifest pointer."""
-
-        version = uuid4().hex
-        generation = self._layout.snapshot_version_path(layer, dataset, version)
-        partitions = generation / "partitions"
-
-        def sort_key(row: Mapping[str, JSONValue]) -> tuple[str, str, str]:
-            return (
-                str(row.get("isin", "")),
-                str(row.get("exchange", "")),
-                str(row.get("code", "")),
-            )
+        """Write canonical Parquet artifacts and atomically publish their manifest."""
 
         materialized = [dict(row) for row in rows]
-        ordered: Iterable[Mapping[str, JSONValue]] = (
-            materialized if snapshot.presorted else sorted(materialized, key=sort_key)
-        )
-
-        def identity(row: Mapping[str, JSONValue]) -> tuple[str, str, str]:
-            return (
-                str(row.get("code", "")),
-                str(row.get("exchange", "")),
-                str(row.get("isin", "")),
-            )
-
-        seen: set[tuple[str, str, str]] = set()
-        pending: list[Future[None]] = []
-        cores = getattr(self, "_cores", resolve_cores())
-        with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-parquet") as executor:
-            for (code, exchange, isin), group in groupby(ordered, key=identity):
-                current_identity = (code, exchange, isin)
-                if current_identity in seen:
-                    raise ValueError(f"{layer.value} {dataset} rows are not grouped by listing")
-                seen.add(current_identity)
-                if not all((code, exchange, isin)):
-                    raise ValueError(
-                        f"{layer.value} {dataset} row has an incomplete listing identity"
-                    )
-                name = _partition_name_parts(code, exchange, isin)
-                pending.append(
-                    executor.submit(
-                        write_parquet_rows,
-                        partitions / f"{name}.parquet",
-                        list(group),
-                    )
-                )
-                if len(pending) >= 8:
-                    finished = next(as_completed(pending))
-                    finished.result()
-                    pending.remove(finished)
-            for future in as_completed(pending):
-                future.result()
-        if snapshot.retractions is not None:
-            write_parquet_rows(generation / "retractions.parquet", snapshot.retractions)
-        artifact_paths = self._write_canonical_snapshot(layer, dataset, materialized, cores)
+        artifact_paths = self._write_canonical_snapshot(layer, dataset, materialized)
         retractions_path: str | None = None
         if snapshot.retractions:
             path = self._layout.retractions_path(layer, dataset)
@@ -1011,7 +951,6 @@ class PostgresEodhdBootstrapRuntime:
             layer=layer,
             semantic_metadata=snapshot.semantic_metadata,
             run_metadata={
-                "storage_version": version,
                 "artifact_paths": cast(JSONValue, artifact_paths),
                 "retractions_path": retractions_path,
             },
@@ -1026,7 +965,6 @@ class PostgresEodhdBootstrapRuntime:
         layer: Layer,
         dataset: str,
         rows: Sequence[Mapping[str, JSONValue]],
-        cores: int,
     ) -> list[str]:
         """Publish current Parquet rows in the canonical Hive-partitioned layout."""
 
@@ -1090,14 +1028,9 @@ class PostgresEodhdBootstrapRuntime:
         else:
             raise ValueError("canonical snapshots support only Silver and Gold")
 
-        with ThreadPoolExecutor(
-            max_workers=cores,
-            thread_name_prefix="xdl-canonical-parquet",
-        ) as pool:
-            futures = [pool.submit(write_parquet_rows, path, group) for path, group in jobs]
-            for (path, _), future in zip(jobs, futures, strict=True):
-                future.result()
-                artifact_paths.append(path.relative_to(self._layout.root).as_posix())
+        for path, partition_rows in jobs:
+            write_parquet_rows(path, partition_rows)
+            artifact_paths.append(path.relative_to(self._layout.root).as_posix())
         return sorted(artifact_paths)
 
     def _write_layer(self, layer: Layer, dataset: str, payload: JSONValue) -> None:
@@ -1153,16 +1086,6 @@ def _split_silver(event: SplitEvent) -> dict[str, JSONValue]:
     row["event_key"] = event.event_key
     row["status"] = event.status.value
     return row
-
-
-def _partition_name(listing: ListingRecord) -> str:
-    """Return a deterministic, path-safe identity partition ordered by listing key."""
-
-    return _partition_name_parts(listing.code, listing.exchange, listing.isin)
-
-
-def _partition_name_parts(code: str, exchange: str, isin: str) -> str:
-    return "!".join(quote(value, safe="") for value in (code, exchange, isin))
 
 
 def _timeframe(dataset: str) -> str:
