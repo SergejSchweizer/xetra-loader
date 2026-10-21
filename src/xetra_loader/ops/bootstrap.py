@@ -936,11 +936,17 @@ class PostgresEodhdBootstrapRuntime:
         rows: Iterable[Mapping[str, JSONValue]],
         *,
         snapshot: SnapshotWrite,
+        sync_directory: bool = True,
     ) -> None:
         """Write canonical Parquet artifacts and atomically publish their manifest."""
 
         materialized = [dict(row) for row in rows]
-        artifact_paths = self._write_canonical_snapshot(layer, dataset, materialized)
+        artifact_paths = self._write_canonical_snapshot(
+            layer,
+            dataset,
+            materialized,
+            sync_directory=sync_directory,
+        )
         semantic_metadata = dict(snapshot.semantic_metadata)
         if layer is Layer.GOLD:
             dataset_id = _gold_dataset_id(dataset)
@@ -951,7 +957,11 @@ class PostgresEodhdBootstrapRuntime:
         retractions_path: str | None = None
         if snapshot.retractions:
             path = self._layout.retractions_path(layer, dataset)
-            write_parquet_rows(path, snapshot.retractions)
+            write_parquet_rows(
+                path,
+                snapshot.retractions,
+                sync_directory=sync_directory,
+            )
             retractions_path = path.relative_to(self._layout.root).as_posix()
         manifest = Manifest(
             dataset=dataset,
@@ -972,6 +982,8 @@ class PostgresEodhdBootstrapRuntime:
         layer: Layer,
         dataset: str,
         rows: Sequence[Mapping[str, JSONValue]],
+        *,
+        sync_directory: bool = True,
     ) -> list[str]:
         """Publish current Parquet rows in the canonical Hive-partitioned layout."""
 
@@ -1034,7 +1046,11 @@ class PostgresEodhdBootstrapRuntime:
             raise ValueError("canonical snapshots support only Silver and Gold")
 
         for path, partition_rows in jobs:
-            write_parquet_rows(path, partition_rows)
+            write_parquet_rows(
+                path,
+                partition_rows,
+                sync_directory=sync_directory,
+            )
             artifact_paths.append(path.relative_to(self._layout.root).as_posix())
         return sorted(artifact_paths)
 
