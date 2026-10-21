@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import polars as pl
+import pytest
 from scripts.migrate_lake_to_parquet import (
     _archive_legacy_artifacts,
     _convert_snapshot,
@@ -29,7 +30,7 @@ from xetra_loader.medallion.core import (
     write_parquet_rows,
     write_raw_listing_partitions,
 )
-from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime
+from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime, SnapshotWrite
 from xetra_loader.ops.verify_postgres_sync import DATASETS, semantic_fingerprint
 
 
@@ -199,7 +200,10 @@ def test_migration_writes_canonical_parquet_and_archives_legacy_artifacts(
     ]
 
 
-def test_migration_repartitions_existing_versioned_parquet(tmp_path: Path) -> None:
+def test_migration_repartitions_existing_versioned_parquet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     layout = MedallionLayout(tmp_path)
     dataset = "eod_quotes"
     version = "legacy-generation"
@@ -230,10 +234,40 @@ def test_migration_repartitions_existing_versioned_parquet(tmp_path: Path) -> No
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = layout
 
+    persisted_with: dict[str, bool] = {}
+    persist = PostgresEodhdBootstrapRuntime._persist_partitioned_snapshot
+
+    # Mirror the production method signature to verify the migration-only opt-out.
+    def capture_sync_policy(  # noqa: PLR0913
+        self: PostgresEodhdBootstrapRuntime,
+        layer: Layer,
+        dataset: str,
+        snapshot_rows: list[dict[str, JSONValue]],
+        *,
+        snapshot: SnapshotWrite,
+        sync_directory: bool = True,
+    ) -> None:
+        persisted_with["sync_directory"] = sync_directory
+        persist(
+            self,
+            layer,
+            dataset,
+            snapshot_rows,
+            snapshot=snapshot,
+            sync_directory=sync_directory,
+        )
+
+    monkeypatch.setattr(
+        PostgresEodhdBootstrapRuntime,
+        "_persist_partitioned_snapshot",
+        capture_sync_policy,
+    )
+
     assert _convert_snapshot(runtime, layout, Layer.SILVER, dataset)
 
     assert read_dataset_rows(layout, Layer.SILVER, dataset) == rows
     assert legacy_partition.exists()
+    assert persisted_with["sync_directory"] is False
 
 
 def test_empty_legacy_archive_does_not_create_backup_directory(tmp_path: Path) -> None:

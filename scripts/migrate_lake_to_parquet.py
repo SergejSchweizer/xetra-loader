@@ -320,6 +320,9 @@ def _convert_snapshot(
             semantic_metadata=semantic_metadata,
             retractions=retractions,
         ),
+        # Legacy rows remain authoritative until Gold fingerprints validate;
+        # replay can safely recreate missing directory entries after a crash.
+        sync_directory=False,
     )
     return True
 
