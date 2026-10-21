@@ -153,7 +153,9 @@ API and worker resident. The service file is a deployment artifact; it must be
 installed and enabled separately by the host administrator.
 
 The direct `.venv/bin/xdl-weekly --cores 6` command remains available for a
-controlled one-off local run; the deployed Sunday cron uses the API queue.
+controlled one-off local run; the Sunday enqueue entry in
+`deploy/cron/xetra-loader.cron` uses the API queue when that cron file and the
+API service are installed on the host.
 
 ## Feature catalog
 
@@ -259,15 +261,17 @@ The materialized view `xetra_loader.xetra_features` has **104 columns**:
 The view deliberately contains no `open_level`, `high_level`, `low_level`, or
 `close_level`, and no `average_correlation_5obs`,
 `average_correlation_10obs`, or `average_correlation_20obs`. Internal OHLC
-values are used only for high-low range, intraday return, and overnight gap.
+values are used only for high-low range, intraday return, overnight gap,
+Stochastic, and Donchian features.
 
 ## Schedule and resource limits
 
-The deployed schedule contract is Sunday `11:00` in `Europe/Vienna`. The cron
+The repository schedule contract is Sunday `11:00` in `Europe/Vienna`. The cron
 entry submits a durable job; one in-process worker runs the restart-safe
-pipeline. `weekly.cores` defaults to **6** and can be overridden with
-`xdl-weekly --cores N`, `xdl-api --cores N`, or `XDL_CORES`. The API sets
-`POLARS_MAX_THREADS` before importing Polars, and the same budget bounds
+pipeline. Install the cron file and API service separately on the host before
+describing this schedule as deployed. `weekly.cores` defaults to **6** and can
+be overridden with `xdl-weekly --cores N`, `xdl-api --cores N`, or `XDL_CORES`.
+The API sets `POLARS_MAX_THREADS` before importing Polars, and the same budget bounds
 concurrent provider fetches. Provider fetch pools are closed before the next
 Polars-heavy stage; PostgreSQL publication stays serialized except for the
 independent dividend/split writers. Feature-view refresh is one atomic
