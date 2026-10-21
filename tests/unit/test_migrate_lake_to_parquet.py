@@ -245,16 +245,16 @@ def test_migration_repartitions_existing_versioned_parquet(
         snapshot_rows: list[dict[str, JSONValue]],
         *,
         snapshot: SnapshotWrite,
-        sync_directory: bool = True,
+        durable_sync: bool = True,
     ) -> None:
-        persisted_with["sync_directory"] = sync_directory
+        persisted_with["durable_sync"] = durable_sync
         persist(
             self,
             layer,
             dataset,
             snapshot_rows,
             snapshot=snapshot,
-            sync_directory=sync_directory,
+            durable_sync=durable_sync,
         )
 
     monkeypatch.setattr(
@@ -267,7 +267,7 @@ def test_migration_repartitions_existing_versioned_parquet(
 
     assert read_dataset_rows(layout, Layer.SILVER, dataset) == rows
     assert legacy_partition.exists()
-    assert persisted_with["sync_directory"] is False
+    assert persisted_with["durable_sync"] is False
 
 
 def test_empty_legacy_archive_does_not_create_backup_directory(tmp_path: Path) -> None:

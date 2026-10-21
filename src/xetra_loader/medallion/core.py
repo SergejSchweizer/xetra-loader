@@ -147,9 +147,10 @@ def atomic_write_parquet(
     path: Path,
     frame: pl.DataFrame,
     *,
+    sync_file: bool = True,
     sync_directory: bool = True,
 ) -> None:
-    """Atomically replace Parquet; optionally defer syncing its parent directory."""
+    """Atomically replace Parquet; replayable migrations may defer durable syncs."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -161,8 +162,9 @@ def atomic_write_parquet(
     temporary = Path(temporary_name)
     try:
         frame.write_parquet(temporary, compression="zstd", statistics=True)
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
+        if sync_file:
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
         os.replace(temporary, path)
         if sync_directory:
             directory_descriptor = os.open(path.parent, os.O_RDONLY)
@@ -179,6 +181,7 @@ def write_parquet_rows(
     path: Path,
     rows: Iterable[Mapping[str, JSONValue]],
     *,
+    sync_file: bool = True,
     sync_directory: bool = True,
 ) -> None:
     """Write semantic rows with Polars, encoding nested Bronze payloads losslessly."""
@@ -196,6 +199,7 @@ def write_parquet_rows(
     atomic_write_parquet(
         path,
         pl.DataFrame(normalized, infer_schema_length=None, strict=False),
+        sync_file=sync_file,
         sync_directory=sync_directory,
     )
 
