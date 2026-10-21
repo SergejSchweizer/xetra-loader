@@ -143,8 +143,13 @@ class MedallionLayout:
         return self.dataset_path(layer, dataset) / "versions" / version
 
 
-def atomic_write_parquet(path: Path, frame: pl.DataFrame) -> None:
-    """Atomically replace a Parquet artifact after Polars has fully written it."""
+def atomic_write_parquet(
+    path: Path,
+    frame: pl.DataFrame,
+    *,
+    sync_directory: bool = True,
+) -> None:
+    """Atomically replace Parquet; optionally defer syncing its parent directory."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -159,17 +164,23 @@ def atomic_write_parquet(path: Path, frame: pl.DataFrame) -> None:
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        if sync_directory:
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
 
 
-def write_parquet_rows(path: Path, rows: Iterable[Mapping[str, JSONValue]]) -> None:
+def write_parquet_rows(
+    path: Path,
+    rows: Iterable[Mapping[str, JSONValue]],
+    *,
+    sync_directory: bool = True,
+) -> None:
     """Write semantic rows with Polars, encoding nested Bronze payloads losslessly."""
 
     normalized: list[dict[str, object]] = []
@@ -182,7 +193,11 @@ def write_parquet_rows(path: Path, rows: Iterable[Mapping[str, JSONValue]]) -> N
         )
     if not normalized:
         return
-    atomic_write_parquet(path, pl.DataFrame(normalized, infer_schema_length=None, strict=False))
+    atomic_write_parquet(
+        path,
+        pl.DataFrame(normalized, infer_schema_length=None, strict=False),
+        sync_directory=sync_directory,
+    )
 
 
 def write_raw_listing_partitions(

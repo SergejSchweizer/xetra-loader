@@ -56,6 +56,28 @@ def test_atomic_parquet_write_failure_preserves_last_committed_artifact(
     assert not list(target.parent.glob(".data.parquet.*.tmp"))
 
 
+def test_atomic_parquet_can_defer_directory_sync_for_replayable_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "bronze" / "data.parquet"
+    real_fsync = medallion_core.os.fsync
+    synced_descriptors: list[int] = []
+
+    def track_fsync(descriptor: int) -> None:
+        synced_descriptors.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(medallion_core.os, "fsync", track_fsync)
+    atomic_write_parquet(
+        target,
+        pl.DataFrame({"value": ["preserved"]}),
+        sync_directory=False,
+    )
+
+    assert len(synced_descriptors) == 1
+    assert pl.read_parquet(target).to_dicts() == [{"value": "preserved"}]
+
+
 def test_silver_snapshot_uses_canonical_annual_partitions(tmp_path: Path) -> None:
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = MedallionLayout(tmp_path)
