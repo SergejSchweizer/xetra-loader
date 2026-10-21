@@ -282,6 +282,16 @@ PostgreSQL `work_mem` for feature refresh is separately configurable through
 within the validated `16MB`–`4GB` range. It is a per-operation/per-worker
 budget, not a transaction-wide cap.
 
+The schema build and refresh set PostgreSQL's parallel worker limit to
+`weekly.cores - 1` and enable leader participation, so the leader plus workers
+can use up to the configured core budget (six by default). Parallel scan
+thresholds and planner costs are tuned for the large quote table. An
+`EXPLAIN` of the feature query with `--cores 6` planned a `Parallel Seq Scan`
+with five workers and a `Gather Merge`. PostgreSQL still executes the
+dependent `WindowAgg` stages in the leader, so this parallelizes the source
+scan and eligible plan stages—not every feature calculation or the whole
+refresh across six cores.
+
 ## Validation
 
 Run local quality gates with the repository's pinned interpreter:

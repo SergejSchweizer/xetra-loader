@@ -42,6 +42,13 @@ SELECT set_config(
     true
 );
 SELECT set_config('parallel_leader_participation', 'on', true);
+-- Prefer parallel scans for the large source relation. WindowAgg itself is
+-- still executed by the leader, but the upstream table scan/sort input can
+-- use the configured worker budget where PostgreSQL's plan allows it.
+SELECT set_config('min_parallel_table_scan_size', '0', true);
+SELECT set_config('min_parallel_index_scan_size', '0', true);
+SELECT set_config('parallel_setup_cost', '0', true);
+SELECT set_config('parallel_tuple_cost', '0', true);
 
 CREATE OR REPLACE FUNCTION xetra_loader.wilder_rsi(
     gains double precision[],
@@ -686,6 +693,10 @@ BEGIN
         'max_parallel_workers_per_gather', greatest(configured_cores - 1, 0)::text, true
     );
     PERFORM set_config('parallel_leader_participation', 'on', true);
+    PERFORM set_config('min_parallel_table_scan_size', '0', true);
+    PERFORM set_config('min_parallel_index_scan_size', '0', true);
+    PERFORM set_config('parallel_setup_cost', '0', true);
+    PERFORM set_config('parallel_tuple_cost', '0', true);
     REFRESH MATERIALIZED VIEW xetra_loader.xetra_features;
 END
 $$;
