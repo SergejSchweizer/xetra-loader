@@ -117,6 +117,19 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
     expected = reference_features(fixture)
     connection = connect_postgres(DSN)
     try:
+        high_gain_rsi = connection.execute(
+            "SELECT xetra_loader.wilder_rsi(%s::double precision[], "
+            "%s::double precision[], 2)",
+            ([None, 1e200, 0.0], [None, 0.0, 1e-200]),
+        ).fetchone()[0]
+        high_loss_rsi = connection.execute(
+            "SELECT xetra_loader.wilder_rsi(%s::double precision[], "
+            "%s::double precision[], 2)",
+            ([None, 1e-200, 0.0], [None, 0.0, 1e200]),
+        ).fetchone()[0]
+        assert math.isclose(high_gain_rsi[-1], 100.0)
+        assert math.isclose(high_loss_rsi[-1], 0.0)
+
         with connection.transaction():
             _insert_fixture(connection, fixture)
             connection.execute("SELECT xetra_loader.refresh_xetra_features()")
@@ -164,6 +177,12 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
         )
         checks = {
             "all_catalog_features_match_independent_reference": True,
+            "extreme_rsi_gain_loss_ratio_is_finite": (
+                math.isfinite(high_gain_rsi[-1])
+                and math.isfinite(high_loss_rsi[-1])
+                and math.isclose(high_gain_rsi[-1], 100.0)
+                and math.isclose(high_loss_rsi[-1], 0.0)
+            ),
             "refresh_respects_six_core_budget": configured_parallel_workers == "5",
             "boundary_nulls_and_minimum_windows": boundary_nulls,
             "instrument_partitioning": partitioned,

@@ -62,6 +62,7 @@ DECLARE
     position integer;
     seed_start integer;
     seed_position integer;
+    relative_strength_log double precision;
 BEGIN
     IF period < 1 OR observations = 0 THEN
         RETURN CASE
@@ -96,12 +97,27 @@ BEGIN
             average_gain := (average_gain * (period - 1) + gains[position]) / period;
             average_loss := (average_loss * (period - 1) + losses[position]) / period;
         END IF;
-        result[position] := CASE
-            WHEN average_gain = 0 AND average_loss = 0 THEN NULL
-            WHEN average_loss = 0 THEN 100.0
-            WHEN average_gain = 0 THEN 0.0
-            ELSE 100.0 - 100.0 / (1.0 + average_gain / average_loss)
-        END;
+        IF average_gain = 0 AND average_loss = 0 THEN
+            result[position] := NULL;
+        ELSIF average_loss = 0 THEN
+            result[position] := 100.0::double precision;
+        ELSIF average_gain = 0 THEN
+            result[position] := 0.0::double precision;
+        ELSE
+            relative_strength_log := ln(average_gain) - ln(average_loss);
+            IF relative_strength_log >= 700.0 THEN
+                result[position] := 100.0::double precision;
+            ELSIF relative_strength_log <= -700.0 THEN
+                result[position] := 0.0::double precision;
+            ELSIF relative_strength_log >= 0.0 THEN
+                result[position] := 100.0::double precision
+                    / (1.0::double precision + exp(-relative_strength_log));
+            ELSE
+                result[position] := 100.0::double precision
+                    * exp(relative_strength_log)
+                    / (1.0::double precision + exp(relative_strength_log));
+            END IF;
+        END IF;
     END LOOP;
     RETURN result;
 END
