@@ -57,11 +57,12 @@ token must never be placed in cron arguments, logs, or tracked files.
 
 ## Lake storage format
 
-All current row artifacts are written by Polars as Parquet with Zstandard compression. Canonical paths are:
+All current row artifacts are written by Polars as Parquet with Zstandard
+compression. Canonical paths are:
 
-- Bronze daily rows: `bronze/dataset_type={type}/exchange={exchange}/instrument_type={type}/symbol={symbol}/timeframe={timeframe}/year={YYYY}/month={YYYY-MM}/date={YYYY-MM-DD}/data.parquet`.
-- Silver monthly rows: `silver/dataset_type={type}/exchange={exchange}/symbol={symbol}/timeframe={timeframe}/year={YYYY}/month={YYYY-MM}/{symbol}-{YYYY-MM}.parquet`.
-- Gold symbol snapshots: `gold/dataset_id={id}/dataset_type=gold_symbol_dataset/feature_set_version=v{MAJOR}.{MINOR}.{PATCH}/exchange={exchange}/symbol={symbol}/{symbol}_GOLD_{feature_hash}_{source_hash}.parquet`.
+- Bronze monthly rows: `bronze/dataset_type={dataset_type}/exchange={exchange}/instrument_type={instrument_type}/symbol={symbol}/timeframe={timeframe}/year={YYYY}/month={YYYY-MM}/data.parquet`.
+- Silver annual rows: `silver/dataset_type={dataset_type}/exchange={exchange}/symbol={symbol}/timeframe={timeframe}/year={YYYY}/{symbol}-{YYYY}.parquet`.
+- Gold symbol snapshots: `gold/dataset_id={dataset_id}/dataset_type=gold_symbol_dataset/exchange={exchange}/symbol={symbol}/{symbol}_GOLD_{feature_hash}_{source_hash}.parquet`.
 
 Small JSON manifests live under each layer's `_metadata/` directory and identify
 the current canonical artifacts. Bronze provider objects are retained as
@@ -71,11 +72,10 @@ control files.
 
 The one-time migration reads the previous `versions/<storage_version>/`
 snapshots and old row JSON, writes and validates canonical Parquet artifacts,
-then archives legacy `data.json` and `retractions.json` row artifacts into a
-timestamped recoverable backup. Manifests and restart metadata remain JSON
-control files. Legacy versioned Parquet files are left in place as recovery
-copies. The normal runtime reader refuses to fall back to that retired layout
-and requires the migration to have published a canonical manifest first.
+then moves legacy row files and obsolete layouts into a timestamped recovery
+backup outside the lake. Manifests and restart metadata remain JSON control
+files. The normal runtime reader refuses to fall back to retired layouts and
+requires the migration to have published a canonical manifest first.
 
 To migrate an existing JSON lake, first let any active writer finish, then run:
 
@@ -83,10 +83,10 @@ To migrate an existing JSON lake, first let any active writer finish, then run:
 PYTHONPATH=src .venv/bin/python scripts/migrate_lake_to_parquet.py
 ```
 
-The migration validates the Gold fingerprints before archiving legacy JSON
-rows below `/home/dev_xetra/.xdl-lake-json-backups/`. It does not remove legacy
-versioned Parquet generations; cleanup of those recovery copies is a separate
-storage-retention decision.
+The migration validates all Gold fingerprints before moving retired row
+artifacts below `/home/dev_xetra/.xdl-lake-recovery-backups/`. This preserves a
+recoverable copy while ensuring the lake itself contains only canonical
+row-bearing artifacts.
 
 ## Current scope
 
@@ -95,11 +95,17 @@ implemented Python pipeline owns EODHD transport, XETRA listings and corporate
 actions, Bronze/Silver/Gold datasets, transactional PostgreSQL publication,
 restart-safe orchestration, and acceptance verification.
 
+The core pipeline downloads XETRA listings, EOD quotes, dividend events, and
+split events from EODHD; builds their Bronze, Silver, and Gold datasets; and
+publishes complete retained histories to PostgreSQL raw tables. Its
+restart-safe weekly worker reconciles provider corrections as well as new
+observations and refreshes the downstream feature materialization.
+
 The feature contract is `xetra_loader.xetra_features`, a materialized view
 with only `adjusted_close_level` and `volume_level` as base levels. OHLC
-columns are internal inputs only for the approved high-low range, intraday
-return, and overnight-gap families. Fold-local standardization is a
-downstream operation documented in
+columns are never exposed as levels. Raw OHLC is used internally only by
+high-low range, intraday return, overnight gap, Stochastic, and Donchian
+features. Fold-local standardization is a downstream operation documented in
 [`docs/train-fold-standardization.md`](docs/train-fold-standardization.md); it
 never changes Gold or the global feature view.
 
@@ -151,10 +157,76 @@ controlled one-off local run; the deployed Sunday cron uses the API queue.
 
 ## Feature catalog
 
-The current catalog version is **4** and defines **98 derived features**.
-The catalog names and formulas are tested against an independent calculation
-reference and PostgreSQL integration fixtures. The complete view column count
-is recorded once in the PostgreSQL inventory below.
+Catalog version **4** defines **98 derived features** from two exposed base
+levels. The materialized view therefore has 104 columns: four row-identity
+columns, the two levels, and the 98 derived values. The executable catalog is
+`src/xetra_loader/features/catalog.py`; the transformations below are checked
+against an independent calculation reference and PostgreSQL integration
+fixtures.
+
+Every rolling calculation is causal: the current row and earlier observations
+only are used. Per-instrument windows count valid observations, not calendar
+days, and emit `NULL` until the catalog's minimum valid count is reached.
+Breadth and dispersion are cross-sectional by trade date; their rolling
+windows count market dates. Standard deviations use the sample estimator
+where noted. Return values are decimal fractions (so `0.01` means 1%); the
+`_pct` suffix does not multiply a result by 100.
+
+`adjusted_close_level` is the adjusted closing price and `volume_level` is
+provider volume. The table lists every derived output column and its
+transformation; names separated by commas share the formula shown in that row.
+Here, `t` is the current instrument observation, `n` is the indicated window,
+`r₁` is the one-observation adjusted-close log return, `SMAₙ` is the trailing
+simple moving average, and `EMAₙ` is the SMA-seeded exponential moving
+average.
+
+| Output columns | Transformation |
+| --- | --- |
+| `adjusted_close_log_return_1obs`, `adjusted_close_log_return_3obs`, `adjusted_close_log_return_5obs`, `adjusted_close_log_return_10obs`, `adjusted_close_log_return_20obs`; `log_return_1`, `log_return_2`, `log_return_3`, `log_return_4`, `log_return_5`, `log_return_8`, `log_return_10`, `log_return_20` | `ln(adjusted_close_level[t] / adjusted_close_level[t-n])`, for each name's lag `n`. |
+| `adjusted_close_return_geom_5obs_pct`, `adjusted_close_return_geom_10obs_pct`, `adjusted_close_return_geom_20obs_pct`; `rolling_cum_return_4`, `rolling_cum_return_8`, `rolling_cum_return_16` | `exp(sum(r₁ over the trailing n returns)) - 1`; `n` is encoded in each name. |
+| `adjusted_close_return_mean_5obs`, `adjusted_close_return_mean_10obs`, `adjusted_close_return_mean_20obs` | Arithmetic mean of the trailing `n` one-observation log returns. |
+| `adjusted_close_volatility_5obs`, `adjusted_close_volatility_10obs`, `adjusted_close_volatility_20obs`, `adjusted_close_volatility_40obs`; `rolling_volatility_8`, `rolling_volatility_32`, `rolling_volatility_96` | Sample standard deviation of the trailing `n` one-observation log returns. |
+| `high_low_range_1obs`, `high_low_range_5obs` | Mean of `(high - low) / close` over the trailing `n` valid source rows. |
+| `intraday_return_1obs`, `intraday_return_5obs` | Mean of `(close - open) / open` over the trailing `n` valid source rows. |
+| `overnight_gap_1obs`, `overnight_gap_5obs` | Mean of `(open[t] - close[t-1]) / close[t-1]` over the trailing `n` valid gaps. |
+| `adjusted_close_sma_ratio_5_20`, `adjusted_close_sma_ratio_10_20`, `adjusted_close_sma_ratio_10_40`, `sma_ratio_5_15` | Ratio of the two named trailing adjusted-close SMAs, e.g. `SMA₅ / SMA₂₀`. |
+| `adjusted_close_rsi_7obs`, `adjusted_close_rsi_14obs`; `rsi_3`, `rsi_5`, `rsi_7`, `rsi_14` | Wilder RSI of adjusted-close gains and losses for the named period; a fully flat gain/loss window is `NULL`. |
+| `rsi_ratio_5_15` | `rsi_5[t] / rsi_15[t]`; `rsi_15` is an internal intermediate, not an exposed column. |
+| `rsi5_slope_3` | `(rsi_5[t] - rsi_5[t-3]) / 3`. |
+| `rsi5_delta_1` | `rsi_5[t] - rsi_5[t-1]`. |
+| `ema5_distance`, `ema9_distance`, `ema21_distance` | `adjusted_close_level[t] / EMAₙ[t] - 1`, with `n` from the name. |
+| `ema5_ema21_spread` | `(EMA₅[t] - EMA₂₁[t]) / adjusted_close_level[t]`. |
+| `ema9_slope_3` | `(EMA₉[t] - EMA₉[t-3]) / (3 × adjusted_close_level[t])`. |
+| `ema5_ema9_cross` | `1` for an upward EMA₅/EMA₉ cross, `-1` for a downward cross, otherwise `0`; `NULL` until both EMAs and prior values exist. |
+| `adjusted_close_roc_3obs`, `adjusted_close_roc_5obs`, `adjusted_close_roc_10obs`, `adjusted_close_roc_20obs`; `roc_1`, `roc_2`, `roc_4`, `roc_8` | `adjusted_close_level[t] / adjusted_close_level[t-n] - 1`, for the named lag `n`. |
+| `roc_acceleration_4_8` | `roc_4[t] - roc_8[t]`. |
+| `stoch_k_5`, `stoch_k_14` | `100 × (close[t] - rolling_min(low, n)) / (rolling_max(high, n) - rolling_min(low, n))`, for `n` from the name. |
+| `stoch_d_5_3`, `stoch_d_14_3` | Three-observation SMA of the corresponding `%K` series. |
+| `stoch_kd_spread_5` | `stoch_k_5[t] - stoch_d_5_3[t]`. |
+| `stoch_k_slope_3` | `(stoch_k_5[t] - stoch_k_5[t-3]) / 3`. |
+| `macd_line_relative` | `(EMA₁₂[t] - EMA₂₆[t]) / adjusted_close_level[t]`. |
+| `macd_hist_relative` | `(MACD line[t] - 9-observation EMA signal[t]) / adjusted_close_level[t]`. |
+| `macd_hist_delta_3` | `macd_hist_relative[t] - macd_hist_relative[t-3]`. |
+| `donchian_breakout_up` | Boolean: current high exceeds the maximum high of the **prior** 20 observations. |
+| `donchian_breakout_down` | Boolean: current low is below the minimum low of the **prior** 20 observations. |
+| `volatility_zscore_96` | Z-score of `rolling_volatility_8` against its trailing 96 valid volatility values. |
+| `level_zscore_96` | `(adjusted_close_level[t] - trailing_mean₉₆) / trailing_sample_std₉₆`. |
+| `momentum_autocorr_lag1_window96` | Pearson correlation of `r₁` with its one-observation lag over 96 valid return pairs. |
+| `momentum_autocorr_lag4_window96` | Pearson correlation of `r₁` with its four-observation lag over 96 valid return pairs. |
+| `momentum_autocorr_lag8_window192` | Pearson correlation of `r₁` with its eight-observation lag over 192 valid return pairs. |
+| `adjusted_close_drawdown_20obs`, `adjusted_close_drawdown_60obs`; `rolling_drawdown_32`, `rolling_drawdown_96` | `adjusted_close_level[t] / trailing_max(adjusted_close_level, n) - 1`, including the current observation. |
+| `relative_volume_5obs`, `relative_volume_10obs`, `relative_volume_20obs` | `volume_level[t] / trailing_mean(volume_level, n)`. |
+| `volume_zscore_5obs`, `volume_zscore_10obs`, `volume_zscore_20obs` | `(volume_level[t] - trailing_meanₙ) / trailing_sample_stdₙ`. |
+| `log_tick_volume` | `ln(1 + volume_level[t])` when volume is nonnegative; otherwise `NULL`. |
+| `breadth_daily` | Per trade date, fraction of instruments with a positive one-observation adjusted-close log return. |
+| `breadth_5obs`, `breadth_10obs`, `breadth_20obs` | Mean of `breadth_daily` over the trailing 5, 10, or 20 valid market dates. |
+| `dispersion_daily` | Per trade date, sample standard deviation across instruments of one-observation adjusted-close log returns. |
+| `dispersion_5obs`, `dispersion_10obs`, `dispersion_20obs` | Mean of `dispersion_daily` over the trailing 5, 10, or 20 valid market dates. |
+
+All OHLC-derived columns above are derived features, not exposed OHLC levels.
+No pairwise or average-correlation columns are calculated. The complete
+104-column view inventory is recorded once in the PostgreSQL schema inventory
+below.
 
 ## Feature benchmark
 
@@ -163,7 +235,10 @@ plan with per-instrument Polars plans on the same synthetic input. The script
 checks both implementations against each other and against the independent
 feature reference before reporting median timings. The reproducible baseline
 uses 100,000 rows, 100 instruments, five timed rounds, and a six-core budget;
-its command is listed with the other local quality gates below.
+the measured result and environment are recorded in
+[`docs/feature-benchmark.md`](docs/feature-benchmark.md). In that run, the
+global plan was 14.26× faster than per-instrument plans. This synthetic
+microbenchmark does not measure total weekly-sync or PostgreSQL-refresh time.
 
 ## PostgreSQL schema inventory
 

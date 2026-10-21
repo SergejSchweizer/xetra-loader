@@ -56,7 +56,7 @@ def test_atomic_parquet_write_failure_preserves_last_committed_artifact(
     assert not list(target.parent.glob(".data.parquet.*.tmp"))
 
 
-def test_silver_snapshot_uses_canonical_monthly_partitions(tmp_path: Path) -> None:
+def test_silver_snapshot_uses_canonical_annual_partitions(tmp_path: Path) -> None:
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = MedallionLayout(tmp_path)
     rows = [
@@ -72,6 +72,12 @@ def test_silver_snapshot_uses_canonical_monthly_partitions(tmp_path: Path) -> No
             "code": "AAA",
             "trade_date": "2026-08-21",
         },
+        {
+            "isin": "DE0000000001",
+            "exchange": "XETRA",
+            "code": "AAA",
+            "trade_date": "2026-09-01",
+        },
     ]
 
     runtime.persist_silver("eod_quotes", rows)
@@ -84,13 +90,17 @@ def test_silver_snapshot_uses_canonical_monthly_partitions(tmp_path: Path) -> No
     assert len(artifact_paths) == 2
     assert all(
         path.startswith("silver/dataset_type=eod_quotes/exchange=XETRA/symbol=")
-        and "/timeframe=1d/year=2026/month=2026-08/" in path
+        and "/timeframe=1d/year=2026/" in path
+        and path.endswith(("AAA-2026.parquet", "BBB-2026.parquet"))
         for path in artifact_paths
     )
+    aaa_path = next(path for path in artifact_paths if path.endswith("AAA-2026.parquet"))
+    assert pl.read_parquet(tmp_path / aaa_path).height == 2
     assert all((tmp_path / path).is_file() for path in artifact_paths)
     assert not list(tmp_path.rglob("versions"))
     assert read_dataset_rows(runtime._layout, Layer.SILVER, "eod_quotes") == [
         {"isin": "DE0000000001", "exchange": "XETRA", "code": "AAA", "trade_date": "2026-08-21"},
+        {"isin": "DE0000000001", "exchange": "XETRA", "code": "AAA", "trade_date": "2026-09-01"},
         {"isin": "DE0000000002", "exchange": "XETRA", "code": "BBB", "trade_date": "2026-08-22"},
     ]
 
@@ -128,12 +138,12 @@ def test_gold_snapshot_uses_content_addressed_symbol_layout(tmp_path: Path) -> N
     artifact_paths = manifest["run_metadata"]["artifact_paths"]
     assert len(artifact_paths) == 1
     assert "storage_version" not in manifest["run_metadata"]
+    assert manifest["semantic_metadata"]["dataset_id"] == "xetra-eod_quotes-gold-v1"
     artifact = Path(artifact_paths[0])
-    assert artifact.parts[:6] == (
+    assert artifact.parts[:5] == (
         "gold",
         "dataset_id=xetra-eod_quotes-gold-v1",
         "dataset_type=gold_symbol_dataset",
-        "feature_set_version=v1.0.0",
         "exchange=XETRA",
         "symbol=AAA",
     )
@@ -143,7 +153,7 @@ def test_gold_snapshot_uses_content_addressed_symbol_layout(tmp_path: Path) -> N
     assert not list(tmp_path.rglob("versions"))
 
 
-def test_raw_listings_are_polars_parquet_in_daily_bronze_layout(tmp_path: Path) -> None:
+def test_raw_listings_are_polars_parquet_in_monthly_bronze_layout(tmp_path: Path) -> None:
     layout = MedallionLayout(tmp_path)
     as_of = date(2026, 8, 23)
     assert write_raw_listing_partitions(

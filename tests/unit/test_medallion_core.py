@@ -29,16 +29,15 @@ def test_layout_resolves_required_partition_paths() -> None:
     ) == Path(
         "/data/xetra/bronze/dataset_type=eod_quotes/exchange=XETRA/"
         "instrument_type=etf/symbol=AAA/timeframe=1d/year=2026/month=2026-08/"
-        "date=2026-08-21/data.parquet"
+        "data.parquet"
     )
-    assert layout.silver_path(SilverPartition("eod_quotes", "XETRA", "AAA", "1d", 2026, 8)) == Path(
+    assert layout.silver_path(SilverPartition("eod_quotes", "XETRA", "AAA", "1d", 2026)) == Path(
         "/data/xetra/silver/dataset_type=eod_quotes/exchange=XETRA/symbol=AAA/"
-        "timeframe=1d/year=2026/month=2026-08/AAA-2026-08.parquet"
+        "timeframe=1d/year=2026/AAA-2026.parquet"
     )
     assert layout.gold_path(
         GoldArtifact(
             "xetra-eod-quotes-gold-v1",
-            "v1.0.0",
             "XETRA",
             "AAA",
             "a" * 64,
@@ -46,8 +45,11 @@ def test_layout_resolves_required_partition_paths() -> None:
         )
     ) == Path(
         "/data/xetra/gold/dataset_id=xetra-eod-quotes-gold-v1/"
-        "dataset_type=gold_symbol_dataset/feature_set_version=v1.0.0/"
-        "exchange=XETRA/symbol=AAA/AAA_GOLD_" + "a" * 64 + "_" + "b" * 64 + ".parquet"
+        "dataset_type=gold_symbol_dataset/exchange=XETRA/symbol=AAA/AAA_GOLD_"
+        + "a" * 64
+        + "_"
+        + "b" * 64
+        + ".parquet"
     )
 
 
