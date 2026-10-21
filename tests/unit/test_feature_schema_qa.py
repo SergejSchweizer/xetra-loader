@@ -82,3 +82,13 @@ def test_schema_qa_uses_validated_configurable_refresh_memory_policy() -> None:
     assert "16MB and 4GB" in VIEW_SQL
     assert "xetra_loader.compute_cores" in VIEW_SQL
     assert "max_parallel_workers_per_gather" in VIEW_SQL
+
+
+def test_schema_qa_enables_parallel_source_scans_for_build_and_refresh() -> None:
+    for setting in (
+        "min_parallel_table_scan_size",
+        "min_parallel_index_scan_size",
+        "parallel_setup_cost",
+        "parallel_tuple_cost",
+    ):
+        assert VIEW_SQL.count(setting) == 2
