@@ -192,7 +192,10 @@ def _convert_bronze_sources(
         unique.update(incoming)
         ordered = [unique[key] for key in sorted(unique)]
         if ordered != prior:
-            write_parquet_rows(path, ordered)
+            # Legacy sources remain authoritative until final validation, so a
+            # missing rename after a host crash is safely replayable. Sync each
+            # Parquet file but avoid an expensive Btrfs directory fsync per shard.
+            write_parquet_rows(path, ordered, sync_directory=False)
             written += 1
     return written
 
