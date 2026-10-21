@@ -27,5 +27,7 @@ def test_sql_preserves_invalid_gain_loss_values_and_flat_null_rule() -> None:
     sql = Path("sql/schema/004_xetra_features.sql").read_text(encoding="utf-8")
     assert "array_agg(r.gain ORDER BY r.observation_number)" in sql
     assert "array_agg(coalesce(r.gain" not in sql
-    assert "WHEN average_gain = 0 AND average_loss = 0 THEN NULL" in sql
-    assert "WHEN average_gain = 0 THEN 0.0" in sql
+    assert "IF average_gain = 0 AND average_loss = 0 THEN" in sql
+    assert "ln(average_gain) - ln(average_loss)" in sql
+    assert "relative_strength_log >= 700.0" in sql
+    assert "relative_strength_log <= -700.0" in sql
