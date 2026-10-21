@@ -14,9 +14,35 @@ IDENTITY_COLUMNS = ("isin", "exchange", "code", "trade_date")
 def test_schema_qa_has_exact_identity_and_feature_column_contract() -> None:
     expected = IDENTITY_COLUMNS + feature_columns()
     assert len(expected) == len(set(expected))
-    assert "SELECT\n    r.isin, r.exchange, r.code, r.trade_date," in VIEW_SQL
-    for column in expected:
-        assert re.search(rf"\b{re.escape(column)}\b", VIEW_SQL)
+    projection_start = VIEW_SQL.index("SELECT\n    r.isin, r.exchange, r.code, r.trade_date,")
+    projection_end = VIEW_SQL.index("FROM normalized AS r", projection_start)
+    projection = VIEW_SQL[projection_start:projection_end].split("SELECT", 1)[1]
+    expressions: list[str] = []
+    start = depth = 0
+    in_string = False
+    for index, character in enumerate(projection):
+        if character == "'":
+            in_string = not in_string
+        elif not in_string:
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            elif character == "," and depth == 0:
+                expressions.append(projection[start:index].strip())
+                start = index + 1
+    expressions.append(projection[start:].strip())
+    actual: list[str] = []
+    for expression in expressions:
+        alias = re.search(r"\bAS\s+([a-z_][a-z_0-9]*)\s*$", expression, re.IGNORECASE)
+        actual.append(
+            alias.group(1)
+            if alias is not None
+            else expression.rsplit(".", maxsplit=1)[-1].strip()
+        )
+    assert actual[:6] == [*IDENTITY_COLUMNS, *BASE_LEVEL_COLUMNS]
+    assert len(actual) == len(set(actual))
+    assert set(actual) == set(expected)
 
 
 def test_schema_qa_allows_only_the_two_exposed_base_levels() -> None:

@@ -941,6 +941,13 @@ class PostgresEodhdBootstrapRuntime:
 
         materialized = [dict(row) for row in rows]
         artifact_paths = self._write_canonical_snapshot(layer, dataset, materialized)
+        semantic_metadata = dict(snapshot.semantic_metadata)
+        if layer is Layer.GOLD:
+            dataset_id = _gold_dataset_id(dataset)
+            recorded_dataset_id = semantic_metadata.setdefault("dataset_id", dataset_id)
+            if recorded_dataset_id != dataset_id:
+                raise ValueError(f"Gold {dataset} manifest has an unstable dataset_id")
+            semantic_metadata.setdefault("feature_set_version", "v1.0.0")
         retractions_path: str | None = None
         if snapshot.retractions:
             path = self._layout.retractions_path(layer, dataset)
@@ -949,7 +956,7 @@ class PostgresEodhdBootstrapRuntime:
         manifest = Manifest(
             dataset=dataset,
             layer=layer,
-            semantic_metadata=snapshot.semantic_metadata,
+            semantic_metadata=semantic_metadata,
             run_metadata={
                 "artifact_paths": cast(JSONValue, artifact_paths),
                 "retractions_path": retractions_path,
@@ -972,7 +979,7 @@ class PostgresEodhdBootstrapRuntime:
         artifact_paths: list[str] = []
         jobs: list[tuple[Path, list[dict[str, JSONValue]]]] = []
         if layer is Layer.SILVER:
-            for (exchange, symbol, year, month), group in groupby(
+            for (exchange, symbol, year), group in groupby(
                 ordered,
                 key=lambda row: _silver_partition_key(dataset, row),
             ):
@@ -983,7 +990,6 @@ class PostgresEodhdBootstrapRuntime:
                         symbol=symbol,
                         timeframe=_timeframe(dataset),
                         year=year,
-                        month=month,
                     )
                 )
                 jobs.append((path, [dict(row) for row in group]))
@@ -999,7 +1005,7 @@ class PostgresEodhdBootstrapRuntime:
                     }
                 ).encode("utf-8")
             ).hexdigest()
-            dataset_id = f"xetra-{dataset}-gold-v1"
+            dataset_id = _gold_dataset_id(dataset)
             for (exchange, symbol), group in groupby(
                 ordered,
                 key=lambda row: (str(row.get("exchange", "")), str(row.get("code", ""))),
@@ -1015,7 +1021,6 @@ class PostgresEodhdBootstrapRuntime:
                         self._layout.gold_path(
                             GoldArtifact(
                                 dataset_id=dataset_id,
-                                feature_set_version=feature_set_version,
                                 exchange=exchange,
                                 symbol=symbol,
                                 feature_hash=feature_hash,
@@ -1096,6 +1101,10 @@ def _timeframe(dataset: str) -> str:
     return "event"
 
 
+def _gold_dataset_id(dataset: str) -> str:
+    return f"xetra-{dataset}-gold-v1"
+
+
 def _partition_date(dataset: str, row: Mapping[str, JSONValue]) -> date:
     field = "trade_date" if dataset == "eod_quotes" else "event_date"
     if dataset == "listings":
@@ -1112,13 +1121,13 @@ def _partition_date(dataset: str, row: Mapping[str, JSONValue]) -> date:
 def _silver_partition_key(
     dataset: str,
     row: Mapping[str, JSONValue],
-) -> tuple[str, str, int, int]:
+) -> tuple[str, str, int]:
     exchange = row.get("exchange")
     symbol = row.get("code")
     if not isinstance(exchange, str) or not exchange or not isinstance(symbol, str) or not symbol:
         raise ValueError(f"Silver {dataset} row has an incomplete symbol identity")
     partition_date = _partition_date(dataset, row)
-    return exchange, symbol, partition_date.year, partition_date.month
+    return exchange, symbol, partition_date.year
 
 
 def _snapshot_sort_key(

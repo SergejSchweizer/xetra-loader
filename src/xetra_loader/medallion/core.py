@@ -41,14 +41,13 @@ class BronzePartition:
 
 @dataclass(frozen=True, slots=True)
 class SilverPartition:
-    """Partition dimensions for a single Silver month file."""
+    """Partition dimensions for one symbol's annual Silver file."""
 
     dataset_type: str
     exchange: str
     symbol: str
     timeframe: str
     year: int
-    month: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +55,6 @@ class GoldArtifact:
     """Partition and content-address dimensions for a Gold symbol artifact."""
 
     dataset_id: str
-    feature_set_version: str
     exchange: str
     symbol: str
     feature_hash: str
@@ -70,7 +68,7 @@ class MedallionLayout:
     root: Path
 
     def bronze_path(self, partition: BronzePartition) -> Path:
-        """Resolve one daily Bronze file using the canonical Hive partition keys."""
+        """Resolve one monthly Bronze file using the canonical Hive partition keys."""
 
         return (
             self.root
@@ -82,16 +80,12 @@ class MedallionLayout:
             / _hive("timeframe", partition.timeframe)
             / _hive("year", f"{partition.partition_date.year:04d}")
             / _hive("month", partition.partition_date.strftime("%Y-%m"))
-            / _hive("date", partition.partition_date.isoformat())
             / "data.parquet"
         )
 
     def silver_path(self, partition: SilverPartition) -> Path:
-        """Resolve one monthly Silver Parquet file using the canonical layout."""
+        """Resolve one annual Silver Parquet file using the canonical layout."""
 
-        if not 1 <= partition.month <= 12:
-            raise ValueError("month must be between 1 and 12")
-        month_text = f"{partition.year:04d}-{partition.month:02d}"
         return (
             self.root
             / Layer.SILVER.value
@@ -100,8 +94,7 @@ class MedallionLayout:
             / _hive("symbol", partition.symbol)
             / _hive("timeframe", partition.timeframe)
             / _hive("year", f"{partition.year:04d}")
-            / _hive("month", month_text)
-            / f"{_path_value(partition.symbol)}-{month_text}.parquet"
+            / f"{_path_value(partition.symbol)}-{partition.year:04d}.parquet"
         )
 
     def gold_path(self, artifact: GoldArtifact) -> Path:
@@ -117,7 +110,6 @@ class MedallionLayout:
             / Layer.GOLD.value
             / _hive("dataset_id", artifact.dataset_id)
             / _hive("dataset_type", "gold_symbol_dataset")
-            / _hive("feature_set_version", artifact.feature_set_version)
             / _hive("exchange", artifact.exchange)
             / _hive("symbol", artifact.symbol)
             / filename
@@ -201,7 +193,7 @@ def write_raw_listing_partitions(
     skip_existing: bool = False,
     snapshot_date: date | None = None,
 ) -> int:
-    """Persist raw provider listing objects in the canonical daily Bronze layout."""
+    """Persist raw provider listing objects in the canonical monthly Bronze layout."""
 
     grouped: dict[Path, list[dict[str, JSONValue]]] = {}
     as_of = snapshot_date or datetime.now(UTC).date()

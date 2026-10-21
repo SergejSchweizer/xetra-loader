@@ -1,3 +1,6 @@
+import re
+from pathlib import Path
+
 from xetra_loader.features.catalog import (
     BASE_LEVEL_COLUMNS,
     FEATURE_CATALOG_FINGERPRINT,
@@ -104,3 +107,15 @@ def test_catalog_declares_unambiguous_window_count_domains() -> None:
     assert specs["breadth_daily"].count_domain is ObservationCountDomain.VALID_INSTRUMENT_RETURNS
     assert specs["dispersion_daily"].minimum_count == 2
     assert specs["breadth_20obs"].count_domain is ObservationCountDomain.VALID_MARKET_DATES
+
+
+def test_readme_documents_every_derived_output_column() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    table = readme.split("| Output columns | Transformation |", maxsplit=1)[1].split(
+        "\nAll OHLC-derived", maxsplit=1
+    )[0]
+    documented = set(re.findall(r"`([a-z][a-z0-9_]+)`", table))
+    expected = set(feature_columns()) - set(BASE_LEVEL_COLUMNS)
+
+    assert len(expected) == 98
+    assert documented.intersection(expected) == expected

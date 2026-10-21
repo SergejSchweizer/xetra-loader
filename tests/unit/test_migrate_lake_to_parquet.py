@@ -7,7 +7,7 @@ from pathlib import Path
 
 import polars as pl
 from scripts.migrate_lake_to_parquet import (
-    _archive_json_artifacts,
+    _archive_legacy_artifacts,
     _convert_snapshot,
     migrate_lake,
 )
@@ -124,16 +124,26 @@ def _legacy_lake(root: Path) -> MedallionLayout:
     return layout
 
 
-def test_migration_writes_polars_parquet_and_archives_json(tmp_path: Path) -> None:
+def test_migration_writes_canonical_parquet_and_archives_legacy_artifacts(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "lake"
     backup_parent = tmp_path / "backups"
     layout = _legacy_lake(root)
+    obsolete_daily = (
+        root
+        / "bronze/dataset_type=eod_quotes/exchange=XETRA/instrument_type=unknown/"
+        "symbol=AAA/timeframe=1d/year=2026/month=2026-08/date=2026-08-21/data.parquet"
+    )
+    write_parquet_rows(obsolete_daily, [{"code": "AAA", "payload_json": "{}"}])
 
     report = migrate_lake(root, backup_parent)
 
     assert report["status"] == "PASS"
     assert report["datasets_fingerprint_valid"] == len(DATASETS)
-    backup = Path(str(report["json_backup"]))
+    backup = Path(str(report["recovery_backup"]))
+    assert (backup / obsolete_daily.relative_to(root)).is_file()
+    assert not obsolete_daily.exists()
     assert (backup / "silver" / "eod_quotes" / "data.json").exists()
     assert (backup / "gold" / "dividends" / "retractions.json").exists()
     assert not (root / "silver" / "eod_quotes" / "data.json").exists()
@@ -226,10 +236,10 @@ def test_migration_repartitions_existing_versioned_parquet(tmp_path: Path) -> No
     assert legacy_partition.exists()
 
 
-def test_empty_json_archive_does_not_create_backup_directory(tmp_path: Path) -> None:
+def test_empty_legacy_archive_does_not_create_backup_directory(tmp_path: Path) -> None:
     root = tmp_path / "lake"
     backup = tmp_path / "backup"
     root.mkdir()
 
-    assert _archive_json_artifacts(root, backup) == 0
+    assert _archive_legacy_artifacts(root, backup) == 0
     assert not backup.exists()
