@@ -192,10 +192,9 @@ def _convert_bronze_sources(
         unique.update(incoming)
         ordered = [unique[key] for key in sorted(unique)]
         if ordered != prior:
-            # Legacy sources remain authoritative until final validation, so a
-            # missing rename after a host crash is safely replayable. Sync each
-            # Parquet file but avoid an expensive Btrfs directory fsync per shard.
-            write_parquet_rows(path, ordered, sync_directory=False)
+            # Legacy sources remain authoritative until final validation, so
+            # missing or unflushed Parquet output is safely replayable.
+            write_parquet_rows(path, ordered, sync_file=False, sync_directory=False)
             written += 1
     return written
 
@@ -322,7 +321,7 @@ def _convert_snapshot(
         ),
         # Legacy rows remain authoritative until Gold fingerprints validate;
         # replay can safely recreate missing directory entries after a crash.
-        sync_directory=False,
+        durable_sync=False,
     )
     return True
 

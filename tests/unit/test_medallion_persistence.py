@@ -78,6 +78,25 @@ def test_atomic_parquet_can_defer_directory_sync_for_replayable_migration(
     assert pl.read_parquet(target).to_dicts() == [{"value": "preserved"}]
 
 
+def test_atomic_parquet_can_defer_file_and_directory_sync_for_replayable_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "bronze" / "replayable.parquet"
+    synced_descriptors: list[int] = []
+    monkeypatch.setattr(medallion_core.os, "fsync", synced_descriptors.append)
+
+    atomic_write_parquet(
+        target,
+        pl.DataFrame({"value": ["replayable"]}),
+        sync_file=False,
+        sync_directory=False,
+    )
+
+    assert synced_descriptors == []
+    assert pl.read_parquet(target).to_dicts() == [{"value": "replayable"}]
+
+
 def test_silver_snapshot_uses_canonical_annual_partitions(tmp_path: Path) -> None:
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = MedallionLayout(tmp_path)
