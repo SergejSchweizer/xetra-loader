@@ -55,6 +55,7 @@ def test_postgres_session_uses_bounded_parallel_query_and_maintenance_workers(
 
     connection = RecordingConnection()
     monkeypatch.setattr(sync_core, "resolve_postgres_writer_dsn", lambda _dsn: "dsn")
+    monkeypatch.setattr(sync_core, "resolve_feature_temp_file_limit", lambda: "32GB")
     monkeypatch.setattr(sync_core.psycopg, "connect", lambda *_args, **_kwargs: connection)
 
     result = sync_core.connect_postgres(cores=cores)
@@ -63,6 +64,10 @@ def test_postgres_session_uses_bounded_parallel_query_and_maintenance_workers(
     assert (
         "SELECT set_config(%s, %s, false)",
         ("max_parallel_workers_per_gather", parallel_workers),
+    ) in connection.calls
+    assert (
+        "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
+        ("32GB",),
     ) in connection.calls
     assert (
         "SELECT set_config(%s, %s, false)",

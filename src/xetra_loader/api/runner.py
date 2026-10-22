@@ -6,12 +6,12 @@ import argparse
 import logging
 import os
 from collections.abc import Sequence
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from wsgiref.simple_server import WSGIServer, make_server
 
 from xetra_loader.api.worker import DurableJobWorker
 from xetra_loader.config import resolve_api_token, resolve_cores, resolve_medallion_root
+from xetra_loader.logging_config import configure_logging, shutdown_logging
 from xetra_loader.sync.core import JSONValue
 
 _LOGGER = logging.getLogger("xetra_loader.api")
@@ -25,24 +25,6 @@ class MonitoringWSGIServer(WSGIServer):
     def service_actions(self) -> None:
         if self.worker is not None and not self.worker.is_alive:
             raise RuntimeError("durable job worker is unavailable")
-
-
-def _configure_logging() -> Path:
-    log_dir = Path(os.getenv("XDL_LOG_DIR", ".logs")).resolve()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "xdl-api.log"
-    handler = RotatingFileHandler(
-        log_path,
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-        delay=True,
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    _LOGGER.setLevel(logging.INFO)
-    _LOGGER.addHandler(handler)
-    _LOGGER.propagate = False
-    return log_path
 
 
 def _run_weekly_sync(job_id: str, cores: int) -> dict[str, JSONValue]:
@@ -80,13 +62,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Set this before importing any component that can initialize Polars.
     os.environ["POLARS_MAX_THREADS"] = str(cores)
     os.environ["XDL_CORES"] = str(cores)
+    log_path = configure_logging("xdl-api")
 
     from xetra_loader.api.application import create_application
     from xetra_loader.api.jobs import JobStore
 
     store = JobStore()
     worker = DurableJobWorker(store, cores=cores, job_runner=_run_weekly_sync)
-    log_path = _configure_logging()
     server: MonitoringWSGIServer | None = None
     try:
         worker.start()
@@ -112,9 +94,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if server is not None:
             server.server_close()
         worker.stop()
-        for handler in tuple(_LOGGER.handlers):
-            handler.close()
-            _LOGGER.removeHandler(handler)
+        shutdown_logging("xdl-api")
     return 0
 
 

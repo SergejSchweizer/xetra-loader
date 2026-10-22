@@ -33,11 +33,13 @@ migrations, and executable tests rather than these retired plans.
   one-time migration completed after validating Gold fingerprints; retired
   source artifacts were archived outside the lake. JSON manifests and
   restart/checkpoint files remain control metadata.
-- The repository cron artifact schedules Sunday 11:00 Vienna and enqueues a
+- The repository cron artifact schedules Sunday 09:00 Vienna and enqueues a
   durable PostgreSQL job for the in-process API worker. The current host
-  crontab instead runs a full historical refresh Saturday at 09:00 and copies
-  Gold to `/volume1/Temp/Quotes` Sunday at 22:00; the API service is not
-  installed. The CPU budget is six cores by default.
+  crontab instead runs a guarded full historical refresh Sunday at 09:00 and
+  copies Gold to `/volume1/Temp/Quotes` Sunday at 22:00; the API service is not
+  installed. After a verified PASS report, the guarded full-refresh command
+  retains the four newest timestamped backup directories and weekly checkpoints;
+  failed runs do not prune. The CPU budget is six cores by default.
 - The repository feature-view contract has 105 columns: four identities, one
   availability column, two base levels, and 98 catalog-derived features.
 - PostgreSQL access follows least privilege; credentials are provisioned
@@ -48,7 +50,7 @@ migrations, and executable tests rather than these retired plans.
 | PRs | Condensed scope | Last recorded disposition |
 | --- | --- | --- |
 | PR001–PR028 | Repository/CI foundations, PostgreSQL schema and roles, medallion/data contracts, EODHD ingestion, Gold builds, transactional sync, orchestration and restart safety | Merged |
-| PR029 | Historical Sunday 11:00 scheduler | Merged; the current repository schedule is Sunday 11:00 Europe/Vienna (`deploy/cron/xetra-loader.cron`) |
+| PR029 | Historical Sunday 11:00 scheduler | Merged; repository schedule is now Sunday 09:00 Europe/Vienna (`deploy/cron/xetra-loader.cron`) |
 | PR030–PR032 | Destructive-operation guard, full XETRA bootstrap, end-to-end QA | Merged |
 | PR033 | Historical production full-sync verification | Superseded by PR053 |
 | PR034–PR053 | Governance and CI corrections, scheduler/restart/incremental fixes, data integrity, lifecycle, provenance, PostgreSQL reconciliation and authoritative rewrite | Merged/completed; PR053 recorded a real-target PASS |

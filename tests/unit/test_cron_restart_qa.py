@@ -149,8 +149,8 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
         and 'cursor.execute("SELECT xetra_loader.refresh_xetra_features()")' in sync_source
     )
     log_paths = (
-        Path("artifacts/cron/xdl-weekly.log"),
-        Path("artifacts/cron/xdl-bootstrap.log"),
+        Path(".logs/xdl-weekly.log"),
+        Path(".logs/xdl-bootstrap.log"),
     )
     secret_markers = ("eodhd_api_token", "password=", "postgresql://", "postgres://", "writer_dsn")
     logs_sanitized = all(
@@ -159,9 +159,12 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
         if path.exists()
     )
     checks = {
-        "cron_vienna_sunday_1100": timezone == "Europe/Vienna" and expression == "0 11 * * 0",
-        "cron_enqueues_weekly_api_job": (
-            "xdl-enqueue-weekly" in cron_line and "xdl-bootstrap" not in cron_line
+        "cron_vienna_sunday_0900": timezone == "Europe/Vienna" and expression == "0 9 * * 0",
+        "cron_runs_guarded_direct_full_sync": (
+            "bash scripts/run_full_refresh.sh" in cron_line
+            and "artifacts/cron/full-refresh.log" in cron_line
+            and "xdl-enqueue-weekly" not in cron_line
+            and "xdl-bootstrap" not in cron_line
         ),
         "durable_api_worker_uses_event_notifications": (
             'LISTEN {_NOTIFY_CHANNEL}' in Path("src/xetra_loader/api/worker.py").read_text(

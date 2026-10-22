@@ -27,10 +27,40 @@ BEGIN
 END
 $$;
 
+CREATE OR REPLACE FUNCTION xetra_loader.resolve_feature_temp_file_limit()
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, xetra_loader
+AS $$
+DECLARE
+    configured text := current_setting('xetra_loader.feature_temp_file_limit', true);
+    size_bytes bigint;
+BEGIN
+    configured := coalesce(nullif(btrim(configured), ''), '32GB');
+    BEGIN
+        size_bytes := pg_size_bytes(configured);
+    EXCEPTION WHEN others THEN
+        RAISE EXCEPTION 'invalid xetra_loader.feature_temp_file_limit setting';
+    END;
+    IF size_bytes < 1::bigint * 1024 * 1024 * 1024
+       OR size_bytes > 64::bigint * 1024 * 1024 * 1024 THEN
+        RAISE EXCEPTION
+            'xetra_loader.feature_temp_file_limit must be between 1GB and 64GB';
+    END IF;
+    RETURN configured;
+END
+$$;
+
 -- work_mem is a per-operation/per-worker budget. The deployment/runtime sets
 -- the custom GUC; the helper validates it and supplies the documented default.
 SELECT set_config(
     'work_mem', xetra_loader.resolve_feature_work_mem(), true
+);
+-- Cap spill files per PostgreSQL process; the limit is deployment-configurable.
+SELECT set_config(
+    'temp_file_limit', xetra_loader.resolve_feature_temp_file_limit(), true
 );
 SELECT set_config(
     'max_parallel_workers_per_gather',
@@ -214,9 +244,11 @@ BEGIN
 END
 $$;
 
-DROP MATERIALIZED VIEW IF EXISTS xetra_loader.xetra_features;
+-- Build the replacement under a staging name so readers can keep using the
+-- current serving view until the full-history calculation is complete.
+DROP MATERIALIZED VIEW IF EXISTS xetra_loader.xetra_features_build;
 
-CREATE MATERIALIZED VIEW xetra_loader.xetra_features AS
+CREATE MATERIALIZED VIEW xetra_loader.xetra_features_build AS
 WITH ordered AS (
     SELECT
         q.isin, q.exchange, q.code, q.trade_date,
@@ -271,63 +303,41 @@ WITH ordered AS (
         lag(log_return_1, 8) OVER w AS return_lag_8
     FROM returns AS r
     WINDOW w AS (PARTITION BY isin, exchange, code ORDER BY trade_date)
-), rsi_arrays AS (
+), feature_series AS MATERIALIZED (
     SELECT r.isin, r.exchange, r.code,
-        xetra_loader.wilder_rsi(
-            array_agg(r.gain ORDER BY r.observation_number),
-            array_agg(r.loss ORDER BY r.observation_number),
-            3
-        ) AS rsi_3,
-        xetra_loader.wilder_rsi(
-            array_agg(r.gain ORDER BY r.observation_number),
-            array_agg(r.loss ORDER BY r.observation_number),
-            5
-        ) AS rsi_5,
-        xetra_loader.wilder_rsi(
-            array_agg(r.gain ORDER BY r.observation_number),
-            array_agg(r.loss ORDER BY r.observation_number),
-            7
-        ) AS rsi_7,
-        xetra_loader.wilder_rsi(
-            array_agg(r.gain ORDER BY r.observation_number),
-            array_agg(r.loss ORDER BY r.observation_number),
-            14
-        ) AS rsi_14,
-        xetra_loader.wilder_rsi(
-            array_agg(r.gain ORDER BY r.observation_number),
-            array_agg(r.loss ORDER BY r.observation_number),
-            15
-        ) AS rsi_15
+        array_agg(r.gain ORDER BY r.observation_number) AS gains,
+        array_agg(r.loss ORDER BY r.observation_number) AS losses,
+        array_agg(r.adjusted_close_level ORDER BY r.observation_number) AS price_values
     FROM returns AS r
     GROUP BY r.isin, r.exchange, r.code
+), rsi_arrays AS (
+    SELECT s.isin, s.exchange, s.code,
+        xetra_loader.wilder_rsi(s.gains, s.losses, 3) AS rsi_3,
+        xetra_loader.wilder_rsi(s.gains, s.losses, 5) AS rsi_5,
+        xetra_loader.wilder_rsi(s.gains, s.losses, 7) AS rsi_7,
+        xetra_loader.wilder_rsi(s.gains, s.losses, 14) AS rsi_14,
+        xetra_loader.wilder_rsi(s.gains, s.losses, 15) AS rsi_15
+    FROM feature_series AS s
 ), rsi_values AS (
     SELECT a.isin, a.exchange, a.code, s.observation_number,
-        a.rsi_3[s.observation_number] AS rsi_3,
-        a.rsi_5[s.observation_number] AS rsi_5,
-        a.rsi_7[s.observation_number] AS rsi_7,
-        a.rsi_14[s.observation_number] AS rsi_14,
-        a.rsi_15[s.observation_number] AS rsi_15
+        s.rsi_3, s.rsi_5, s.rsi_7, s.rsi_14, s.rsi_15
     FROM rsi_arrays AS a
-    CROSS JOIN LATERAL generate_subscripts(a.rsi_3, 1) AS s(observation_number)
+    CROSS JOIN LATERAL unnest(a.rsi_3, a.rsi_5, a.rsi_7, a.rsi_14, a.rsi_15)
+        WITH ORDINALITY AS s(rsi_3, rsi_5, rsi_7, rsi_14, rsi_15, observation_number)
 ), rsi_value_lags AS (
     SELECT v.*,
         lag(rsi_5, 1) OVER w AS rsi_5_lag_1,
         lag(rsi_5, 3) OVER w AS rsi_5_lag_3
     FROM rsi_values AS v
     WINDOW w AS (PARTITION BY isin, exchange, code ORDER BY observation_number)
-), ema_prices AS (
-    SELECT r.isin, r.exchange, r.code,
-        array_agg(r.adjusted_close_level ORDER BY r.observation_number) AS price_values
-    FROM returns AS r
-    GROUP BY r.isin, r.exchange, r.code
 ), ema_base AS (
-    SELECT p.isin, p.exchange, p.code,
-        xetra_loader.exponential_moving_average(price_values, 5) AS ema_5,
-        xetra_loader.exponential_moving_average(price_values, 9) AS ema_9,
-        xetra_loader.exponential_moving_average(price_values, 12) AS ema_12,
-        xetra_loader.exponential_moving_average(price_values, 21) AS ema_21,
-        xetra_loader.exponential_moving_average(price_values, 26) AS ema_26
-    FROM ema_prices AS p
+    SELECT s.isin, s.exchange, s.code,
+        xetra_loader.exponential_moving_average(s.price_values, 5) AS ema_5,
+        xetra_loader.exponential_moving_average(s.price_values, 9) AS ema_9,
+        xetra_loader.exponential_moving_average(s.price_values, 12) AS ema_12,
+        xetra_loader.exponential_moving_average(s.price_values, 21) AS ema_21,
+        xetra_loader.exponential_moving_average(s.price_values, 26) AS ema_26
+    FROM feature_series AS s
 ), ema_macd_line AS (
     SELECT e.*,
         xetra_loader.subtract_feature_arrays(ema_12, ema_26) AS macd_line
@@ -336,17 +346,17 @@ WITH ordered AS (
     SELECT e.*,
         xetra_loader.exponential_moving_average(macd_line, 9, TRUE) AS macd_signal
     FROM ema_macd_line AS e
-), ema_values AS (
+-- Keep the per-instrument array expansion ahead of the observation-level join.
+-- If inlined, PostgreSQL can re-run each full-array unnest once per quote row.
+), ema_values AS MATERIALIZED (
     SELECT a.isin, a.exchange, a.code, s.observation_number,
-        a.ema_5[s.observation_number] AS ema_5,
-        a.ema_9[s.observation_number] AS ema_9,
-        a.ema_12[s.observation_number] AS ema_12,
-        a.ema_21[s.observation_number] AS ema_21,
-        a.ema_26[s.observation_number] AS ema_26,
-        a.macd_line[s.observation_number] AS macd_line,
-        a.macd_signal[s.observation_number] AS macd_signal
+        s.ema_5, s.ema_9, s.ema_12, s.ema_21, s.ema_26, s.macd_line, s.macd_signal
     FROM ema_arrays AS a
-    CROSS JOIN LATERAL generate_subscripts(a.ema_5, 1) AS s(observation_number)
+    CROSS JOIN LATERAL unnest(
+        a.ema_5, a.ema_9, a.ema_12, a.ema_21, a.ema_26, a.macd_line, a.macd_signal
+    ) WITH ORDINALITY AS s(
+        ema_5, ema_9, ema_12, ema_21, ema_26, macd_line, macd_signal, observation_number
+    )
 ), ema_value_lags AS (
     SELECT e.*,
         r.adjusted_close_level,
@@ -485,7 +495,9 @@ WITH ordered AS (
         w60 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW),
         w96 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 95 PRECEDING AND CURRENT ROW),
         w192 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 191 PRECEDING AND CURRENT ROW)
-), normalized AS (
+-- Keep the wide observation-level feature rows in one computed rowset for the
+-- final projection; daily market statistics use the narrower returns CTE.
+), normalized AS MATERIALIZED (
     SELECT r.*,
         CASE WHEN count(vol_8) OVER w96 = 96
              THEN (vol_8 - avg(vol_8) OVER w96)
@@ -500,7 +512,7 @@ WITH ordered AS (
     SELECT trade_date,
         avg(CASE WHEN log_return_1 > 0 THEN 1.0 WHEN log_return_1 IS NOT NULL THEN 0.0 END) AS breadth_daily,
         stddev_samp(log_return_1) AS dispersion_daily
-    FROM normalized
+    FROM returns
     GROUP BY trade_date
 ), cross_rolling AS (
     SELECT d.*,
@@ -647,8 +659,14 @@ LEFT JOIN ema_value_lags AS ev ON ev.isin = r.isin AND ev.exchange = r.exchange
 JOIN cross_rolling AS c ON c.trade_date = r.trade_date
 ;
 
-CREATE UNIQUE INDEX xetra_features_identity_idx
-    ON xetra_loader.xetra_features (isin, exchange, code, trade_date);
+CREATE UNIQUE INDEX xetra_features_build_identity_idx
+    ON xetra_loader.xetra_features_build (isin, exchange, code, trade_date);
+
+-- Swap only after the replacement is fully populated and indexed. All DDL is
+-- in this transaction, so failures restore the previous serving view.
+DROP MATERIALIZED VIEW IF EXISTS xetra_loader.xetra_features;
+ALTER MATERIALIZED VIEW xetra_loader.xetra_features_build RENAME TO xetra_features;
+ALTER INDEX xetra_loader.xetra_features_build_identity_idx RENAME TO xetra_features_identity_idx;
 
 ALTER MATERIALIZED VIEW xetra_loader.xetra_features OWNER TO "xetra-data-loader";
 
@@ -667,6 +685,10 @@ REVOKE ALL ON FUNCTION xetra_loader.subtract_feature_arrays(double precision[], 
 ALTER FUNCTION xetra_loader.resolve_feature_work_mem()
     OWNER TO "xetra-data-loader";
 REVOKE ALL ON FUNCTION xetra_loader.resolve_feature_work_mem() FROM PUBLIC;
+
+ALTER FUNCTION xetra_loader.resolve_feature_temp_file_limit()
+    OWNER TO "xetra-data-loader";
+REVOKE ALL ON FUNCTION xetra_loader.resolve_feature_temp_file_limit() FROM PUBLIC;
 
 COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
     'XETRA feature view; catalog version=4; base levels=adjusted_close_level,volume_level';
@@ -694,6 +716,9 @@ BEGIN
         RAISE EXCEPTION 'xetra_loader.compute_cores must be between 1 and 64';
     END IF;
     PERFORM set_config('work_mem', xetra_loader.resolve_feature_work_mem(), true);
+    PERFORM set_config(
+        'temp_file_limit', xetra_loader.resolve_feature_temp_file_limit(), true
+    );
     -- PostgreSQL's parallel workers plus the participating leader stay within
     -- the configured process-wide CPU budget.
     PERFORM set_config(

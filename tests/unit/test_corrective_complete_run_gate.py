@@ -18,7 +18,7 @@ def test_corrective_complete_run_contract_is_closed() -> None:
     for forbidden in ("open_level", "high_level", "low_level", "close_level"):
         assert re.search(rf"(?<![a-z_]){forbidden}(?![a-z_])", sql) is None
     assert cron_timezone == "Europe/Vienna"
-    assert cron_expression == "0 11 * * 0"
+    assert cron_expression == "0 9 * * 0"
 
 
 def test_corrective_run_keeps_configuration_and_logs_out_of_git() -> None:

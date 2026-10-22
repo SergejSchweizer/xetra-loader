@@ -10,7 +10,12 @@ from typing import Any
 
 from psycopg import Connection
 
-from xetra_loader.config import resolve_cores, resolve_feature_work_mem
+from xetra_loader.config import (
+    resolve_cores,
+    resolve_feature_temp_file_limit,
+    resolve_feature_work_mem,
+)
+from xetra_loader.logging_config import configure_logging
 from xetra_loader.sync import connect_postgres
 
 SCHEMA_FILES: tuple[str, ...] = (
@@ -49,6 +54,10 @@ def apply_postgres_schema(
             "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
             (resolve_feature_work_mem(),),
         )
+        db.execute(
+            "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
+            (resolve_feature_temp_file_limit(),),
+        )
         if own_connection:
             db.commit()
         applied_files = list(SCHEMA_FILES)
@@ -76,6 +85,7 @@ def apply_postgres_schema(
 def main(argv: Sequence[str] | None = None) -> int:
     """Provision the real target using the protected admin configuration."""
 
+    configure_logging("xdl-migrate")
     parser = argparse.ArgumentParser(prog="xdl-migrate")
     parser.add_argument(
         "--cores",

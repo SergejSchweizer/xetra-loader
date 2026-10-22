@@ -6,22 +6,22 @@
 - [Cutover sequence](#cutover-sequence)
 - [Restore the weekly schedule](#restore-the-weekly-schedule)
 
-This is an operational procedure for the explicit one-off full rewrite, not
-the repository's normal Sunday `11:00 Europe/Vienna` durable weekly sync with
-semantic-delta publication. The current host crontab is intentionally different:
-it runs a full historical refresh on Saturday at `09:00` and copies Gold to
-`/volume1/Temp/Quotes` on Sunday at `22:00`. The user API service is not
-installed, and the repository's Sunday enqueue entry is not active on this
-host. Do not assume these host jobs match `deploy/cron/xetra-loader.cron`.
+This is the runbook for the guarded full rewrite used by the repository's
+Sunday `09:00 Europe/Vienna` schedule. The current host crontab also runs this
+full historical refresh every Sunday at `09:00` and copies Gold to
+`/volume1/Temp/Quotes` at `22:00`. The API service is not installed. Do not add
+the REST enqueue entry alongside the direct full-refresh schedule.
 
 ## Purpose and preconditions
 
 `xdl-verify-production-sync --execute-full-sync --confirm-destructive-reset
---cores 6` is the one-off final cutover command (`--cores` defaults to the
-configured budget or six). It refuses to run unless the recurring
-`xdl-enqueue-weekly` cron entry has first been disabled, the configured administrative
-connection resolves exactly to `10.10.1.3:54321`, a lock is acquired, and a
-backup root outside this repository is supplied.
+--cores 6` is the destructive full-rewrite command (`--cores` defaults to the
+configured budget or six). The host wrapper `scripts/run_full_refresh.sh`
+invokes it weekly. Before a separate manual invocation, disable the host's
+scheduled full-refresh entry and any `xdl-enqueue-weekly` entry, then verify no
+API worker or queued job can race the rewrite. The command also requires the
+configured administrative connection to resolve exactly to
+`10.10.1.3:54321`, an acquired lock, and a backup root outside this repository.
 
 Stop `xetra-loader-api.service` and verify that `xetra_loader.loader_jobs` has
 no queued or running job before the destructive rewrite. This prevents a new
@@ -34,13 +34,18 @@ manifests, performs the confirmed loader-owned reset, and fetches the complete
 active and delisted universe. Administrative credentials are used only for the
 backup and reset; all serving publication is performed through the configured
 non-superuser writer. It then runs the guarded weekly path once against the
-unchanged source and writes the sanitized V2 acceptance report.
+unchanged source and writes the sanitized V2 acceptance report. Each run adds
+a timestamped recovery directory under the configured backup root. Only after
+the verified `PASS` report is successfully written does the command retain the
+four newest matching full-sync directories and archived weekly checkpoints,
+removing older artifacts of each type. A failed or unverified run never prunes;
+unrelated files and malformed names are left untouched. If pruning itself fails
+after a PASS, the sync remains successful and emits a warning so the completed
+destructive import is not mistakenly retried.
 
 ## Restore the weekly schedule
 
-Keep the cron entry disabled until that report is `PASS`. On deployments using
-the repository cron and API service, restart the API service and restore the
-Sunday `11:00 Europe/Vienna` `xdl-enqueue-weekly` entry only after a successful
-run. On this host, restore only the Saturday full-refresh and Sunday Gold-copy
-entries that were disabled before the rewrite; do not install a second schedule
-as part of this procedure.
+Keep the cron entry disabled until that report is `PASS`. Restore only the
+Sunday `09:00 Europe/Vienna` direct full-refresh entry and Sunday `22:00`
+Gold-copy entry that were disabled before the rewrite. Do not install a
+parallel `xdl-enqueue-weekly` entry as part of this procedure.

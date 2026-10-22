@@ -54,6 +54,7 @@ def test_schema_provisioner_sets_database_core_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XDL_FEATURE_WORK_MEM", "256MB")
+    monkeypatch.setenv("XDL_FEATURE_TEMP_FILE_LIMIT", "16GB")
     connection = _RecordingConnection()
     for relative in migrate.SCHEMA_FILES:
         sql_path = tmp_path / relative
@@ -71,6 +72,10 @@ def test_schema_provisioner_sets_database_core_budget(
         ("SELECT set_config('xetra_loader.compute_cores', %s, false)", ("4",)),
         ("SELECT set_config('xetra_loader.feature_work_mem', %s, false)", ("256MB",)),
     ]
+    assert connection.statements[2] == (
+        "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
+        ("16GB",),
+    )
     assert connection.statements[-1] == (
         "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)",
         ("xetra_loader",),
@@ -82,6 +87,7 @@ def test_schema_provisioner_reapplies_reader_contract_after_view_rebuild(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XDL_FEATURE_WORK_MEM", "256MB")
+    monkeypatch.setenv("XDL_FEATURE_TEMP_FILE_LIMIT", "16GB")
     connection = _RecordingConnection(reader_role_exists=True)
     for relative in migrate.SCHEMA_FILES:
         sql_path = tmp_path / relative

@@ -411,7 +411,7 @@ def test_complete_gold_postgres_feature_acceptance(tmp_path: Path) -> None:
             "permissions_are_read_only_for_consumers": privileges == (True, False, True),
             "utc_contract": timezone == "UTC",
             "cron_contract": cron_timezone == "Europe/Vienna"
-            and cron_expression == "0 11 * * 0",
+            and cron_expression == "0 9 * * 0",
             "restart_safe_weekly_runner": restart.succeeded,
         }
         report = {

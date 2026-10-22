@@ -11,6 +11,7 @@ from typing import Any
 
 from psycopg import Connection
 
+from xetra_loader.logging_config import configure_logging
 from xetra_loader.sync import connect_postgres
 
 CONFIRM_FLAG = "--confirm-destructive-reset"
@@ -73,6 +74,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point; absent confirmation always yields a non-mutating plan."""
 
+    configure_logging("xdl-reset")
     args = _parser().parse_args(argv)
     plan = build_reset_plan(args.medallion_root)
     print("schemas=" + ",".join(plan.schemas))
