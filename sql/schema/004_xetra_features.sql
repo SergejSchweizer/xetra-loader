@@ -518,6 +518,13 @@ WITH ordered AS (
 )
 SELECT
     r.isin, r.exchange, r.code, r.trade_date,
+    (
+        r.trade_date + CASE EXTRACT(ISODOW FROM r.trade_date)::integer
+            WHEN 5 THEN 3
+            WHEN 6 THEN 2
+            ELSE 1
+        END
+    )::timestamp without time zone AT TIME ZONE 'UTC' AS available_at_utc,
     r.adjusted_close_level, r.volume_level,
     r.log_return_1 AS adjusted_close_log_return_1obs,
     r.log_return_3 AS adjusted_close_log_return_3obs,

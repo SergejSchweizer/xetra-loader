@@ -10,21 +10,28 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Iterator, Mapping
+import tempfile
+from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from itertools import groupby
 from pathlib import Path, PurePosixPath
 from typing import cast
 
 from xetra_loader.config import resolve_cores, resolve_medallion_root
 
-os.environ["POLARS_MAX_THREADS"] = str(resolve_cores())
+# Polars initializes its thread pool at import, so resolve the CLI override first.
+_core_parser = argparse.ArgumentParser(add_help=False)
+_core_parser.add_argument("--cores", type=int)
+_core_arguments, _ = _core_parser.parse_known_args()
+_POLARS_CORES = resolve_cores(_core_arguments.cores)
+os.environ["POLARS_MAX_THREADS"] = str(_POLARS_CORES)
 
-import polars as pl
+import polars as pl  # noqa: E402 - thread budget is set before Polars initializes
 
-from xetra_loader.medallion.core import (
+from xetra_loader.medallion.core import (  # noqa: E402 - see Polars initialization above
     BronzePartition,
     JSONValue,
     Layer,
@@ -37,9 +44,16 @@ from xetra_loader.medallion.core import (
     write_parquet_rows,
     write_raw_listing_partitions,
 )
-from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime, SnapshotWrite
-from xetra_loader.ops.verify_postgres_sync import DATASETS, load_gold_snapshots
-from xetra_loader.pipeline.restart import LoaderLock
+from xetra_loader.ops.bootstrap import (  # noqa: E402
+    PostgresEodhdBootstrapRuntime,
+    SnapshotWrite,
+    _silver_partition_key,
+)
+from xetra_loader.ops.verify_postgres_sync import (  # noqa: E402
+    DATASETS,
+    validate_gold_fingerprints_streaming,
+)
+from xetra_loader.pipeline.restart import LoaderLock  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,14 +72,24 @@ def _json_value(value: object) -> JSONValue:
     raise ValueError(f"unsupported JSON-compatible value: {type(value).__name__}")
 
 
-def _frame_rows(frame: pl.DataFrame) -> Iterator[dict[str, JSONValue]]:
+def _frame_rows(
+    frame: pl.DataFrame,
+    *,
+    dataset: str,
+    presorted: bool = False,
+) -> Iterator[dict[str, JSONValue]]:
     if frame.height == 0:
         return iter(())
     required = {"isin", "exchange", "code"}
     if not required.issubset(frame.columns):
         missing = sorted(required - set(frame.columns))
         raise ValueError(f"snapshot is missing listing identity columns: {missing}")
-    ordered = frame.sort(["isin", "exchange", "code"])
+    sort_columns = ["exchange", "code"]
+    date_column = "trade_date" if dataset == "eod_quotes" else "event_date"
+    if dataset != "listings" and date_column in frame.columns:
+        sort_columns.append(date_column)
+    sort_columns.append("isin")
+    ordered = frame if presorted else frame.sort(sort_columns)
 
     def rows() -> Iterator[dict[str, JSONValue]]:
         for row in ordered.iter_rows(named=True):
@@ -74,7 +98,7 @@ def _frame_rows(frame: pl.DataFrame) -> Iterator[dict[str, JSONValue]]:
     return rows()
 
 
-def _convert_bronze_partitions(root: Path) -> int:
+def _convert_bronze_partitions(root: Path, *, cores: int) -> int:
     layout = MedallionLayout(root)
     listing_manifest = layout.manifest_path(Layer.SILVER, "listings")
     listing_rows = (
@@ -85,7 +109,6 @@ def _convert_bronze_partitions(root: Path) -> int:
     instrument_types = _listing_instrument_types(listing_rows)
     context = _BronzeMigrationContext(layout, instrument_types)
     groups = _group_bronze_sources(_legacy_bronze_sources(root))
-    cores = resolve_cores()
     converted = 0
     with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-bronze-migrate") as pool:
         results = pool.map(
@@ -291,14 +314,41 @@ def _convert_snapshot(
         # Inspect the full JSON input so late non-null strings are not inferred as Null.
         frame = pl.read_json(source, infer_schema_length=None)
     else:
-        rows = (
-            read_dataset_rows(layout, layer, dataset)
-            if manifest_path.exists()
-            else read_legacy_dataset_rows(layout, layer, dataset)
+        legacy_run_metadata = manifest.get("run_metadata")
+        storage_version = (
+            legacy_run_metadata.get("storage_version")
+            if isinstance(legacy_run_metadata, dict)
+            else None
         )
-        if not rows and not legacy_manifest_path.exists():
-            raise FileNotFoundError(f"missing {layer.value} snapshot: {source}")
-        frame = pl.DataFrame(rows, infer_schema_length=None)
+        legacy_partitions = (
+            layout.snapshot_version_path(layer, dataset, storage_version) / "partitions"
+            if isinstance(storage_version, str)
+            else None
+        )
+        partition_sources = (
+            sorted(legacy_partitions.glob("*.parquet"))
+            if legacy_partitions is not None
+            else []
+        )
+        if partition_sources:
+            return _convert_versioned_parquet_snapshot(
+                runtime,
+                layout,
+                layer,
+                dataset,
+                manifest,
+                manifest_path,
+                partition_sources,
+            )
+        else:
+            rows = (
+                read_dataset_rows(layout, layer, dataset)
+                if manifest_path.exists()
+                else read_legacy_dataset_rows(layout, layer, dataset)
+            )
+            if not rows and not legacy_manifest_path.exists():
+                raise FileNotFoundError(f"missing {layer.value} snapshot: {source}")
+            frame = pl.DataFrame(rows, infer_schema_length=None)
     if layer is Layer.GOLD:
         semantic_metadata, retractions = _gold_migration_metadata(
             layout,
@@ -314,7 +364,7 @@ def _convert_snapshot(
     runtime._persist_partitioned_snapshot(
         layer,
         dataset,
-        _frame_rows(frame),
+        _frame_rows(frame, dataset=dataset),
         snapshot=SnapshotWrite(
             semantic_metadata=semantic_metadata,
             retractions=retractions,
@@ -322,8 +372,140 @@ def _convert_snapshot(
         # Legacy rows remain authoritative until Gold fingerprints validate;
         # replay can safely recreate missing directory entries after a crash.
         durable_sync=False,
+        presorted=True,
     )
     return True
+
+
+def _convert_versioned_parquet_snapshot(  # noqa: C901, PLR0913, PLR0917
+    runtime: PostgresEodhdBootstrapRuntime,
+    layout: MedallionLayout,
+    layer: Layer,
+    dataset: str,
+    manifest: Mapping[str, object],
+    manifest_path: Path,
+    partition_sources: list[Path],
+) -> bool:
+    """Convert old one-instrument files with memory bounded to one partition."""
+
+    run_metadata = manifest.get("run_metadata")
+    if not isinstance(run_metadata, dict):
+        raise ValueError(f"legacy {layer.value}/{dataset} manifest has no run metadata")
+    row_count = 0
+    expected_schema: tuple[str, ...] | None = None
+    staged: dict[tuple[str, ...], list[Path]] = {}
+    sort_columns = ["exchange", "code"]
+    if dataset != "listings":
+        sort_columns.append("trade_date" if dataset == "eod_quotes" else "event_date")
+    sort_columns.append("isin")
+    temporary_parent = layout.root.parent.parent / ".xdl-snapshot-migration-tmp"
+    temporary_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(
+        prefix="xdl-snapshot-migration-",
+        dir=temporary_parent,
+    ) as temporary_root:
+        stage_root = Path(temporary_root)
+        chunk_number = 0
+        for source_index, source in enumerate(partition_sources, start=1):
+            frame = pl.read_parquet(source, low_memory=True)
+            if frame.height == 0:
+                continue
+            schema = tuple(sorted(frame.columns))
+            if expected_schema is None:
+                expected_schema = schema
+            elif schema != expected_schema:
+                raise ValueError(
+                    f"legacy {layer.value}/{dataset} partitions have inconsistent schemas"
+                )
+            row_count += frame.height
+            ordered = frame.sort(sort_columns)
+            for key, group in groupby(
+                _frame_rows(ordered, dataset=dataset, presorted=True),
+                key=lambda row: _snapshot_partition_key(layer, dataset, row),
+            ):
+                chunk_path = stage_root / f"{chunk_number:08d}.parquet"
+                write_parquet_rows(
+                    chunk_path,
+                    group,
+                    sync_file=False,
+                    sync_directory=False,
+                )
+                staged.setdefault(key, []).append(chunk_path)
+                chunk_number += 1
+            if source_index % 1_000 == 0 or source_index == len(partition_sources):
+                print(
+                    canonical_json(
+                        {
+                            "stage": "snapshot-partition-staging",
+                            "dataset": dataset,
+                            "layer": layer.value,
+                            "source_partitions_completed": source_index,
+                            "source_partitions_total": len(partition_sources),
+                            "rows_read": row_count,
+                        }
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        if expected_schema is None:
+            if not manifest_path.exists():
+                raise FileNotFoundError(f"missing {layer.value} snapshot partitions")
+
+        def staged_rows() -> Iterator[dict[str, JSONValue]]:
+            for key in sorted(staged):
+                chunks = staged[key]
+                frame = (
+                    pl.scan_parquet([str(path) for path in chunks])
+                    .sort(sort_columns)
+                    .collect(engine="streaming")
+                )
+                yield from _frame_rows(frame, dataset=dataset, presorted=True)
+
+        if layer is Layer.GOLD:
+            semantic_metadata, retractions = _gold_migration_metadata(
+                layout,
+                dataset,
+                manifest,
+                row_count,
+                manifest_path,
+            )
+        else:
+            semantic_metadata = {"row_count": row_count}
+            retractions = None
+        runtime._persist_partitioned_snapshot(
+            layer,
+            dataset,
+            staged_rows(),
+            snapshot=SnapshotWrite(
+                semantic_metadata=semantic_metadata,
+                retractions=retractions,
+            ),
+            durable_sync=False,
+            presorted=True,
+        )
+    return True
+
+
+def _snapshot_partition_key(
+    layer: Layer,
+    dataset: str,
+    row: Mapping[str, JSONValue],
+) -> tuple[str, ...]:
+    if layer is Layer.SILVER:
+        exchange, symbol, year = _silver_partition_key(dataset, row)
+        return exchange, symbol, f"{year:04d}"
+    exchange = row.get("exchange")
+    symbol = row.get("code")
+    if (
+        not isinstance(exchange, str)
+        or not exchange
+        or not isinstance(symbol, str)
+        or not symbol
+    ):
+        raise ValueError(f"Gold {dataset} row has an incomplete symbol identity")
+    return exchange, symbol
 
 
 def _canonical_snapshot_ready(
@@ -423,6 +605,7 @@ def _validate_canonical_lake(root: Path) -> int:
     """Reject any row artifact left outside the goal's canonical lake layout."""
 
     row_artifact_count = 0
+    canonical_snapshot_artifacts: set[str] = set()
     invalid_paths: list[str] = []
     for artifact in root.rglob("*.parquet"):
         relative = PurePosixPath(artifact.relative_to(root).as_posix())
@@ -439,12 +622,28 @@ def _validate_canonical_lake(root: Path) -> int:
         )
         if layer_is_canonical:
             row_artifact_count += 1
+            if relative.parts[0] in {Layer.SILVER.value, Layer.GOLD.value}:
+                canonical_snapshot_artifacts.add(relative.as_posix())
         elif len(invalid_paths) < 10:
             invalid_paths.append(relative.as_posix())
     if invalid_paths:
         raise ValueError(
             "non-canonical Parquet row artifacts remain in the lake: "
             + ", ".join(invalid_paths)
+        )
+
+    referenced_artifacts = set(_canonical_snapshot_references(root))
+    orphaned_artifacts = canonical_snapshot_artifacts - referenced_artifacts
+    if orphaned_artifacts:
+        raise ValueError(
+            "canonical Silver/Gold artifacts are not referenced by a manifest: "
+            + ", ".join(sorted(orphaned_artifacts)[:10])
+        )
+    orphaned_sidecars = _unreferenced_snapshot_sidecars(root)
+    if orphaned_sidecars:
+        raise ValueError(
+            "unreferenced Gold retraction sidecars remain in the lake: "
+            + ", ".join(path.relative_to(root).as_posix() for path in orphaned_sidecars[:10])
         )
 
     legacy_rows = [
@@ -462,6 +661,95 @@ def _validate_canonical_lake(root: Path) -> int:
             + ", ".join(legacy_rows[:10])
         )
     return row_artifact_count
+
+
+def _canonical_snapshot_references(root: Path) -> dict[str, str]:  # noqa: C901, PLR0912
+    """Load and validate the authoritative Silver/Gold manifest artifact set."""
+
+    referenced: dict[str, str] = {}
+    resolved_root = root.resolve()
+    for layer in (Layer.SILVER, Layer.GOLD):
+        metadata_root = root / layer.value / "_metadata"
+        for manifest_path in sorted(metadata_root.rglob("manifest.json")):
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict) or manifest.get("layer") != layer.value:
+                raise ValueError(f"invalid canonical {layer.value} manifest: {manifest_path}")
+            dataset = manifest.get("dataset")
+            run_metadata = manifest.get("run_metadata")
+            artifact_paths = (
+                run_metadata.get("artifact_paths") if isinstance(run_metadata, dict) else None
+            )
+            if not isinstance(dataset, str) or not isinstance(artifact_paths, list):
+                raise ValueError(f"invalid canonical {layer.value} manifest: {manifest_path}")
+            owner = f"{layer.value}/{dataset}"
+            for artifact_path in artifact_paths:
+                if not isinstance(artifact_path, str):
+                    raise ValueError(f"invalid artifact path in {manifest_path}")
+                relative = PurePosixPath(artifact_path)
+                if not _canonical_snapshot_path(layer, relative):
+                    raise ValueError(f"non-canonical artifact path in {manifest_path}")
+                resolved_artifact = (root / Path(*relative.parts)).resolve()
+                if (
+                    resolved_root not in resolved_artifact.parents
+                    or not resolved_artifact.is_file()
+                ):
+                    raise ValueError(f"missing or unsafe artifact in {manifest_path}")
+                previous_owner = referenced.get(relative.as_posix())
+                if previous_owner is not None:
+                    raise ValueError(
+                        f"duplicate canonical artifact reference: {relative} "
+                        f"({previous_owner}, {owner})"
+                    )
+                referenced[relative.as_posix()] = owner
+            retractions_path = run_metadata.get("retractions_path")
+            if retractions_path is not None:
+                expected_retractions = (
+                    PurePosixPath("gold")
+                    / "_metadata"
+                    / f"dataset_type={dataset}"
+                    / "retractions.parquet"
+                )
+                if (
+                    layer is not Layer.GOLD
+                    or dataset not in {"dividends", "splits"}
+                    or not isinstance(retractions_path, str)
+                    or PurePosixPath(retractions_path) != expected_retractions
+                ):
+                    raise ValueError(f"invalid Gold retraction sidecar path in {manifest_path}")
+                resolved_sidecar = (root / Path(*expected_retractions.parts)).resolve()
+                if resolved_root not in resolved_sidecar.parents or not resolved_sidecar.is_file():
+                    raise ValueError(f"missing or unsafe retraction sidecar in {manifest_path}")
+                if expected_retractions.as_posix() in referenced:
+                    raise ValueError(
+                        f"duplicate canonical artifact reference: {expected_retractions}"
+                    )
+                referenced[expected_retractions.as_posix()] = owner
+    return referenced
+
+
+def _unreferenced_canonical_artifacts(root: Path) -> list[Path]:
+    """Find stale canonical snapshots so the recoverable archive can remove duplicates."""
+
+    referenced = set(_canonical_snapshot_references(root))
+    orphaned: list[Path] = []
+    for layer in (Layer.SILVER, Layer.GOLD):
+        for artifact in (root / layer.value).rglob("*.parquet"):
+            relative = PurePosixPath(artifact.relative_to(root).as_posix())
+            if _canonical_snapshot_path(layer, relative) and relative.as_posix() not in referenced:
+                orphaned.append(artifact)
+    return sorted(orphaned)
+
+
+def _unreferenced_snapshot_sidecars(root: Path) -> list[Path]:
+    """Find retraction Parquets not owned by a current Gold manifest."""
+
+    referenced = set(_canonical_snapshot_references(root))
+    metadata_root = root / Layer.GOLD.value / "_metadata"
+    return sorted(
+        path
+        for path in metadata_root.rglob("retractions.parquet")
+        if path.is_file() and path.relative_to(root).as_posix() not in referenced
+    )
 
 
 def _gold_migration_metadata(
@@ -522,11 +810,24 @@ def _legacy_artifact(path: Path, root: Path) -> bool:
     )
 
 
-def _archive_legacy_artifacts(root: Path, backup_root: Path) -> int:
-    sources = (path for path in root.rglob("*") if path.is_file() and _legacy_artifact(path, root))
+def _archive_legacy_artifacts(
+    root: Path,
+    backup_root: Path,
+    *,
+    additional_sources: Iterable[Path] = (),
+) -> int:
+    resolved_root = root.resolve()
+    sources = {
+        path for path in root.rglob("*") if path.is_file() and _legacy_artifact(path, root)
+    }
+    for path in additional_sources:
+        resolved_path = path.resolve()
+        if resolved_root not in resolved_path.parents or not resolved_path.is_file():
+            raise ValueError(f"additional archive source is outside the lake: {path}")
+        sources.add(resolved_path)
     source_count = 0
     actual_backup: Path | None = None
-    for source in sources:
+    for source in sorted(sources):
         if actual_backup is None:
             actual_backup = backup_root
             actual_backup.mkdir(parents=True, mode=0o700, exist_ok=False)
@@ -539,11 +840,17 @@ def _archive_legacy_artifacts(root: Path, backup_root: Path) -> int:
     return source_count
 
 
-def migrate_lake(root: Path, backup_root: Path) -> dict[str, JSONValue]:
+def migrate_lake(
+    root: Path,
+    backup_root: Path,
+    *,
+    cores: int | None = None,
+) -> dict[str, JSONValue]:
     """Publish and validate Parquet snapshots before moving JSON originals to backup."""
 
     resolved_root = root.resolve()
     resolved_backup_root = backup_root.resolve()
+    worker_count = resolve_cores(cores)
     if not resolved_root.is_dir() or not all(
         (resolved_root / layer.value).is_dir() for layer in Layer
     ):
@@ -552,13 +859,21 @@ def migrate_lake(root: Path, backup_root: Path) -> dict[str, JSONValue]:
         raise ValueError("JSON backup root must be outside the lake root")
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = MedallionLayout(resolved_root)
-    with LoaderLock(resolved_root / "weekly.lock"):
-        bronze_partitions = _convert_bronze_partitions(resolved_root)
+    # The canonical weekly pipeline and the destructive full-refresh verifier
+    # use different locks. Hold both while rewriting lake artifacts so neither
+    # scheduler path can publish into the same tree concurrently.
+    with LoaderLock(resolved_root / "authoritative-rewrite.lock"), LoaderLock(
+        resolved_root / "weekly.lock"
+    ):
+        bronze_partitions = _convert_bronze_partitions(
+            resolved_root,
+            cores=worker_count,
+        )
         converted_snapshots = 0
         for dataset in DATASETS:
             for layer in (Layer.SILVER, Layer.GOLD):
                 converted_snapshots += int(
-                _convert_snapshot(runtime, runtime._layout, layer, dataset)
+                    _convert_snapshot(runtime, runtime._layout, layer, dataset)
                 )
                 print(
                     canonical_json(
@@ -573,24 +888,27 @@ def migrate_lake(root: Path, backup_root: Path) -> dict[str, JSONValue]:
                     flush=True,
                 )
 
-        snapshots = load_gold_snapshots(resolved_root)
-        invalid = [
-            dataset for dataset, snapshot in snapshots.items() if not snapshot.fingerprint_valid
-        ]
-        if invalid:
-            raise ValueError(f"Parquet Gold fingerprint validation failed: {', '.join(invalid)}")
+        validated_datasets = validate_gold_fingerprints_streaming(resolved_root)
 
+        orphaned_artifacts = _unreferenced_canonical_artifacts(resolved_root)
+        orphaned_sidecars = _unreferenced_snapshot_sidecars(resolved_root)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         actual_backup = resolved_backup_root / stamp
-        archived = _archive_legacy_artifacts(resolved_root, actual_backup)
+        archived = _archive_legacy_artifacts(
+            resolved_root,
+            actual_backup,
+            additional_sources=(*orphaned_artifacts, *orphaned_sidecars),
+        )
         canonical_row_artifacts = _validate_canonical_lake(resolved_root)
         return {
             "status": "PASS",
             "root": str(resolved_root),
             "bronze_parquet_artifacts": bronze_partitions,
             "silver_gold_snapshots": converted_snapshots,
-            "datasets_fingerprint_valid": len(snapshots),
+            "datasets_fingerprint_valid": validated_datasets,
             "legacy_artifacts_archived": archived,
+            "orphaned_canonical_artifacts_archived": len(orphaned_artifacts),
+            "orphaned_retraction_sidecars_archived": len(orphaned_sidecars),
             "recovery_backup": str(actual_backup) if archived else None,
             "canonical_row_artifacts": canonical_row_artifacts,
         }
@@ -604,12 +922,23 @@ def _parser() -> argparse.ArgumentParser:
         default="/home/dev_xetra/.xdl-lake-recovery-backups",
         help="Private parent directory for recoverable legacy lake artifacts",
     )
+    parser.add_argument(
+        "--cores",
+        type=int,
+        default=None,
+        help="CPU budget for Polars and independent migration tasks (default: config or 6)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    result = migrate_lake(Path(resolve_medallion_root(args.root)), Path(args.backup_root))
+    cores = resolve_cores(args.cores)
+    result = migrate_lake(
+        Path(resolve_medallion_root(args.root)),
+        Path(args.backup_root),
+        cores=cores,
+    )
     print(canonical_json(result))
     return 0
 

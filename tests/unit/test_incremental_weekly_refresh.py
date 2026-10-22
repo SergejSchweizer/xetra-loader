@@ -20,7 +20,12 @@ from xetra_loader.ops.bootstrap import (
     FetchMetrics,
     PostgresEodhdBootstrapRuntime,
 )
-from xetra_loader.pipeline.runtime import _replace_action_window, _WeeklyState, build_weekly_stages
+from xetra_loader.pipeline.runtime import (
+    _parallel_database_core_budgets,
+    _replace_action_window,
+    _WeeklyState,
+    build_weekly_stages,
+)
 
 
 def _quote(day: int, close: str) -> QuoteRecord:
@@ -217,10 +222,15 @@ def test_weekly_corporate_actions_fetch_complete_history(tmp_path: Path) -> None
 def test_weekly_stages_quarantine_invalid_provider_ohlc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, bool] = {}
+    captured: dict[str, bool | int] = {}
 
-    def from_environment(*, quarantine_invalid_ohlc: bool = False) -> object:
+    def from_environment(
+        *,
+        quarantine_invalid_ohlc: bool = False,
+        cores: int | None = None,
+    ) -> object:
         captured["quarantine_invalid_ohlc"] = quarantine_invalid_ohlc
+        captured["cores"] = cores or 0
         return object()
 
     monkeypatch.setattr(
@@ -228,6 +238,23 @@ def test_weekly_stages_quarantine_invalid_provider_ohlc(
         from_environment,
     )
 
-    build_weekly_stages()
+    build_weekly_stages(cores=4)
 
-    assert captured == {"quarantine_invalid_ohlc": True}
+    assert captured == {"quarantine_invalid_ohlc": True, "cores": 4}
+
+
+@pytest.mark.parametrize(
+    ("cores", "expected"),
+    [(1, (1, 1)), (2, (1, 1)), (3, (2, 1)), (6, (3, 3)), (7, (4, 3))],
+)
+def test_parallel_database_queries_share_the_configured_cpu_budget(
+    cores: int,
+    expected: tuple[int, int],
+) -> None:
+    budgets = _parallel_database_core_budgets(cores)
+
+    assert budgets == expected
+    if cores == 1:
+        assert budgets == (1, 1)  # one executor thread runs these serially
+    else:
+        assert sum(budgets) == cores

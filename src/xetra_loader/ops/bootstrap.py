@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from itertools import groupby
+from itertools import chain, groupby
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.request import Request, urlopen
@@ -179,7 +180,7 @@ class BootstrapRuntime(Protocol):
     """Provider, persistence, publication, and verification boundary for bootstrap."""
 
     def reset_owned_state(self) -> None: ...
-    def database_worker(self) -> BootstrapRuntime: ...
+    def database_worker(self, *, cores: int | None = None) -> BootstrapRuntime: ...
     def fetch_listings(self) -> FetchBatch[ListingRecord]: ...
     def fetch_quotes(
         self,
@@ -544,7 +545,7 @@ class _MeasuredTransport:
 class PostgresEodhdBootstrapRuntime:
     """Concrete EODHD + medallion + PostgreSQL implementation for production bootstrap."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - dependency/configuration injection boundary
         self,
         *,
         connection: Connection[Any],
@@ -552,12 +553,14 @@ class PostgresEodhdBootstrapRuntime:
         medallion_root: Path,
         repository_root: Path,
         quarantine_invalid_ohlc: bool = False,
+        cores: int | None = None,
     ) -> None:
         self._connection = connection
         self._transport = transport
         self._layout = MedallionLayout(medallion_root.resolve())
         self._repository_root = repository_root.resolve()
         self._quarantine_invalid_ohlc = quarantine_invalid_ohlc
+        self._cores = resolve_cores(cores)
         self._owns_connection = True
 
     @classmethod
@@ -565,14 +568,17 @@ class PostgresEodhdBootstrapRuntime:
         cls,
         *,
         quarantine_invalid_ohlc: bool = False,
+        cores: int | None = None,
     ) -> PostgresEodhdBootstrapRuntime:
+        worker_count = resolve_cores(cores)
         root = resolve_medallion_root()
         return cls(
-            connection=connect_postgres(require_non_superuser=True),
+            connection=connect_postgres(require_non_superuser=True, cores=worker_count),
             transport=_MeasuredTransport(),
             medallion_root=Path(root),
             repository_root=Path.cwd(),
             quarantine_invalid_ohlc=quarantine_invalid_ohlc,
+            cores=worker_count,
         )
 
     @classmethod
@@ -580,14 +586,17 @@ class PostgresEodhdBootstrapRuntime:
         cls,
         *,
         quarantine_invalid_ohlc: bool = False,
+        cores: int | None = None,
     ) -> PostgresEodhdBootstrapRuntime:
+        worker_count = resolve_cores(cores)
         root = resolve_medallion_root()
         return cls(
-            connection=connect_postgres(admin=True),
+            connection=connect_postgres(admin=True, cores=worker_count),
             transport=_MeasuredTransport(),
             medallion_root=Path(root),
             repository_root=Path.cwd(),
             quarantine_invalid_ohlc=quarantine_invalid_ohlc,
+            cores=worker_count,
         )
 
     def reset_owned_state(self) -> None:
@@ -613,19 +622,26 @@ class PostgresEodhdBootstrapRuntime:
             medallion_root=self._layout.root,
             repository_root=self._repository_root,
             quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
+            cores=self._cores,
         )
         worker._owns_connection = False
         return worker
 
-    def database_worker(self) -> PostgresEodhdBootstrapRuntime:
+    def database_worker(
+        self,
+        *,
+        cores: int | None = None,
+    ) -> PostgresEodhdBootstrapRuntime:
         """Return a publication worker with an independent writer connection."""
 
+        worker_count = resolve_cores(cores) if cores is not None else self._cores
         return type(self)(
-            connection=connect_postgres(require_non_superuser=True),
+            connection=connect_postgres(require_non_superuser=True, cores=worker_count),
             transport=self._transport.clone(),
             medallion_root=self._layout.root,
             repository_root=self._repository_root,
             quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
+            cores=worker_count,
         )
 
     def fetch_listings(self) -> FetchBatch[ListingRecord]:
@@ -929,7 +945,7 @@ class PostgresEodhdBootstrapRuntime:
                 sorted(rows, key=lambda row: canonical_json(cast(JSONValue, dict(row)))),
             )
 
-    def _persist_partitioned_snapshot(
+    def _persist_partitioned_snapshot(  # noqa: PLR0913 - explicit persistence policy inputs
         self,
         layer: Layer,
         dataset: str,
@@ -937,15 +953,16 @@ class PostgresEodhdBootstrapRuntime:
         *,
         snapshot: SnapshotWrite,
         durable_sync: bool = True,
+        presorted: bool = False,
     ) -> None:
         """Write canonical Parquet artifacts and atomically publish their manifest."""
 
-        materialized = [dict(row) for row in rows]
         artifact_paths = self._write_canonical_snapshot(
             layer,
             dataset,
-            materialized,
+            rows,
             durable_sync=durable_sync,
+            presorted=presorted,
         )
         semantic_metadata = dict(snapshot.semantic_metadata)
         if layer is Layer.GOLD:
@@ -982,20 +999,22 @@ class PostgresEodhdBootstrapRuntime:
         self,
         layer: Layer,
         dataset: str,
-        rows: Sequence[Mapping[str, JSONValue]],
+        rows: Iterable[Mapping[str, JSONValue]],
         *,
         durable_sync: bool = True,
+        presorted: bool = False,
     ) -> list[str]:
-        """Publish current Parquet rows in the canonical Hive-partitioned layout."""
+        """Publish canonical partitions, buffering at most one partition at a time."""
 
-        ordered = sorted(rows, key=lambda row: _snapshot_sort_key(dataset, row))
         artifact_paths: list[str] = []
-        jobs: list[tuple[Path, list[dict[str, JSONValue]]]] = []
+        ordered = (
+            iter(rows)
+            if presorted
+            else iter(sorted(rows, key=lambda row: _snapshot_sort_key(dataset, row)))
+        )
         if layer is Layer.SILVER:
-            for (exchange, symbol, year), group in groupby(
-                ordered,
-                key=lambda row: _silver_partition_key(dataset, row),
-            ):
+            groups = groupby(ordered, key=lambda row: _silver_partition_key(dataset, row))
+            for (exchange, symbol, year), group in groups:
                 path = self._layout.silver_path(
                     SilverPartition(
                         dataset_type=dataset,
@@ -1005,10 +1024,19 @@ class PostgresEodhdBootstrapRuntime:
                         year=year,
                     )
                 )
-                jobs.append((path, [dict(row) for row in group]))
+                write_parquet_rows(
+                    path,
+                    (dict(row) for row in group),
+                    sync_file=durable_sync,
+                    sync_directory=durable_sync,
+                )
+                artifact_paths.append(path.relative_to(self._layout.root).as_posix())
         elif layer is Layer.GOLD:
             feature_set_version = "v1.0.0"
-            schema = sorted({column for row in ordered for column in row})
+            first_row = next(ordered, None)
+            if first_row is None:
+                return []
+            schema = sorted(first_row)
             feature_hash = hashlib.sha256(
                 canonical_json(
                     {
@@ -1019,41 +1047,37 @@ class PostgresEodhdBootstrapRuntime:
                 ).encode("utf-8")
             ).hexdigest()
             dataset_id = _gold_dataset_id(dataset)
-            for (exchange, symbol), group in groupby(
-                ordered,
+            gold_groups = groupby(
+                chain((first_row,), ordered),
                 key=lambda row: (str(row.get("exchange", "")), str(row.get("code", ""))),
-            ):
+            )
+            for (exchange, symbol), group in gold_groups:
                 if not exchange or not symbol:
                     raise ValueError(f"Gold {dataset} row has an incomplete symbol identity")
                 symbol_rows = [dict(row) for row in group]
+                if any(sorted(row) != schema for row in symbol_rows):
+                    raise ValueError(f"Gold {dataset} rows do not share a stable schema")
                 source_hash = hashlib.sha256(
                     canonical_json(cast(JSONValue, symbol_rows)).encode("utf-8")
                 ).hexdigest()
-                jobs.append(
-                    (
-                        self._layout.gold_path(
-                            GoldArtifact(
-                                dataset_id=dataset_id,
-                                exchange=exchange,
-                                symbol=symbol,
-                                feature_hash=feature_hash,
-                                source_hash=source_hash,
-                            )
-                        ),
-                        symbol_rows,
+                path = self._layout.gold_path(
+                    GoldArtifact(
+                        dataset_id=dataset_id,
+                        exchange=exchange,
+                        symbol=symbol,
+                        feature_hash=feature_hash,
+                        source_hash=source_hash,
                     )
                 )
+                write_parquet_rows(
+                    path,
+                    symbol_rows,
+                    sync_file=durable_sync,
+                    sync_directory=durable_sync,
+                )
+                artifact_paths.append(path.relative_to(self._layout.root).as_posix())
         else:
             raise ValueError("canonical snapshots support only Silver and Gold")
-
-        for path, partition_rows in jobs:
-            write_parquet_rows(
-                path,
-                partition_rows,
-                sync_file=durable_sync,
-                sync_directory=durable_sync,
-            )
-            artifact_paths.append(path.relative_to(self._layout.root).as_posix())
         return sorted(artifact_paths)
 
     def _write_layer(self, layer: Layer, dataset: str, payload: JSONValue) -> None:
@@ -1174,6 +1198,12 @@ def _bounds(values: Iterable[date]) -> tuple[date | None, date | None]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="xdl-bootstrap")
     parser.add_argument("--confirm-destructive-reset", action="store_true")
+    parser.add_argument(
+        "--cores",
+        type=int,
+        default=None,
+        help="CPU budget for Polars, PostgreSQL, and independent downloads (default: config or 6)",
+    )
     return parser
 
 
@@ -1185,14 +1215,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(canonical_json({"status": "BLOCKED", "reason": "confirmation-required"}))
         return 2
 
-    runtime = PostgresEodhdBootstrapRuntime.from_admin_environment()
+    cores = resolve_cores(args.cores)
+    os.environ["POLARS_MAX_THREADS"] = str(cores)
+    os.environ["XDL_CORES"] = str(cores)
+    runtime = PostgresEodhdBootstrapRuntime.from_admin_environment(cores=cores)
     try:
         result = run_full_bootstrap(
             runtime,
             confirmed=True,
             reset_owned_state=True,
             parallel_runtime_factory=runtime.fetch_worker,
-            max_workers=resolve_cores(),
+            max_workers=cores,
         )
     finally:
         runtime.close()

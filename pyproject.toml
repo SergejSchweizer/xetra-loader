@@ -20,9 +20,9 @@ dependencies = [
 xdl-weekly = "xetra_loader.pipeline.runner:main"
 xdl-api = "xetra_loader.api.runner:main"
 xdl-enqueue-weekly = "xetra_loader.api.enqueue:main"
-xdl-bootstrap = "xetra_loader.ops.bootstrap:main"
+xdl-bootstrap = "xetra_loader.ops.bootstrap_cli:main"
 xdl-migrate = "xetra_loader.ops.migrate:main"
-xdl-verify-production-sync = "xetra_loader.ops.verify_postgres_sync:main"
+xdl-verify-production-sync = "xetra_loader.ops.verify_cli:main"
 
 [project.optional-dependencies]
 dev = [

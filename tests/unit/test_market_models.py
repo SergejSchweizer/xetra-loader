@@ -3,16 +3,18 @@ from decimal import Decimal
 
 import pytest
 
-from xetra_loader.market import DividendRow, ListingRow, QuoteRow
+from xetra_loader.contracts.corporate_actions import DividendEvent
+from xetra_loader.contracts.listings import ListingRecord
+from xetra_loader.contracts.quotes import QuoteRecord
 
 
 def test_listing_contract_carries_active_lifecycle_state() -> None:
-    assert ListingRow("DE0000000001", "XETRA", "AAA", is_active=False).is_active is False
+    assert ListingRecord("DE0000000001", "XETRA", "AAA", is_active=False).is_active is False
 
 
 def test_quote_rejects_invalid_ohlc_order() -> None:
     with pytest.raises(ValueError, match="between low and high"):
-        QuoteRow(
+        QuoteRecord(
             isin="DE0000000001",
             exchange="XETRA",
             code="AAA",
@@ -27,7 +29,7 @@ def test_quote_rejects_invalid_ohlc_order() -> None:
 
 
 def test_event_contract_generates_a_sha256_identity() -> None:
-    event = DividendRow(
+    event = DividendEvent(
         isin="DE0000000001",
         exchange="XETRA",
         code="AAA",

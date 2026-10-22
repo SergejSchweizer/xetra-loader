@@ -12,7 +12,7 @@ DSN = os.getenv("XDL_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.integration
 
 _IDENTITY_COLUMNS = ("isin", "exchange", "code", "trade_date")
-_EXPECTED_COLUMNS = _IDENTITY_COLUMNS + feature_columns()
+_EXPECTED_COLUMNS = _IDENTITY_COLUMNS + ("available_at_utc",) + feature_columns()
 
 
 def _apply_sql(path: str) -> None:
@@ -92,7 +92,8 @@ def test_feature_schema_catalog_grants_and_types(tmp_path: Path) -> None:
         ),
         "identity_types": columns[:4]
         == ["isin:text", "exchange:text", "code:text", "trade_date:date"],
-        "base_level_types": columns[4:6] == [
+        "availability_type": columns[4] == "available_at_utc:timestamp with time zone",
+        "base_level_types": columns[5:7] == [
             "adjusted_close_level:double precision",
             "volume_level:double precision",
         ],

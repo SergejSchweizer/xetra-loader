@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+import xetra_loader.ops.bootstrap as bootstrap_module
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.contracts.quotes import QuoteRecord
@@ -182,6 +184,7 @@ def test_fetch_worker_cannot_close_the_parent_database_connection(tmp_path: Path
     runtime._layout = MedallionLayout(tmp_path)
     runtime._repository_root = tmp_path
     runtime._quarantine_invalid_ohlc = False
+    runtime._cores = 6
 
     worker = runtime.fetch_worker()
     worker.close()
@@ -225,3 +228,55 @@ def test_clean_full_universe_bootstrap_then_unchanged_replay_is_noop() -> None:
     assert "reset" not in runtime.calls
     assert all(outcome.status == "noop" for outcome in replay.sync_outcomes.values())
     assert all(outcome.counters.total_mutations == 0 for outcome in replay.sync_outcomes.values())
+
+
+def test_bootstrap_cli_passes_core_budget_to_runtime_and_fetch_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for name in ("POLARS_MAX_THREADS", "XDL_CORES"):
+        if name in os.environ:
+            monkeypatch.setenv(name, os.environ[name])
+        else:
+            monkeypatch.delenv(name, raising=False)
+    observed: dict[str, object] = {}
+
+    class CloseableRuntime:
+        def fetch_worker(self) -> CloseableRuntime:
+            return self
+
+        def close(self) -> None:
+            observed["closed"] = True
+
+    class Result:
+        def as_dict(self) -> dict[str, str]:
+            return {"status": "PASS"}
+
+    runtime = CloseableRuntime()
+
+    def make_runtime(
+        cls: type[PostgresEodhdBootstrapRuntime],
+        **kwargs: object,
+    ) -> CloseableRuntime:
+        del cls
+        observed["runtime_cores"] = kwargs["cores"]
+        return runtime
+
+    def run_bootstrap(
+        selected_runtime: object,
+        **kwargs: object,
+    ) -> Result:
+        assert selected_runtime is runtime
+        observed["max_workers"] = kwargs["max_workers"]
+        return Result()
+
+    monkeypatch.setattr(
+        PostgresEodhdBootstrapRuntime,
+        "from_admin_environment",
+        classmethod(make_runtime),
+    )
+    monkeypatch.setattr(bootstrap_module, "run_full_bootstrap", run_bootstrap)
+
+    assert bootstrap_module.main(["--confirm-destructive-reset", "--cores", "4"]) == 0
+    assert observed == {"runtime_cores": 4, "max_workers": 4, "closed": True}
+    assert '"status":"PASS"' in capsys.readouterr().out
