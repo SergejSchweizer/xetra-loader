@@ -11,7 +11,6 @@ from xetra_loader.config import (
     resolve_feature_work_mem,
     resolve_medallion_root,
     resolve_postgres_admin_dsn,
-    resolve_postgres_dsn,
     resolve_postgres_writer_dsn,
 )
 
@@ -49,8 +48,9 @@ def test_ignored_yaml_config_resolves_loader_values(
     monkeypatch.delenv("XDL_MEDALLION_ROOT", raising=False)
 
     assert resolve_eodhd_token() == "file-token"
-    assert resolve_postgres_dsn() == ("postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market")
-    assert resolve_postgres_writer_dsn() == resolve_postgres_dsn()
+    assert resolve_postgres_writer_dsn() == (
+        "postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market"
+    )
     assert resolve_postgres_admin_dsn() == (
         "postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market"
     )
@@ -66,14 +66,36 @@ def test_environment_values_override_yaml_config(
     _write_config(config_path)
     monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
     monkeypatch.setenv("EODHD_API_TOKEN", "env-token")
-    monkeypatch.setenv("XDL_POSTGRES_DSN", "postgresql://env-dsn")
+    monkeypatch.setenv("XDL_POSTGRES_WRITER_DSN", "postgresql://writer-env-dsn")
     monkeypatch.setenv("XDL_POSTGRES_ADMIN_DSN", "postgresql://admin-dsn")
     monkeypatch.setenv("XDL_MEDALLION_ROOT", "/env/medallion")
 
     assert resolve_eodhd_token() == "env-token"
-    assert resolve_postgres_dsn() == "postgresql://env-dsn"
+    assert resolve_postgres_writer_dsn() == "postgresql://writer-env-dsn"
     assert resolve_postgres_admin_dsn() == "postgresql://admin-dsn"
     assert resolve_medallion_root() == "/env/medallion"
+
+
+def test_retired_writer_dsn_fallback_is_ignored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "  database: market\n",
+            "  database: market\n  dsn: postgresql://retired-config-dsn\n",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
+    monkeypatch.delenv("XDL_POSTGRES_WRITER_DSN", raising=False)
+    monkeypatch.setenv("XDL_POSTGRES_DSN", "postgresql://retired-env-dsn")
+
+    assert resolve_postgres_writer_dsn() == (
+        "postgresql://loader:p%40ss%2Fword@127.0.0.1:6543/market"
+    )
 
 
 @pytest.mark.parametrize("value", ["15MB", "5GB", "0MB", "512", "not-a-size"])

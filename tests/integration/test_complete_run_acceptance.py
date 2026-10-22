@@ -381,7 +381,14 @@ def test_complete_gold_postgres_feature_acceptance(tmp_path: Path) -> None:
             "feature_identity_matches_quotes": set(before_replay)
             == {(row.code, row.trade_date) for row in fixture},
             "feature_columns_are_catalog_exact": columns
-            == ("isin", "exchange", "code", "trade_date", *feature_columns()),
+            == (
+                "isin",
+                "exchange",
+                "code",
+                "trade_date",
+                "available_at_utc",
+                *feature_columns(),
+            ),
             "forbidden_ohlc_levels_absent": not {
                 "open_level",
                 "high_level",

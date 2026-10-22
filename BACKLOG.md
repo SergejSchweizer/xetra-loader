@@ -1,6 +1,6 @@
 # XETRA Data Loader — Backlog Archive
 
-Last reviewed: 2026-10-20
+Last reviewed: 2026-10-22
 
 ## Contents
 
@@ -22,17 +22,24 @@ migrations, and executable tests rather than these retired plans.
 
 - EODHD market data flows through Bronze, Silver, and Gold datasets and is
   published to PostgreSQL raw tables.
-- The serving object is `xetra_loader.xetra_features`, a materialized view
-  keyed by `(isin, exchange, code, trade_date)`. Its only base levels are
-  `adjusted_close_level` and `volume_level`; OHLC values are internal inputs
-  only for the approved intraday-derived features.
-- Market-data artifacts across the lake use Polars-written Parquet. JSON
-  manifests and restart/checkpoint files remain control metadata.
-- The Sunday 11:00 Vienna cron enqueues a durable PostgreSQL job consumed by
-  the event-driven worker inside the resident API process; the CPU budget is
-  six cores by default.
-- The feature materialization has 104 columns: four identities, two base
-  levels, and 98 catalog-derived features.
+- The serving contract is `xetra_loader.xetra_features`, a materialized view
+  keyed by `(isin, exchange, code, trade_date)`. It includes
+  `available_at_utc`, the next weekday at midnight UTC; exchange holidays are
+  not modeled. Its only base levels are `adjusted_close_level` and
+  `volume_level`; OHLC values are internal inputs only for approved derived
+  features. The complete view contains 105 columns: four identities,
+  availability, two levels, and 98 derived feature columns.
+- The runtime writes market-data artifacts as Polars-written Parquet. The
+  one-time migration completed after validating Gold fingerprints; retired
+  source artifacts were archived outside the lake. JSON manifests and
+  restart/checkpoint files remain control metadata.
+- The repository cron artifact schedules Sunday 11:00 Vienna and enqueues a
+  durable PostgreSQL job for the in-process API worker. The current host
+  crontab instead runs a full historical refresh Saturday at 09:00 and copies
+  Gold to `/volume1/Temp/Quotes` Sunday at 22:00; the API service is not
+  installed. The CPU budget is six cores by default.
+- The repository feature-view contract has 105 columns: four identities, one
+  availability column, two base levels, and 98 catalog-derived features.
 - PostgreSQL access follows least privilege; credentials are provisioned
   outside tracked repository files.
 
@@ -41,7 +48,7 @@ migrations, and executable tests rather than these retired plans.
 | PRs | Condensed scope | Last recorded disposition |
 | --- | --- | --- |
 | PR001–PR028 | Repository/CI foundations, PostgreSQL schema and roles, medallion/data contracts, EODHD ingestion, Gold builds, transactional sync, orchestration and restart safety | Merged |
-| PR029 | Historical Sunday 11:00 scheduler | Merged; superseded by the later Sunday 08:00 schedule contract |
+| PR029 | Historical Sunday 11:00 scheduler | Merged; the current repository schedule is Sunday 11:00 Europe/Vienna (`deploy/cron/xetra-loader.cron`) |
 | PR030–PR032 | Destructive-operation guard, full XETRA bootstrap, end-to-end QA | Merged |
 | PR033 | Historical production full-sync verification | Superseded by PR053 |
 | PR034–PR053 | Governance and CI corrections, scheduler/restart/incremental fixes, data integrity, lifecycle, provenance, PostgreSQL reconciliation and authoritative rewrite | Merged/completed; PR053 recorded a real-target PASS |

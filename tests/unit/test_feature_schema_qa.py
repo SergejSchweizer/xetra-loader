@@ -12,7 +12,7 @@ IDENTITY_COLUMNS = ("isin", "exchange", "code", "trade_date")
 
 
 def test_schema_qa_has_exact_identity_and_feature_column_contract() -> None:
-    expected = IDENTITY_COLUMNS + feature_columns()
+    expected = IDENTITY_COLUMNS + ("available_at_utc",) + feature_columns()
     assert len(expected) == len(set(expected))
     projection_start = VIEW_SQL.index("SELECT\n    r.isin, r.exchange, r.code, r.trade_date,")
     projection_end = VIEW_SQL.index("FROM normalized AS r", projection_start)
@@ -40,7 +40,7 @@ def test_schema_qa_has_exact_identity_and_feature_column_contract() -> None:
             if alias is not None
             else expression.rsplit(".", maxsplit=1)[-1].strip()
         )
-    assert actual[:6] == [*IDENTITY_COLUMNS, *BASE_LEVEL_COLUMNS]
+    assert actual[:7] == [*IDENTITY_COLUMNS, "available_at_utc", *BASE_LEVEL_COLUMNS]
     assert len(actual) == len(set(actual))
     assert set(actual) == set(expected)
 

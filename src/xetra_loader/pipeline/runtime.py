@@ -381,10 +381,11 @@ class _WeeklyState:
             max_workers=min(2, self.cores),
             thread_name_prefix="xdl-postgres",
         )
+        dividend_cores, split_cores = _parallel_database_core_budgets(self.cores)
         self._publication_futures = {
             "dividends": self._publication_executor.submit(
                 _publish_dividends_worker,
-                database_worker,
+                lambda: database_worker(cores=dividend_cores),
                 self._require_dividends(),
                 cast(
                     dict[tuple[str, str, str, str], datetime],
@@ -394,7 +395,7 @@ class _WeeklyState:
             ),
             "splits": self._publication_executor.submit(
                 _publish_splits_worker,
-                database_worker,
+                lambda: database_worker(cores=split_cores),
                 self._require_splits(),
                 cast(
                     dict[tuple[str, str, str, str], datetime],
@@ -594,9 +595,13 @@ class _WeeklyState:
 def build_weekly_stages(cores: int | None = None) -> PipelineStages:
     """Build the concrete factory referenced by the deployed Vienna cron entry."""
 
+    worker_count = resolve_cores(cores)
     state = _WeeklyState(
-        PostgresEodhdBootstrapRuntime.from_environment(quarantine_invalid_ohlc=True),
-        cores=resolve_cores(cores),
+        PostgresEodhdBootstrapRuntime.from_environment(
+            quarantine_invalid_ohlc=True,
+            cores=worker_count,
+        ),
+        cores=worker_count,
     )
     _LOGGER.info("weekly_configuration cores=%d", state.cores)
     return PipelineStages(
@@ -631,6 +636,14 @@ def _completed_future(value: SyncOutcome) -> Future[SyncOutcome]:
     future: Future[SyncOutcome] = Future()
     future.set_result(value)
     return future
+
+
+def _parallel_database_core_budgets(cores: int) -> tuple[int, int]:
+    """Split the total CPU budget across the concurrent dividend/split queries."""
+
+    if cores < 1:
+        raise ValueError("cores must be positive")
+    return max(1, (cores + 1) // 2), max(1, cores // 2)
 
 
 def _publish_dividends_worker(

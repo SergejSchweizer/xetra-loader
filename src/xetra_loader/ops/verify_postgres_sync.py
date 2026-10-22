@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+import polars as pl
 from psycopg import Connection, Cursor, Error
 from psycopg.conninfo import conninfo_to_dict
 
@@ -257,15 +258,21 @@ class ProductionVerificationError(RuntimeError):
 class _AdminResetWriterPublishRuntime:
     """Keep reset/fetch work administrative while serving writes use the writer login."""
 
-    def __init__(self, admin: PostgresEodhdBootstrapRuntime) -> None:
+    def __init__(self, admin: PostgresEodhdBootstrapRuntime, *, cores: int) -> None:
         self._admin = admin
+        self._cores = cores
         self._writer: PostgresEodhdBootstrapRuntime | None = None
 
     def reset_owned_state(self) -> None:
         self._admin.reset_owned_state()
 
-    def database_worker(self) -> PostgresEodhdBootstrapRuntime:
-        return self._writer_runtime().database_worker()
+    def database_worker(
+        self,
+        *,
+        cores: int | None = None,
+    ) -> PostgresEodhdBootstrapRuntime:
+        worker_cores = self._cores if cores is None else cores
+        return self._writer_runtime().database_worker(cores=worker_cores)
 
     def fetch_listings(self) -> FetchBatch[ListingRecord]:
         return self._admin.fetch_listings()
@@ -334,7 +341,9 @@ class _AdminResetWriterPublishRuntime:
 
     def _writer_runtime(self) -> PostgresEodhdBootstrapRuntime:
         if self._writer is None:
-            self._writer = PostgresEodhdBootstrapRuntime.from_environment()
+            self._writer = PostgresEodhdBootstrapRuntime.from_environment(
+                cores=self._cores
+            )
         return self._writer
 
 
@@ -344,14 +353,16 @@ def execute_production_full_sync_and_verify(
     output_path: Path,
     backup_root: Path,
     weekly_replay: bool = True,
+    cores: int | None = None,
 ) -> ProductionAcceptanceReport:
     """Destructively bootstrap the real target and independently verify publication."""
 
     root = medallion_root.resolve()
+    worker_count = resolve_cores(cores)
     _require_scheduler_disabled()
     _require_private_backup_root(backup_root)
     with LoaderLock(root / "authoritative-rewrite.lock"):
-        preflight = connect_postgres(admin=True)
+        preflight = connect_postgres(admin=True, cores=worker_count)
         try:
             preflight.autocommit = True
             _, _, _, target_matches = _verify_target(preflight)
@@ -365,11 +376,16 @@ def execute_production_full_sync_and_verify(
 
         _backup_owned_state(root, backup_root)
         runtime = _AdminResetWriterPublishRuntime(
-            PostgresEodhdBootstrapRuntime.from_admin_environment(quarantine_invalid_ohlc=True)
+            PostgresEodhdBootstrapRuntime.from_admin_environment(
+                quarantine_invalid_ohlc=True,
+                cores=worker_count,
+            ),
+            cores=worker_count,
         )
         def worker_runtime() -> PostgresEodhdBootstrapRuntime:
             return PostgresEodhdBootstrapRuntime.from_admin_environment(
-                quarantine_invalid_ohlc=True
+                quarantine_invalid_ohlc=True,
+                cores=worker_count,
             )
 
         try:
@@ -378,14 +394,14 @@ def execute_production_full_sync_and_verify(
                 confirmed=True,
                 reset_owned_state=True,
                 parallel_runtime_factory=worker_runtime,
-                max_workers=resolve_cores(),
+                max_workers=worker_count,
             )
         finally:
             runtime.close()
 
         if weekly_replay:
             replay = run_restartable_pipeline(
-                build_weekly_stages(),
+                build_weekly_stages(worker_count),
                 lock_path=root / "weekly.lock",
                 checkpoint_path=root / "weekly.checkpoint.json",
             )
@@ -393,7 +409,7 @@ def execute_production_full_sync_and_verify(
         else:
             replay_mutations = {}
 
-        connection = connect_postgres(admin=True)
+        connection = connect_postgres(admin=True, cores=worker_count)
         try:
             connection.autocommit = True
             connection.execute("SET TIME ZONE 'UTC'")
@@ -522,6 +538,148 @@ def load_gold_snapshots(root: Path) -> dict[str, GoldDatasetSnapshot]:
             ),
         )
     return result
+
+
+def validate_gold_fingerprints_streaming(root: Path) -> int:  # noqa: C901, PLR0912, PLR0915
+    """Validate manifest Gold hashes in bounded Polars batches, without row lists."""
+
+    layout = MedallionLayout(root.resolve())
+    root_path = layout.root.resolve()
+    for dataset in DATASETS:
+        manifest_path = layout.manifest_path(Layer.GOLD, dataset)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("layer") != Layer.GOLD.value:
+            raise ValueError(f"invalid Gold manifest for {dataset}")
+        if manifest.get("dataset") != dataset:
+            raise ValueError(f"Gold manifest dataset mismatch for {dataset}")
+        semantic_metadata = manifest.get("semantic_metadata")
+        run_metadata = manifest.get("run_metadata")
+        if not isinstance(semantic_metadata, dict) or not isinstance(run_metadata, dict):
+            raise ValueError(f"Gold manifest for {dataset} is malformed")
+        expected_fingerprint = semantic_metadata.get("builder_semantic_fingerprint")
+        expected_count = semantic_metadata.get("row_count")
+        artifact_paths = run_metadata.get("artifact_paths")
+        if (
+            not isinstance(expected_fingerprint, str)
+            or len(expected_fingerprint) != 64
+            or not isinstance(expected_count, int)
+            or isinstance(expected_count, bool)
+            or expected_count < 0
+            or not isinstance(artifact_paths, list)
+        ):
+            raise ValueError(f"Gold manifest for {dataset} has invalid snapshot metadata")
+
+        parquet_paths: list[str] = []
+        for artifact_path in artifact_paths:
+            if not isinstance(artifact_path, str):
+                raise ValueError(f"Gold manifest for {dataset} has an invalid artifact path")
+            candidate = Path(artifact_path)
+            resolved = (root_path / candidate).resolve()
+            if (
+                candidate.is_absolute()
+                or ".." in candidate.parts
+                or root_path not in resolved.parents
+                or not resolved.is_file()
+                or resolved.suffix != ".parquet"
+            ):
+                raise ValueError(f"Gold manifest for {dataset} references an unsafe artifact")
+            parquet_paths.append(str(resolved))
+
+        retracted_keys: tuple[tuple[str, str, str, str], ...] = ()
+        if dataset in {"dividends", "splits"}:
+            decoded: list[list[str]] = []
+            for row in read_snapshot_retractions(layout, Layer.GOLD, dataset):
+                key = [
+                    row.get("isin"),
+                    row.get("exchange"),
+                    row.get("code"),
+                    row.get("event_key"),
+                ]
+                if not all(isinstance(part, str) for part in key):
+                    raise ValueError(f"Gold retractions for {dataset} contain an invalid key")
+                decoded.append(cast(list[str], key))
+            retracted_keys = _validated_retracted_keys(
+                dataset,
+                cast(list[JSONValue], decoded),
+            )
+            expected_retractions = semantic_metadata.get("retractions_fingerprint")
+            actual_retractions = hashlib.sha256(
+                canonical_json([list(key) for key in retracted_keys]).encode("utf-8")
+            ).hexdigest()
+            if expected_retractions != actual_retractions:
+                raise ValueError(f"Gold retractions fingerprint mismatch for {dataset}")
+
+        digest = hashlib.sha256()
+        if dataset in {"dividends", "splits"}:
+            digest.update(b'{"retracted_keys":')
+            digest.update(canonical_json([list(key) for key in retracted_keys]).encode("utf-8"))
+            digest.update(b',"rows":[')
+        else:
+            digest.update(b"[")
+        row_count = 0
+        if parquet_paths:
+            key_columns = list(
+                {
+                    "listings": ("isin", "exchange", "code"),
+                    "eod_quotes": ("isin", "exchange", "code", "trade_date"),
+                    "dividends": ("isin", "exchange", "code", "event_key"),
+                    "splits": ("isin", "exchange", "code", "event_key"),
+                }[dataset]
+            )
+            # Per-instrument Gold files may encode an entirely-null optional
+            # string field as Polars Null while populated partitions use String.
+            # Build the union schema once so the multi-file scan remains
+            # streaming and deterministic instead of failing on file order.
+            parquet_schema: dict[str, pl.DataType] = {}
+            for parquet_path in parquet_paths:
+                for name, dtype in pl.read_parquet_schema(parquet_path).items():
+                    previous = parquet_schema.get(name)
+                    if previous is None or previous == pl.Null:
+                        parquet_schema[name] = dtype
+                    elif dtype not in {pl.Null, previous}:
+                        raise ValueError(
+                            f"incompatible Gold Parquet schemas for {dataset}.{name}: "
+                            f"{previous} != {dtype}"
+                        )
+            batches = pl.scan_parquet(
+                parquet_paths,
+                schema=parquet_schema,
+                missing_columns="insert",
+                extra_columns="ignore",
+                low_memory=True,
+            ).sort(
+                key_columns,
+                maintain_order=True,
+            ).collect_batches(chunk_size=32_768, engine="streaming")
+            for batch in batches:
+                for row in batch.iter_rows(named=True):
+                    normalized: dict[str, JSONValue] = {}
+                    for name, value in row.items():
+                        if value is None or isinstance(value, (str, int, float, bool)):
+                            normalized[name] = value
+                        elif isinstance(value, Decimal):
+                            normalized[name] = str(value)
+                        elif hasattr(value, "isoformat"):
+                            normalized[name] = value.isoformat()
+                        else:
+                            raise ValueError(
+                                f"unsupported Gold Parquet value for {dataset}.{name}: "
+                                f"{type(value).__name__}"
+                            )
+                    _business_key(dataset, normalized)
+                    if row_count:
+                        digest.update(b",")
+                    digest.update(canonical_json(cast(JSONValue, normalized)).encode("utf-8"))
+                    row_count += 1
+        if dataset in {"dividends", "splits"}:
+            digest.update(b"]}")
+        else:
+            digest.update(b"]")
+        if row_count != expected_count:
+            raise ValueError(f"Gold row count does not match manifest for {dataset}")
+        if digest.hexdigest() != expected_fingerprint:
+            raise ValueError(f"Parquet Gold fingerprint validation failed: {dataset}")
+    return len(DATASETS)
 
 
 def _validated_retracted_keys(
@@ -1071,6 +1229,12 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("artifacts/acceptance/postgres-full-sync-v2.json"),
     )
     parser.add_argument("--backup-root", type=Path, required=True)
+    parser.add_argument(
+        "--cores",
+        type=int,
+        default=None,
+        help="CPU budget for Polars, PostgreSQL, and independent downloads (default: config or 6)",
+    )
     return parser
 
 
@@ -1096,6 +1260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path=args.output,
         backup_root=args.backup_root,
         weekly_replay=not args.skip_weekly_replay,
+        cores=args.cores,
     )
     print(canonical_json(report.as_dict()))
     return 0

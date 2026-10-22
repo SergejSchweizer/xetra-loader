@@ -8,8 +8,9 @@
 ## Current delivery rules
 
 - Run Ruff, Mypy, unit tests, and the applicable PostgreSQL integration tests
-  locally as documented in `README.md`. GitHub Actions is not a required test
-  runner or a delivery dependency; do not invoke or depend on it.
+  locally as documented in `README.md`, but only after implementation is
+  complete for every PR in the delivery batch. GitHub Actions is not a required
+  test runner or a delivery dependency; do not invoke or depend on it.
 - Keep active, explicitly assigned work items isolated on their own branch.
   `BACKLOG.md` currently contains only obsolete PR history and no active work
   items.
@@ -19,6 +20,14 @@
   current remote protection before pushing; if it rejects the authorized
   operation, stop and request maintainer direction rather than force-pushing,
   weakening protections, or invoking a workflow.
+- The repository has no active workflow files under `.github/workflows`; all
+  quality gates are local and must wait until the full PR batch is implemented.
+- During the 2026-10-21 delivery audit, `origin/main` still required the
+  `merge-gate` status check, although its workflow has now been retired to meet
+  the no-GitHub-Actions goal. The maintainer chose to preserve the no-Actions
+  goal and defer merging rather than weaken branch protection or restore an
+  Actions dependency. Keep the PR unmerged until a compatible policy is
+  explicitly established.
 
 The following records document retired XDL-PR process requirements. They are
 historical evidence, not current delivery instructions.

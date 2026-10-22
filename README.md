@@ -39,9 +39,14 @@ administrative connection in this order: `sql/schema/001_xetra_loader.sql`,
 `sql/roles/005_xetra_loader_feature_view_reader.sql` only after the externally
 provisioned `xetra_loader` role exists; it grants that role `USAGE` on the
 `xetra_loader` schema and `SELECT` only on `xetra_loader.xetra_features`.
-The explicit provisioning command is `.venv/bin/xdl-migrate`; it uses only the
-admin DSN and creates/populates the materialized feature view and durable job
-queue. The weekly API worker never creates or alters PostgreSQL objects.
+`xdl-migrate` reapplies this reader contract after rebuilding the materialized
+view whenever that external role exists, because dropping and recreating the
+view discards its object-level grants.
+The explicit provisioning command is `.venv/bin/xdl-migrate --cores 6`; it uses
+only the admin DSN and creates/populates the materialized feature view and
+durable job queue. `--cores` bounds PostgreSQL parallel plans; it defaults to
+`weekly.cores` or six. The weekly API worker never creates or alters
+PostgreSQL objects.
 The publication writer is the non-superuser `xetra_data_loader_writer`, a
 member of the `xetra-data-loader` group. The legacy files in `sql/migrations/`
 are historical rename migrations, not the current clean-create setup.
@@ -73,20 +78,33 @@ control files.
 The one-time migration reads the previous `versions/<storage_version>/`
 snapshots and old row JSON, writes and validates canonical Parquet artifacts,
 then moves legacy row files and obsolete layouts into a timestamped recovery
-backup outside the lake. Manifests and restart metadata remain JSON control
-files. The normal runtime reader refuses to fall back to retired layouts and
-requires the migration to have published a canonical manifest first.
+backup outside the lake. Versioned Parquet snapshots are converted one source
+partition at a time and staged outside the lake; the writer buffers only one
+canonical symbol/year partition instead of materializing the complete snapshot
+as Python row objects. Manifests and restart metadata remain JSON control files.
+The normal runtime reader refuses to fall back to retired layouts and requires
+the migration to have published a canonical manifest first.
 
 To migrate an existing JSON lake, first let any active writer finish, then run:
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/migrate_lake_to_parquet.py
+PYTHONPATH=src .venv/bin/python scripts/migrate_lake_to_parquet.py --cores 6
 ```
 
-The migration validates all Gold fingerprints before moving retired row
-artifacts below `/home/dev_xetra/.xdl-lake-recovery-backups/`. This preserves a
-recoverable copy while ensuring the lake itself contains only canonical
-row-bearing artifacts.
+The migration uses the configured six-core default; override it with
+`--cores N` to bound Polars threads and independent Bronze migration workers.
+It holds both `lake/authoritative-rewrite.lock` and `lake/weekly.lock`, so it
+cannot overlap either the destructive full refresh or the normal weekly writer.
+
+The migration validates all Gold fingerprints in sorted Polars batches before
+moving retired row artifacts below
+`/home/dev_xetra/.xdl-lake-recovery-backups/`; it does not materialize the full
+Silver or Gold snapshots as Python row lists for this final check. It also
+checks that every canonical Silver/Gold Parquet file is referenced by exactly
+one current manifest, validates declared Gold retraction sidecars, and
+recoverably archives orphaned canonical artifacts and sidecars. This preserves
+a recoverable copy while ensuring the lake itself contains only canonical,
+manifest-owned row-bearing artifacts.
 
 ## Current scope
 
@@ -160,8 +178,11 @@ API service are installed on the host.
 ## Feature catalog
 
 Catalog version **4** defines **98 derived features** from two exposed base
-levels. The materialized view therefore has 104 columns: four row-identity
-columns, the two levels, and the 98 derived values. The executable catalog is
+levels. The materialized view therefore has 105 columns: four row-identity
+columns, `available_at_utc`, the two levels, and the 98 derived values.
+`available_at_utc` is midnight UTC on the next Monday–Friday after `trade_date`
+(Friday advances to Monday); this weekday rule does not account for exchange
+holidays. The executable catalog is
 `src/xetra_loader/features/catalog.py`; the transformations below are checked
 against an independent calculation reference and PostgreSQL integration
 fixtures.
@@ -227,7 +248,7 @@ average.
 
 All OHLC-derived columns above are derived features, not exposed OHLC levels.
 No pairwise or average-correlation columns are calculated. The complete
-104-column view inventory is recorded once in the PostgreSQL schema inventory
+105-column view inventory is recorded once in the PostgreSQL schema inventory
 below.
 
 ## Feature benchmark
@@ -250,9 +271,10 @@ market fields (`open`, `high`, `low`, `close`, `adjusted_close`, `volume`), and
 two publication-audit timestamps. It contains raw OHLCV data, not derived
 features.
 
-The materialized view `xetra_loader.xetra_features` has **104 columns**:
+The materialized view `xetra_loader.xetra_features` has **105 columns**:
 
 - **4 identity columns**: `isin`, `exchange`, `code`, `trade_date`;
+- **1 availability column**: `available_at_utc`, the next weekday at 00:00 UTC;
 - **2 exposed level columns**: `adjusted_close_level`, `volume_level`;
 - **98 derived feature columns** from the versioned catalog, or **100 feature
   columns** when the two base levels are included and identity columns are
@@ -266,35 +288,49 @@ Stochastic, and Donchian features.
 
 ## Schedule and resource limits
 
-The repository schedule contract is Sunday `11:00` in `Europe/Vienna`. The cron
-entry submits a durable job; one in-process worker runs the restart-safe
-pipeline. Install the cron file and API service separately on the host before
-describing this schedule as deployed. `weekly.cores` defaults to **6** and can
-be overridden with `xdl-weekly --cores N`, `xdl-api --cores N`, or `XDL_CORES`.
+The repository cron artifact schedules a durable weekly job for Sunday
+`11:00` in `Europe/Vienna`; one in-process worker runs the restart-safe
+pipeline. The host's current user crontab is intentionally different: it runs a
+full historical refresh on Saturday at `09:00` and copies the Gold lake to
+`/volume1/Temp/Quotes` on Sunday at `22:00`. The API service is not installed
+for the current user, so the repository's Sunday enqueue entry is not the
+active host sync schedule. Install the cron file and API service separately
+before describing that deployment as active. `weekly.cores` defaults to **6** and can
+be overridden with `xdl-weekly --cores N`, `xdl-api --cores N`,
+`xdl-bootstrap --cores N`, `xdl-migrate --cores N`,
+`xdl-verify-production-sync --cores N`, or `XDL_CORES`.
 The API sets `POLARS_MAX_THREADS` before importing Polars, and the same budget bounds
 concurrent provider fetches. Provider fetch pools are closed before the next
 Polars-heavy stage; PostgreSQL publication stays serialized except for the
-independent dividend/split writers. Feature-view refresh is one atomic
-PostgreSQL operation. API and weekly logs are rotated below ignored `.logs/`.
+independent dividend/split writers, whose per-query PostgreSQL worker budgets
+are divided so their combined leader-plus-worker budget does not exceed
+`weekly.cores`. Feature-view refresh is one atomic PostgreSQL operation. API
+and weekly logs are rotated below ignored `.logs/`.
 
 PostgreSQL `work_mem` for feature refresh is separately configurable through
 `XDL_FEATURE_WORK_MEM` or `postgres.feature_work_mem`; the default is `256MB`
 within the validated `16MB`–`4GB` range. It is a per-operation/per-worker
 budget, not a transaction-wide cap.
 
-The schema build and refresh set PostgreSQL's parallel worker limit to
-`weekly.cores - 1` and enable leader participation, so the leader plus workers
-can use up to the configured core budget (six by default). Parallel scan
-thresholds and planner costs are tuned for the large quote table. An
-`EXPLAIN` of the feature query with `--cores 6` planned a `Parallel Seq Scan`
-with five workers and a `Gather Merge`. PostgreSQL still executes the
-dependent `WindowAgg` stages in the leader, so this parallelizes the source
-scan and eligible plan stages—not every feature calculation or the whole
-refresh across six cores.
+Every data/runtime session opened through `connect_postgres` applies
+`max_parallel_workers_per_gather` and `max_parallel_maintenance_workers` as
+`cores - 1`, with leader participation enabled. The schema build and feature
+refresh additionally tune parallel scan thresholds and planner costs for the
+large quote table. Thus one eligible query can use up to the configured core
+budget (six by default). An
+`EXPLAIN` of the quote-input/window stage with the six-core settings planned a
+`Parallel Seq Scan` with five workers and a `Gather Merge` before its
+`WindowAgg`. This proves the source scan is eligible for the configured
+parallelism, not that every stage uses it: PostgreSQL runs dependent window and
+array calculations in the leader. During the full materialized-view rebuild
+observed on 2026-10-21, no parallel workers were active at the sampled instant;
+the complete refresh therefore must not be described as continuously using six
+cores.
 
 ## Validation
 
-Run local quality gates with the repository's pinned interpreter:
+Run local quality gates with the repository's pinned interpreter only after
+implementation is complete for every PR in the delivery batch:
 
 ```bash
 .venv/bin/ruff check --no-cache src tests scripts
@@ -306,4 +342,7 @@ Run local quality gates with the repository's pinned interpreter:
 
 PostgreSQL integration tests require `XDL_TEST_POSTGRES_DSN`; they should use a
 disposable test database, never the production DSN. No GitHub Actions workflow
-is required to run these checks.
+is used to run these checks. `origin/main` still requires a `merge-gate` status
+check, while the workflow was retired to satisfy the no-Actions goal. The
+maintainer chose to keep the no-Actions policy and defer remote merging; do not
+weaken branch protection or restore an Actions dependency implicitly.

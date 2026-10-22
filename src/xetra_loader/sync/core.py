@@ -75,6 +75,7 @@ def connect_postgres(
     *,
     admin: bool = False,
     require_non_superuser: bool = False,
+    cores: int | None = None,
 ) -> Connection[Any]:
     """Connect as an explicit admin or a normal writer, rejecting unsafe weekly sessions."""
 
@@ -84,11 +85,23 @@ def connect_postgres(
         "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
         (resolve_feature_work_mem(),),
     )
+    configured_cores = resolve_cores(cores)
     connection.execute(
         "SELECT set_config('xetra_loader.compute_cores', %s, false)",
-        (str(resolve_cores()),),
+        (str(configured_cores),),
     )
-    connection.commit()
+    parallel_workers = str(max(configured_cores - 1, 0))
+    for setting in (
+        "max_parallel_workers_per_gather",
+        "max_parallel_maintenance_workers",
+    ):
+        connection.execute(
+            "SELECT set_config(%s, %s, false)",
+            (setting, parallel_workers),
+        )
+    connection.execute(
+        "SELECT set_config('parallel_leader_participation', 'on', false)"
+    )
     connection.commit()
     if require_non_superuser:
         row = connection.execute(

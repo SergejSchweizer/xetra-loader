@@ -11,6 +11,8 @@ VIEW_SQL = Path("sql/schema/004_xetra_features.sql").read_text(encoding="utf-8")
 
 def test_feature_view_is_materialized_and_has_all_catalog_columns() -> None:
     assert "CREATE MATERIALIZED VIEW xetra_loader.xetra_features AS" in VIEW_SQL
+    assert "AS available_at_utc" in VIEW_SQL
+    assert "AT TIME ZONE 'UTC' AS available_at_utc" in VIEW_SQL
     for column in feature_columns():
         assert column in VIEW_SQL
 
@@ -18,6 +20,16 @@ def test_feature_view_is_materialized_and_has_all_catalog_columns() -> None:
 def test_feature_view_does_not_expose_ohlc_level_columns() -> None:
     for forbidden in FORBIDDEN_LEVEL_COLUMNS:
         assert re.search(rf"(?<![a-z_]){re.escape(forbidden)}(?![a-z_])", VIEW_SQL) is None
+
+
+def test_available_at_utc_is_the_next_weekday_at_utc_midnight() -> None:
+    expression = VIEW_SQL.split("AS available_at_utc", maxsplit=1)[0].rsplit(
+        "SELECT", maxsplit=1
+    )[-1]
+    assert "EXTRACT(ISODOW FROM r.trade_date)::integer" in expression
+    assert "WHEN 5 THEN 3" in expression
+    assert "WHEN 6 THEN 2" in expression
+    assert "AT TIME ZONE 'UTC'" in VIEW_SQL
 
 
 def test_feature_view_has_identity_index_and_runtime_refresh_function() -> None:
