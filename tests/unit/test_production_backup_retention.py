@@ -75,6 +75,23 @@ def test_full_sync_backup_retention_rejects_a_symlink_root(tmp_path: Path) -> No
 class _FakeConnection:
     autocommit = False
 
+    class _Context:
+        def __enter__(self) -> _FakeConnection._Context:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class _Cursor(_Context):
+        def execute(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    def transaction(self) -> _Context:
+        return self._Context()
+
+    def cursor(self) -> _Cursor:
+        return self._Cursor()
+
     def execute(self, *_args: object, **_kwargs: object) -> None:
         return None
 
@@ -99,6 +116,9 @@ def _patch_full_sync(
     passed: bool,
 ) -> None:
     class FakeAdminRuntime:
+        def promote_staging_state(self) -> None:
+            return None
+
         def close(self) -> None:
             return None
 

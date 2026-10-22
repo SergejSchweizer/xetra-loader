@@ -1,2 +1,3 @@
 CRON_TZ=Europe/Vienna
-0 9 * * 0 cd /home/dev_xetra/xetra-loader && bash scripts/run_full_refresh.sh >> artifacts/cron/full-refresh.log 2>&1
+0 9 * * 0 cd /home/dev_xetra/xetra-loader && bash scripts/run_full_refresh.sh
+0 22 * * 0 cd /home/dev_xetra/xetra-loader && bash scripts/run_gold_lake_copy.sh

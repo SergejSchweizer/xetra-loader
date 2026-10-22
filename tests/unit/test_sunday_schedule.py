@@ -15,9 +15,25 @@ def test_cron_contract_is_exact_sunday_0900_vienna() -> None:
     assert lines[0] == "CRON_TZ=Europe/Vienna"
     assert lines[1].startswith("0 9 * * 0 ")
     assert "bash scripts/run_full_refresh.sh" in lines[1]
-    assert ">> artifacts/cron/full-refresh.log 2>&1" in lines[1]
+    assert "artifacts/cron" not in lines[1]
     assert "xdl-enqueue-weekly" not in lines[1]
     assert "xdl-bootstrap" not in lines[1]
+    assert lines[2] == (
+        "0 22 * * 0 cd /home/dev_xetra/xetra-loader && bash scripts/run_gold_lake_copy.sh"
+    )
+
+
+def test_cron_wrappers_log_and_prune_only_their_own_run_logs() -> None:
+    full_refresh = Path("scripts/run_full_refresh.sh").read_text(encoding="utf-8")
+    gold_copy = Path("scripts/run_gold_lake_copy.sh").read_text(encoding="utf-8")
+
+    for source, pattern in (
+        (full_refresh, "full-refresh-cron-*.log"),
+        (gold_copy, "gold-lake-copy-*.log"),
+    ):
+        assert 'log_path="$repo_root/.logs/' in source
+        assert 'exec >>"$log_path" 2>&1' in source
+        assert f"-name '{pattern}' -mtime +90 -delete" in source
 
 
 def test_vienna_0900_remains_local_0900_across_dst() -> None:

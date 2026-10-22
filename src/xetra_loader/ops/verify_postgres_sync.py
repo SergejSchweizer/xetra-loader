@@ -43,6 +43,7 @@ from xetra_loader.ops.bootstrap import (
     BootstrapResult,
     FetchBatch,
     PostgresEodhdBootstrapRuntime,
+    drop_previous_serving_schemas,
     run_full_bootstrap,
 )
 from xetra_loader.pipeline.restart import LoaderLock, run_restartable_pipeline
@@ -62,13 +63,17 @@ _FULL_SYNC_BACKUP_RETENTION = 4
 _EXPECTED_TIMESTAMP_COLUMNS = {
     ("xetra_loader", "listings", "fetched_at_utc"),
     ("xetra_loader", "listings", "published_at_utc"),
+    ("xetra_loader", "listings", "available_at_utc"),
     ("xetra_loader", "eod_quotes", "timestamp_eod"),
     ("xetra_loader", "eod_quotes", "fetched_at_utc"),
     ("xetra_loader", "eod_quotes", "published_at_utc"),
+    ("xetra_loader", "eod_quotes", "available_at_utc"),
     ("xetra_loader", "dividends", "fetched_at_utc"),
     ("xetra_loader", "dividends", "published_at_utc"),
+    ("xetra_loader", "dividends", "available_at_utc"),
     ("xetra_loader", "splits", "fetched_at_utc"),
     ("xetra_loader", "splits", "published_at_utc"),
+    ("xetra_loader", "splits", "available_at_utc"),
     ("xetra_loader_sync", "sync_state", "synced_at_utc"),
     ("xetra_loader_sync", "loader_runs", "started_at_utc"),
     ("xetra_loader_sync", "loader_runs", "finished_at_utc"),
@@ -275,6 +280,9 @@ class _AdminResetWriterPublishRuntime:
     def reset_owned_state(self) -> None:
         self._admin.reset_owned_state()
 
+    def promote_staging_state(self) -> None:
+        self._admin.promote_staging_state()
+
     def database_worker(
         self,
         *,
@@ -351,12 +359,13 @@ class _AdminResetWriterPublishRuntime:
     def _writer_runtime(self) -> PostgresEodhdBootstrapRuntime:
         if self._writer is None:
             self._writer = PostgresEodhdBootstrapRuntime.from_environment(
-                cores=self._cores
+                cores=self._cores,
+                staging=True,
             )
         return self._writer
 
 
-def execute_production_full_sync_and_verify(
+def execute_production_full_sync_and_verify(  # noqa: PLR0915 -- ordered safety gates are explicit.
     *,
     medallion_root: Path,
     output_path: Path,
@@ -388,6 +397,7 @@ def execute_production_full_sync_and_verify(
             PostgresEodhdBootstrapRuntime.from_admin_environment(
                 quarantine_invalid_ohlc=True,
                 cores=worker_count,
+                staging=True,
             ),
             cores=worker_count,
         )
@@ -405,6 +415,7 @@ def execute_production_full_sync_and_verify(
                 parallel_runtime_factory=worker_runtime,
                 max_workers=worker_count,
             )
+            runtime.promote_staging_state()
         finally:
             runtime.close()
 
@@ -435,6 +446,11 @@ def execute_production_full_sync_and_verify(
     write_production_report(report, output_path)
     if not report.passed:
         raise ProductionVerificationError("production PostgreSQL acceptance report is not PASS")
+    cleanup_connection = connect_postgres(admin=True, cores=worker_count)
+    try:
+        drop_previous_serving_schemas(cleanup_connection)
+    finally:
+        cleanup_connection.close()
     try:
         removed_backups = _prune_full_sync_backups(backup_root)
     except (OSError, ProductionVerificationError):

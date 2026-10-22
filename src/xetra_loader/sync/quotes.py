@@ -14,6 +14,7 @@ from xetra_loader.sync.core import (
     AuthoritativeSnapshotRequired,
     SyncCounters,
     SyncOutcome,
+    qualify_serving_sql,
     run_sync,
 )
 
@@ -26,6 +27,8 @@ def sync_quotes(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None = None,
     authoritative_snapshot: GoldValidationSummary | None = None,
+    serving_schema: str = "xetra_loader",
+    sync_schema: str = "xetra_loader_sync",
 ) -> SyncOutcome:
     """Insert new quote dates, update corrections, and skip semantic replays."""
 
@@ -35,11 +38,11 @@ def sync_quotes(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
 
     def mutate(cursor: Cursor[Any]) -> SyncCounters:
         _copy_desired_quotes(cursor, gold, fetched_at_by_key, published_at)
-        inserted = _count_inserted_quotes(cursor)
-        updated = _count_updated_quotes(cursor)
-        deleted = _count_deleted_quotes(cursor)
-        cursor.execute(_UPSERT_DESIRED_QUOTES)
-        cursor.execute(_DELETE_RETRACTED_QUOTES)
+        inserted = _count_inserted_quotes(cursor, serving_schema)
+        updated = _count_updated_quotes(cursor, serving_schema)
+        deleted = _count_deleted_quotes(cursor, serving_schema)
+        cursor.execute(qualify_serving_sql(_UPSERT_DESIRED_QUOTES, serving_schema))
+        cursor.execute(qualify_serving_sql(_DELETE_RETRACTED_QUOTES, serving_schema))
         return SyncCounters(inserted=inserted, updated=updated, deleted=deleted)
 
     return run_sync(
@@ -48,6 +51,8 @@ def sync_quotes(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
         semantic_rows=gold.semantic_rows(),
         mutate=mutate,
         run_id=run_id,
+        serving_schema=serving_schema,
+        sync_schema=sync_schema,
     )
 
 
@@ -108,22 +113,22 @@ def _copy_desired_quotes(
             )
 
 
-def _count_inserted_quotes(cursor: Cursor[Any]) -> int:
+def _count_inserted_quotes(cursor: Cursor[Any], serving_schema: str = "xetra_loader") -> int:
     row = cursor.execute(
-        """
+        qualify_serving_sql("""
         SELECT count(*)
         FROM xdl_desired_eod_quotes AS desired
         LEFT JOIN xetra_loader.eod_quotes AS current
           USING (isin, exchange, code, trade_date)
         WHERE current.isin IS NULL
-        """
+        """, serving_schema),
     ).fetchone()
     return int(cast(tuple[int], row)[0])
 
 
-def _count_updated_quotes(cursor: Cursor[Any]) -> int:
+def _count_updated_quotes(cursor: Cursor[Any], serving_schema: str = "xetra_loader") -> int:
     row = cursor.execute(
-        """
+        qualify_serving_sql("""
         SELECT count(*)
         FROM xdl_desired_eod_quotes AS desired
         JOIN xetra_loader.eod_quotes AS current
@@ -133,14 +138,14 @@ def _count_updated_quotes(cursor: Cursor[Any]) -> int:
               IS DISTINCT FROM
               (desired.open, desired.high, desired.low, desired.close,
                desired.adjusted_close, desired.volume)
-        """
+        """, serving_schema),
     ).fetchone()
     return int(cast(tuple[int], row)[0])
 
 
-def _count_deleted_quotes(cursor: Cursor[Any]) -> int:
+def _count_deleted_quotes(cursor: Cursor[Any], serving_schema: str = "xetra_loader") -> int:
     row = cursor.execute(
-        """
+        qualify_serving_sql("""
         SELECT count(*)
         FROM xetra_loader.eod_quotes AS current
         WHERE NOT EXISTS (
@@ -151,7 +156,7 @@ def _count_deleted_quotes(cursor: Cursor[Any]) -> int:
               AND desired.code = current.code
               AND desired.trade_date = current.trade_date
         )
-        """
+        """, serving_schema),
     ).fetchone()
     return int(cast(tuple[int], row)[0])
 

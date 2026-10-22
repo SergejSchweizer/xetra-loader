@@ -9,16 +9,18 @@ from typing import Any, cast
 from psycopg import Connection, Cursor
 
 from xetra_loader.gold.listings import ListingGoldResult
-from xetra_loader.sync.core import SyncCounters, SyncOutcome, run_sync
+from xetra_loader.sync.core import SyncCounters, SyncOutcome, qualify_serving_sql, run_sync
 
 
-def sync_listings(
+def sync_listings(  # noqa: PLR0913 -- explicit schema routing is a publication input.
     connection: Connection[Any],
     gold: ListingGoldResult,
     *,
     run_id: str | None = None,
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str], datetime] | None = None,
+    serving_schema: str = "xetra_loader",
+    sync_schema: str = "xetra_loader_sync",
 ) -> SyncOutcome:
     """Insert/update listing rows while preserving semantic no-op behavior."""
 
@@ -31,9 +33,12 @@ def sync_listings(
         for row in gold.rows:
             fetched_at = _fetched_at(row.key, fetched_at_by_key, published_at)
             cursor.execute(
-                "SELECT name, instrument_type, currency, country, is_active "
-                "FROM xetra_loader.listings "
-                "WHERE isin = %s AND exchange = %s AND code = %s",
+                qualify_serving_sql(
+                    "SELECT name, instrument_type, currency, country, is_active "
+                    "FROM xetra_loader.listings "
+                    "WHERE isin = %s AND exchange = %s AND code = %s",
+                    serving_schema,
+                ),
                 row.key,
             )
             existing = cast(
@@ -49,19 +54,26 @@ def sync_listings(
             )
             if existing is None:
                 cursor.execute(
-                    "INSERT INTO xetra_loader.listings "
-                    "(isin, exchange, code, name, instrument_type, currency, country, is_active, "
-                    "fetched_at_utc, published_at_utc) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    qualify_serving_sql(
+                        "INSERT INTO xetra_loader.listings "
+                        "(isin, exchange, code, name, instrument_type, currency, country, "
+                        "is_active, "
+                        "fetched_at_utc, published_at_utc) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        serving_schema,
+                    ),
                     (*row.key, *semantic, fetched_at, published_at),
                 )
                 inserted += 1
             elif existing != semantic:
                 cursor.execute(
-                    "UPDATE xetra_loader.listings SET name = %s, instrument_type = %s, "
-                    "currency = %s, country = %s, is_active = %s, fetched_at_utc = %s, "
-                    "published_at_utc = %s "
-                    "WHERE isin = %s AND exchange = %s AND code = %s",
+                    qualify_serving_sql(
+                        "UPDATE xetra_loader.listings SET name = %s, instrument_type = %s, "
+                        "currency = %s, country = %s, is_active = %s, fetched_at_utc = %s, "
+                        "published_at_utc = %s "
+                        "WHERE isin = %s AND exchange = %s AND code = %s",
+                        serving_schema,
+                    ),
                     (*semantic, fetched_at, published_at, *row.key),
                 )
                 updated += 1
@@ -73,10 +85,17 @@ def sync_listings(
         semantic_rows=gold.semantic_rows(),
         mutate=mutate,
         run_id=run_id,
+        serving_schema=serving_schema,
+        sync_schema=sync_schema,
     )
 
 
-def prune_stale_listings(connection: Connection[Any], gold: ListingGoldResult) -> int:
+def prune_stale_listings(
+    connection: Connection[Any],
+    gold: ListingGoldResult,
+    *,
+    serving_schema: str = "xetra_loader",
+) -> int:
     """Delete listings absent from Gold after dependent datasets were reconciled."""
 
     expected_keys = {row.key for row in gold.rows}
@@ -84,13 +103,19 @@ def prune_stale_listings(connection: Connection[Any], gold: ListingGoldResult) -
         existing_keys = {
             tuple(str(value) for value in key)
             for key in cursor.execute(
-                "SELECT isin, exchange, code FROM xetra_loader.listings"
+                qualify_serving_sql(
+                    "SELECT isin, exchange, code FROM xetra_loader.listings", serving_schema
+                )
             ).fetchall()
         }
         deleted = 0
         for stale_key in sorted(existing_keys - expected_keys):
             cursor.execute(
-                "DELETE FROM xetra_loader.listings WHERE isin = %s AND exchange = %s AND code = %s",
+                qualify_serving_sql(
+                    "DELETE FROM xetra_loader.listings "
+                    "WHERE isin = %s AND exchange = %s AND code = %s",
+                    serving_schema,
+                ),
                 stale_key,
             )
             deleted += cursor.rowcount

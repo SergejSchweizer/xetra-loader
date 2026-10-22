@@ -183,9 +183,8 @@ API and worker resident. The service file is a deployment artifact; it must be
 installed and enabled separately by the host administrator.
 
 The direct `.venv/bin/xdl-weekly --cores 6` command remains available for a
-controlled one-off local run; the Sunday enqueue entry in
-`deploy/cron/xetra-loader.cron` uses the API queue when that cron file and the
-API service are installed on the host.
+controlled one-off local run; `deploy/cron/xetra-loader.cron` invokes the
+guarded direct full-refresh wrapper at Sunday 09:00 Europe/Vienna.
 
 ## Feature catalog
 
@@ -315,16 +314,22 @@ runtime guarantee.
 
 ## PostgreSQL schema inventory
 
-The raw quote table `xetra_loader.eod_quotes` has **13 columns**: four identity
+The raw quote table `xetra_loader.eod_quotes` has **14 columns**: four identity
 columns (`isin`, `exchange`, `code`, `trade_date`), one EOD timestamp, six raw
-market fields (`open`, `high`, `low`, `close`, `adjusted_close`, `volume`), and
-two publication-audit timestamps. It contains raw OHLCV data, not derived
-features.
+market fields (`open`, `high`, `low`, `close`, `adjusted_close`, `volume`), two
+publication-audit timestamps, and the generated `available_at_utc` timestamp.
+The same generated availability column exists in `listings`, `dividends`, and
+`splits`: it uses the UTC publication date for listings and each row's
+`trade_date`/`event_date` for market observations and corporate actions. The
+date maps to the next Monday–Friday at 00:00 UTC (Friday/Saturday to Monday;
+exchange holidays are not modeled). These tables contain raw OHLCV data and
+metadata, not derived features.
 
 The materialized view `xetra_loader.xetra_features` has **105 columns**:
 
 - **4 identity columns**: `isin`, `exchange`, `code`, `trade_date`;
-- **1 availability column**: `available_at_utc`, the next weekday at 00:00 UTC;
+- **1 availability column**: `available_at_utc`, projected from the raw quote
+  table and set to the next weekday at 00:00 UTC;
 - **2 exposed level columns**: `adjusted_close_level`, `volume_level`;
 - **98 derived feature columns** from the versioned catalog, or **100 feature
   columns** when the two base levels are included and identity columns are
@@ -339,10 +344,11 @@ Stochastic, and Donchian features.
 ## Schedule and resource limits
 
 The repository cron artifact schedules the guarded direct full-refresh wrapper
-for Sunday `09:00` in `Europe/Vienna`, logging to
-`artifacts/cron/full-refresh.log`. The active host user crontab runs the same
-full historical refresh at that time and copies the Gold lake to
-`/volume1/Temp/Quotes` on Sunday at `22:00` (also `Europe/Vienna`). Keep the
+for Sunday `09:00` in `Europe/Vienna` and the Gold lake copy at `22:00`. Both
+wrappers write per-run stdout/stderr logs below `.logs/`; their cron output is
+not redirected to `artifacts/`. These operational logs older than 90 days are
+pruned by the wrappers. The `22:00` job copies the Gold lake to
+`/volume1/Temp/Quotes`. Keep the
 REST enqueue out of the Sunday schedule while this direct full sync is active;
 running both at the same time could race. The full refresh is a guarded,
 destructive rewrite, not semantic-delta publication. It keeps

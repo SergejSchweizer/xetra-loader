@@ -146,7 +146,7 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
     sync_source = Path("src/xetra_loader/sync/core.py").read_text(encoding="utf-8")
     feature_refresh_order = (
         'if dataset == "eod_quotes" and counters.total_mutations:' in sync_source
-        and 'cursor.execute("SELECT xetra_loader.refresh_xetra_features()")' in sync_source
+        and 'cursor.execute(f"SELECT {serving_schema}.refresh_xetra_features()")' in sync_source
     )
     log_paths = (
         Path(".logs/xdl-weekly.log"),
@@ -162,7 +162,10 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
         "cron_vienna_sunday_0900": timezone == "Europe/Vienna" and expression == "0 9 * * 0",
         "cron_runs_guarded_direct_full_sync": (
             "bash scripts/run_full_refresh.sh" in cron_line
-            and "artifacts/cron/full-refresh.log" in cron_line
+            and "artifacts/cron" not in cron_line
+            and "full-refresh-cron-*.log" in Path("scripts/run_full_refresh.sh").read_text(
+                encoding="utf-8"
+            )
             and "xdl-enqueue-weekly" not in cron_line
             and "xdl-bootstrap" not in cron_line
         ),
