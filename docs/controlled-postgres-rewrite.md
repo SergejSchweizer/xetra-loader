@@ -30,18 +30,25 @@ authenticated API request from racing the cutover.
 ## Cutover sequence
 
 The command backs up only `xetra_loader` and `xetra_loader_sync` plus the Gold
-manifests, performs the confirmed loader-owned reset, and fetches the complete
-active and delisted universe. Administrative credentials are used only for the
-backup and reset; all serving publication is performed through the configured
-non-superuser writer. It then runs the guarded weekly path once against the
-unchanged source and writes the sanitized V2 acceptance report. Each run adds
-a timestamped recovery directory under the configured backup root. Only after
-the verified `PASS` report is successfully written does the command retain the
-four newest matching full-sync directories and archived weekly checkpoints,
-removing older artifacts of each type. A failed or unverified run never prunes;
-unrelated files and malformed names are left untouched. If pruning itself fails
-after a PASS, the sync remains successful and emits a warning so the completed
-destructive import is not mistakenly retried.
+manifests, then creates `xetra_loader_build` and `xetra_loader_sync_build`.
+It fetches the complete active and delisted universe and publishes every table,
+job queue, feature materialized view, and index into those build schemas. The
+active schemas are not reset or dropped during the download/build phase. Admin
+credentials provision the build schemas; serving publication uses the
+configured non-superuser writer.
+
+After the build's row/key/fingerprint checks pass, one PostgreSQL transaction
+renames the active schemas to `*_previous` and promotes both build schemas to
+the canonical names. If this transaction fails, PostgreSQL rolls back the
+schema-name changes and the original schemas remain active. An independent
+production acceptance run follows the swap. Only after its sanitized V2 report
+is successfully written with `PASS` are the previous schemas removed, without
+`CASCADE` (external dependent objects therefore block cleanup instead of being
+silently deleted). A failed or unverified run leaves the previous schemas in
+place for recovery. Each run adds a timestamped recovery directory under the
+configured backup root; only a verified `PASS` prunes older backup/checkpoint
+artifacts, retaining the four newest matching full-sync directories and
+checkpoints. Unrelated files and malformed names are untouched.
 
 ## Restore the weekly schedule
 

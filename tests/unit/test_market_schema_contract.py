@@ -22,3 +22,11 @@ def test_schema_uses_exact_timestamp_and_date_contract() -> None:
     assert "trade_date DATE NOT NULL" in sql
     assert "timestamp_eod = (trade_date::timestamp AT TIME ZONE 'UTC')" in sql
     assert "TIMESTAMP WITHOUT TIME ZONE" not in sql.upper()
+
+
+def test_all_xetra_tables_have_generated_availability_timestamps() -> None:
+    sql = SCHEMA.read_text(encoding="utf-8")
+    assert sql.count("available_at_utc TIMESTAMPTZ(6) GENERATED ALWAYS AS (") == 8
+    assert "next_business_day_utc((published_at_utc AT TIME ZONE 'UTC')::date)" in sql
+    assert "next_business_day_utc(trade_date)" in sql
+    assert sql.count("next_business_day_utc(event_date)") == 4

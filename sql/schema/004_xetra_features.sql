@@ -252,6 +252,7 @@ CREATE MATERIALIZED VIEW xetra_loader.xetra_features_build AS
 WITH ordered AS (
     SELECT
         q.isin, q.exchange, q.code, q.trade_date,
+        q.available_at_utc,
         q.adjusted_close::double precision AS adjusted_close_level,
         q.volume::double precision AS volume_level,
         q.open::double precision AS open_value,
@@ -530,13 +531,7 @@ WITH ordered AS (
 )
 SELECT
     r.isin, r.exchange, r.code, r.trade_date,
-    (
-        r.trade_date + CASE EXTRACT(ISODOW FROM r.trade_date)::integer
-            WHEN 5 THEN 3
-            WHEN 6 THEN 2
-            ELSE 1
-        END
-    )::timestamp without time zone AT TIME ZONE 'UTC' AS available_at_utc,
+    r.available_at_utc,
     r.adjusted_close_level, r.volume_level,
     r.log_return_1 AS adjusted_close_log_return_1obs,
     r.log_return_3 AS adjusted_close_log_return_3obs,
@@ -729,7 +724,7 @@ BEGIN
     PERFORM set_config('min_parallel_index_scan_size', '0', true);
     PERFORM set_config('parallel_setup_cost', '0', true);
     PERFORM set_config('parallel_tuple_cost', '0', true);
-    REFRESH MATERIALIZED VIEW xetra_loader.xetra_features;
+    REFRESH MATERIALIZED VIEW xetra_features;
 END
 $$;
 

@@ -8,11 +8,16 @@ cd "$repo_root"
 
 run_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 backup_root="/home/dev_xetra/.xdl-full-backups"
+log_path="$repo_root/.logs/full-refresh-cron-${run_stamp}.log"
 report_path="$repo_root/.logs/full-refresh-${run_stamp}-report.json"
 checkpoint_path="$repo_root/lake/weekly.checkpoint.json"
 
 mkdir -p "$repo_root/.logs" "$backup_root"
+chmod 700 "$repo_root/.logs"
 chmod 700 "$backup_root"
+find "$repo_root/.logs" -maxdepth 1 -type f \
+  -name 'full-refresh-cron-*.log' -mtime +90 -delete
+exec >>"$log_path" 2>&1
 
 if [[ -f "$checkpoint_path" ]]; then
   mv -- "$checkpoint_path" "$backup_root/weekly-checkpoint-${run_stamp}.json"

@@ -16,6 +16,7 @@ from xetra_loader.sync.core import (
     JSONValue,
     SyncCounters,
     SyncOutcome,
+    qualify_serving_sql,
     run_sync,
 )
 
@@ -28,6 +29,8 @@ def sync_splits(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
     authoritative_snapshot: GoldValidationSummary | None = None,
+    serving_schema: str = "xetra_loader",
+    sync_schema: str = "xetra_loader_sync",
 ) -> SyncOutcome:
     """Apply active split events and tombstone retractions in one transaction."""
 
@@ -53,8 +56,11 @@ def sync_splits(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
         expected_keys = {event.key for event in gold.rows}
         for key in gold.retracted_keys:
             cursor.execute(
-                "DELETE FROM xetra_loader.splits "
-                "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                qualify_serving_sql(
+                    "DELETE FROM xetra_loader.splits "
+                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    serving_schema,
+                ),
                 key,
             )
             if cursor.rowcount > 0:
@@ -63,8 +69,11 @@ def sync_splits(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
         for event in gold.rows:
             fetched_at = _fetched_at(event.key, fetched_at_by_key, published_at)
             cursor.execute(
-                "SELECT event_date, split_ratio, split_factor FROM xetra_loader.splits "
-                "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                qualify_serving_sql(
+                    "SELECT event_date, split_ratio, split_factor FROM xetra_loader.splits "
+                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    serving_schema,
+                ),
                 event.key,
             )
             existing = cast(
@@ -74,30 +83,42 @@ def sync_splits(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
             semantic = (event.event_date, event.split_ratio, event.split_factor)
             if existing is None:
                 cursor.execute(
-                    "INSERT INTO xetra_loader.splits "
-                    "(isin, exchange, code, event_key, event_date, split_ratio, split_factor, "
-                    "fetched_at_utc, published_at_utc) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    qualify_serving_sql(
+                        "INSERT INTO xetra_loader.splits "
+                        "(isin, exchange, code, event_key, event_date, split_ratio, split_factor, "
+                        "fetched_at_utc, published_at_utc) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        serving_schema,
+                    ),
                     (*event.key, *semantic, fetched_at, published_at),
                 )
                 inserted += 1
             elif existing != semantic:
                 cursor.execute(
-                    "UPDATE xetra_loader.splits SET event_date = %s, split_ratio = %s, "
-                    "split_factor = %s, fetched_at_utc = %s, published_at_utc = %s "
-                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    qualify_serving_sql(
+                        "UPDATE xetra_loader.splits SET event_date = %s, split_ratio = %s, "
+                        "split_factor = %s, fetched_at_utc = %s, published_at_utc = %s "
+                        "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                        serving_schema,
+                    ),
                     (*semantic, fetched_at, published_at, *event.key),
                 )
                 updated += 1
         existing_keys = cursor.execute(
-            "SELECT isin, exchange, code, event_key FROM xetra_loader.splits"
+            qualify_serving_sql(
+                "SELECT isin, exchange, code, event_key FROM xetra_loader.splits",
+                serving_schema,
+            )
         ).fetchall()
         for key in existing_keys:
             normalized = cast(tuple[str, str, str, str], key)
             if normalized not in expected_keys:
                 cursor.execute(
-                    "DELETE FROM xetra_loader.splits "
-                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    qualify_serving_sql(
+                        "DELETE FROM xetra_loader.splits "
+                        "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                        serving_schema,
+                    ),
                     normalized,
                 )
                 retracted += cursor.rowcount
@@ -109,6 +130,8 @@ def sync_splits(  # noqa: PLR0913 -- explicit timestamps and row provenance are 
         semantic_rows=semantic_rows,
         mutate=mutate,
         run_id=run_id,
+        serving_schema=serving_schema,
+        sync_schema=sync_schema,
     )
 
 

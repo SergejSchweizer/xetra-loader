@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +32,22 @@ _DATASET_TABLES: dict[str, str] = {
     "dividends": "dividends",
     "splits": "splits",
 }
+_SCHEMA_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def validate_schema_identifier(schema: str) -> str:
+    """Validate a schema name before interpolating this internal SQL identifier."""
+
+    if not _SCHEMA_IDENTIFIER.fullmatch(schema):
+        raise ValueError(f"invalid PostgreSQL schema identifier: {schema!r}")
+    return schema
+
+
+def qualify_serving_sql(statement: str, schema: str) -> str:
+    """Retarget loader SQL from the active schema to a validated staging schema."""
+
+    validate_schema_identifier(schema)
+    return statement.replace("xetra_loader.", f"{schema}.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,18 +148,22 @@ def semantic_fingerprint(rows: Iterable[SemanticRow]) -> tuple[str, int]:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest(), len(canonical_rows)
 
 
-def run_sync(
+def run_sync(  # noqa: PLR0913 -- schema routing remains explicit at the transaction boundary.
     connection: Connection[Any],
     *,
     dataset: str,
     semantic_rows: Iterable[SemanticRow],
     mutate: Mutator,
     run_id: str | None = None,
+    serving_schema: str = "xetra_loader",
+    sync_schema: str = "xetra_loader_sync",
 ) -> SyncOutcome:
     """Couple serving mutations and sync-state advance in one PostgreSQL transaction."""
 
     if not dataset.strip():
         raise ValueError("dataset must be non-empty")
+    validate_schema_identifier(serving_schema)
+    validate_schema_identifier(sync_schema)
     materialized_rows = tuple(semantic_rows)
     fingerprint, row_count = semantic_fingerprint(materialized_rows)
     serving_row_count = sum(
@@ -165,17 +186,17 @@ def run_sync(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
             (dataset,),
         )
-        _preflight(cursor, dataset)
+        _preflight(cursor, dataset, serving_schema, sync_schema)
         cursor.execute(
             "SELECT semantic_fingerprint, row_count "
-            "FROM xetra_loader_sync.sync_state WHERE dataset = %s FOR UPDATE",
+            f"FROM {sync_schema}.sync_state WHERE dataset = %s FOR UPDATE",
             (dataset,),
         )
         raw_state = cursor.fetchone()
         state = cast(tuple[str, int] | None, raw_state)
         cursor.execute(
             "SELECT entity_key, row_sha256 "
-            "FROM xetra_loader_sync.row_hashes WHERE dataset = %s FOR UPDATE",
+            f"FROM {sync_schema}.row_hashes WHERE dataset = %s FOR UPDATE",
             (dataset,),
         )
         persisted_digests = {
@@ -192,7 +213,7 @@ def run_sync(
             and state[1] == row_count
             and persisted_digests == source_digests
             and (
-                (serving_count := _serving_row_count(cursor, dataset)) is None
+                (serving_count := _serving_row_count(cursor, dataset, serving_schema)) is None
                 or serving_count == serving_row_count
             )
         )
@@ -200,12 +221,14 @@ def run_sync(
         counters = SyncCounters() if is_noop else mutate(cursor)
         if not is_noop:
             if dataset in DATASET_KEY_FIELDS:
-                _replace_row_digests(cursor, dataset, source_digests)
+                _replace_row_digests(cursor, dataset, source_digests, sync_schema)
             if dataset == "eod_quotes" and counters.total_mutations:
-                cursor.execute("SELECT xetra_loader.refresh_xetra_features()")
-            _verify_post_write(cursor, dataset, serving_row_count, source_digests)
+                cursor.execute(f"SELECT {serving_schema}.refresh_xetra_features()")
+            _verify_post_write(
+                cursor, dataset, serving_row_count, source_digests, serving_schema, sync_schema
+            )
             cursor.execute(
-                "INSERT INTO xetra_loader_sync.sync_state "
+                f"INSERT INTO {sync_schema}.sync_state "
                 "(dataset, semantic_fingerprint, row_count, synced_at_utc) "
                 "VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT (dataset) DO UPDATE SET "
@@ -218,7 +241,7 @@ def run_sync(
         finished_at = _require_utc(datetime.now(UTC))
         status = "noop" if is_noop else "applied"
         cursor.execute(
-            "INSERT INTO xetra_loader_sync.loader_runs "
+            f"INSERT INTO {sync_schema}.loader_runs "
             "(run_id, dataset, semantic_fingerprint, row_count, inserted_count, "
             "updated_count, deleted_count, retracted_count, started_at_utc, "
             "finished_at_utc, status) "
@@ -252,6 +275,7 @@ def _replace_row_digests(
     cursor: Cursor[Any],
     dataset: str,
     digests: Mapping[str, str],
+    sync_schema: str = "xetra_loader_sync",
 ) -> None:
     """Replace one dataset's complete digest snapshot in the open transaction."""
 
@@ -267,56 +291,74 @@ def _replace_row_digests(
         for entity_key, row_sha256 in digests.items():
             copy.write_row((entity_key, row_sha256))
     cursor.execute(
-        "DELETE FROM xetra_loader_sync.row_hashes WHERE dataset = %s",
+        f"DELETE FROM {sync_schema}.row_hashes WHERE dataset = %s",
         (dataset,),
     )
     if digests:
         cursor.execute(
-            "INSERT INTO xetra_loader_sync.row_hashes "
+            f"INSERT INTO {sync_schema}.row_hashes "
             "(dataset, entity_key, row_sha256) "
             "SELECT %s, entity_key, row_sha256 FROM xdl_desired_row_hashes",
             (dataset,),
         )
 
 
-def _preflight(cursor: Cursor[Any], dataset: str) -> None:
+def _preflight(
+    cursor: Cursor[Any],
+    dataset: str,
+    serving_schema: str = "xetra_loader",
+    sync_schema: str = "xetra_loader_sync",
+) -> None:
     """Check every relation and routine needed before allowing a mutation."""
 
     table = _DATASET_TABLES.get(dataset)
     cursor.execute(
-        "SELECT to_regclass('xetra_loader_sync.sync_state') IS NOT NULL, "
-        "to_regclass('xetra_loader_sync.loader_runs') IS NOT NULL, "
-        "to_regclass('xetra_loader_sync.row_hashes') IS NOT NULL, "
+        "SELECT to_regclass(%s) IS NOT NULL, "
+        "to_regclass(%s) IS NOT NULL, "
+        "to_regclass(%s) IS NOT NULL, "
         "to_regclass(%s) IS NOT NULL, "
         "(%s = 'eod_quotes' AND "
-        "to_regclass('xetra_loader.xetra_features') IS NOT NULL AND "
-        "to_regprocedure('xetra_loader.refresh_xetra_features()') IS NOT NULL) "
+        "to_regclass(%s) IS NOT NULL AND "
+        "to_regprocedure(%s) IS NOT NULL) "
         "OR %s <> 'eod_quotes'",
-        (f"xetra_loader.{table}" if table else "xetra_loader_sync.sync_state", dataset, dataset),
+        (
+            f"{sync_schema}.sync_state",
+            f"{sync_schema}.loader_runs",
+            f"{sync_schema}.row_hashes",
+            f"{serving_schema}.{table}" if table else f"{sync_schema}.sync_state",
+            dataset,
+            f"{serving_schema}.xetra_features",
+            f"{serving_schema}.refresh_xetra_features()",
+            dataset,
+        ),
     )
     raw = cursor.fetchone()
     if raw is None or not all(bool(value) for value in raw):
         raise RuntimeError(f"PostgreSQL sync preflight failed for dataset {dataset!r}")
 
 
-def _serving_row_count(cursor: Cursor[Any], dataset: str) -> int | None:
+def _serving_row_count(
+    cursor: Cursor[Any], dataset: str, serving_schema: str = "xetra_loader"
+) -> int | None:
     """Confirm that a state-matching sync still has the expected table cardinality."""
 
     table = _DATASET_TABLES.get(dataset)
     if table is None:
         return None
-    cursor.execute(f'SELECT count(*) FROM xetra_loader."{table}"')
+    cursor.execute(f'SELECT count(*) FROM {serving_schema}."{table}"')
     row = cursor.fetchone()
     if row is None:
         raise RuntimeError(f"missing serving row count for dataset {dataset!r}")
     return int(row[0])
 
 
-def _verify_post_write(
+def _verify_post_write(  # noqa: PLR0913, PLR0917 -- schema routing is kept explicit.
     cursor: Cursor[Any],
     dataset: str,
     row_count: int,
     expected_digests: Mapping[str, str],
+    serving_schema: str = "xetra_loader",
+    sync_schema: str = "xetra_loader_sync",
 ) -> None:
     """Verify the complete Gold snapshot before the transaction can commit."""
 
@@ -325,7 +367,7 @@ def _verify_post_write(
     if dataset in DATASET_KEY_FIELDS:
         cursor.execute(
             "SELECT entity_key, row_sha256 "
-            "FROM xetra_loader_sync.row_hashes WHERE dataset = %s",
+            f"FROM {sync_schema}.row_hashes WHERE dataset = %s",
             (dataset,),
         )
         actual_digests = {
@@ -337,7 +379,7 @@ def _verify_post_write(
 
     table = _DATASET_TABLES.get(dataset)
     if table is not None:
-        cursor.execute(f"SELECT count(*) FROM xetra_loader.{table}")
+        cursor.execute(f"SELECT count(*) FROM {serving_schema}.{table}")
         raw_count = cursor.fetchone()
         if raw_count is None or (
             int(raw_count[0]) < row_count
@@ -348,7 +390,7 @@ def _verify_post_write(
     if dataset == "eod_quotes":
         cursor.execute(
             "SELECT count(*), count(DISTINCT (isin, exchange, code, trade_date)) "
-            "FROM xetra_loader.xetra_features"
+            f"FROM {serving_schema}.xetra_features"
         )
         view_counts = cursor.fetchone()
         if view_counts is None or tuple(map(int, view_counts)) != (row_count, row_count):

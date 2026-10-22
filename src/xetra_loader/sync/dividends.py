@@ -16,6 +16,7 @@ from xetra_loader.sync.core import (
     JSONValue,
     SyncCounters,
     SyncOutcome,
+    qualify_serving_sql,
     run_sync,
 )
 
@@ -38,6 +39,8 @@ def sync_dividends(  # noqa: PLR0913 -- explicit timestamps and row provenance a
     published_at_utc: datetime | None = None,
     fetched_at_by_key: Mapping[tuple[str, str, str, str], datetime] | None = None,
     authoritative_snapshot: GoldValidationSummary | None = None,
+    serving_schema: str = "xetra_loader",
+    sync_schema: str = "xetra_loader_sync",
 ) -> SyncOutcome:
     """Apply active dividend events and tombstone retractions in one transaction."""
 
@@ -63,8 +66,11 @@ def sync_dividends(  # noqa: PLR0913 -- explicit timestamps and row provenance a
         expected_keys = {event.key for event in gold.rows}
         for key in gold.retracted_keys:
             cursor.execute(
-                "DELETE FROM xetra_loader.dividends "
-                "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                qualify_serving_sql(
+                    "DELETE FROM xetra_loader.dividends "
+                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    serving_schema,
+                ),
                 key,
             )
             if cursor.rowcount > 0:
@@ -73,9 +79,12 @@ def sync_dividends(  # noqa: PLR0913 -- explicit timestamps and row provenance a
         for event in gold.rows:
             fetched_at = _fetched_at(event.key, fetched_at_by_key, published_at)
             cursor.execute(
-                "SELECT event_date, declaration_date, record_date, payment_date, value, "
-                "currency, period FROM xetra_loader.dividends "
-                "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                qualify_serving_sql(
+                    "SELECT event_date, declaration_date, record_date, payment_date, value, "
+                    "currency, period FROM xetra_loader.dividends "
+                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    serving_schema,
+                ),
                 event.key,
             )
             existing = cast(DividendSemantic | None, cursor.fetchone())
@@ -90,31 +99,45 @@ def sync_dividends(  # noqa: PLR0913 -- explicit timestamps and row provenance a
             )
             if existing is None:
                 cursor.execute(
-                    "INSERT INTO xetra_loader.dividends "
-                    "(isin, exchange, code, event_key, event_date, declaration_date, record_date, "
-                    "payment_date, value, currency, period, fetched_at_utc, published_at_utc) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    qualify_serving_sql(
+                        "INSERT INTO xetra_loader.dividends "
+                        "(isin, exchange, code, event_key, event_date, declaration_date, "
+                        "record_date, "
+                        "payment_date, value, currency, period, fetched_at_utc, published_at_utc) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        serving_schema,
+                    ),
                     (*event.key, *semantic, fetched_at, published_at),
                 )
                 inserted += 1
             elif existing != semantic:
                 cursor.execute(
-                    "UPDATE xetra_loader.dividends SET event_date = %s, declaration_date = %s, "
-                    "record_date = %s, payment_date = %s, value = %s, currency = %s, period = %s, "
-                    "fetched_at_utc = %s, published_at_utc = %s "
-                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    qualify_serving_sql(
+                        "UPDATE xetra_loader.dividends SET event_date = %s, declaration_date = %s, "
+                        "record_date = %s, payment_date = %s, value = %s, currency = %s, "
+                        "period = %s, "
+                        "fetched_at_utc = %s, published_at_utc = %s "
+                        "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                        serving_schema,
+                    ),
                     (*semantic, fetched_at, published_at, *event.key),
                 )
                 updated += 1
         existing_keys = cursor.execute(
-            "SELECT isin, exchange, code, event_key FROM xetra_loader.dividends"
+            qualify_serving_sql(
+                "SELECT isin, exchange, code, event_key FROM xetra_loader.dividends",
+                serving_schema,
+            )
         ).fetchall()
         for key in existing_keys:
             normalized = cast(tuple[str, str, str, str], key)
             if normalized not in expected_keys:
                 cursor.execute(
-                    "DELETE FROM xetra_loader.dividends "
-                    "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                    qualify_serving_sql(
+                        "DELETE FROM xetra_loader.dividends "
+                        "WHERE isin = %s AND exchange = %s AND code = %s AND event_key = %s",
+                        serving_schema,
+                    ),
                     normalized,
                 )
                 retracted += cursor.rowcount
@@ -126,6 +149,8 @@ def sync_dividends(  # noqa: PLR0913 -- explicit timestamps and row provenance a
         semantic_rows=semantic_rows,
         mutate=mutate,
         run_id=run_id,
+        serving_schema=serving_schema,
+        sync_schema=sync_schema,
     )
 
 

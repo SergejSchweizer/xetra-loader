@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +59,15 @@ from xetra_loader.sync.dividends import sync_dividends
 from xetra_loader.sync.listings import prune_stale_listings, sync_listings
 from xetra_loader.sync.quotes import sync_quotes
 from xetra_loader.sync.splits import sync_splits
+
+
+def _rewrite_staging_schema_names(statement: str) -> str:
+    for active, staging in (
+        ("xetra_loader_sync", "xetra_loader_sync_build"),
+        ("xetra_loader", "xetra_loader_build"),
+    ):
+        statement = re.sub(rf"\b{active}\b", staging, statement)
+    return statement
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,6 +565,7 @@ class PostgresEodhdBootstrapRuntime:
         repository_root: Path,
         quarantine_invalid_ohlc: bool = False,
         cores: int | None = None,
+        staging: bool = False,
     ) -> None:
         self._connection = connection
         self._transport = transport
@@ -562,6 +573,9 @@ class PostgresEodhdBootstrapRuntime:
         self._repository_root = repository_root.resolve()
         self._quarantine_invalid_ohlc = quarantine_invalid_ohlc
         self._cores = resolve_cores(cores)
+        self._staging = staging
+        self._serving_schema = "xetra_loader_build" if staging else "xetra_loader"
+        self._sync_schema = "xetra_loader_sync_build" if staging else "xetra_loader_sync"
         self._owns_connection = True
 
     @classmethod
@@ -570,6 +584,7 @@ class PostgresEodhdBootstrapRuntime:
         *,
         quarantine_invalid_ohlc: bool = False,
         cores: int | None = None,
+        staging: bool = False,
     ) -> PostgresEodhdBootstrapRuntime:
         worker_count = resolve_cores(cores)
         root = resolve_medallion_root()
@@ -580,6 +595,7 @@ class PostgresEodhdBootstrapRuntime:
             repository_root=Path.cwd(),
             quarantine_invalid_ohlc=quarantine_invalid_ohlc,
             cores=worker_count,
+            staging=staging,
         )
 
     @classmethod
@@ -588,6 +604,7 @@ class PostgresEodhdBootstrapRuntime:
         *,
         quarantine_invalid_ohlc: bool = False,
         cores: int | None = None,
+        staging: bool = False,
     ) -> PostgresEodhdBootstrapRuntime:
         worker_count = resolve_cores(cores)
         root = resolve_medallion_root()
@@ -598,9 +615,16 @@ class PostgresEodhdBootstrapRuntime:
             repository_root=Path.cwd(),
             quarantine_invalid_ohlc=quarantine_invalid_ohlc,
             cores=worker_count,
+            staging=staging,
         )
 
     def reset_owned_state(self) -> None:
+        if self._staging:
+            with self._connection.transaction(), self._connection.cursor() as cursor:
+                cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_sync_build" CASCADE')
+                cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_build" CASCADE')
+            self._initialize_database(staging=True)
+            return
         execute_reset(
             build_reset_plan(self._layout.root),
             confirmed=True,
@@ -609,6 +633,71 @@ class PostgresEodhdBootstrapRuntime:
         )
         self._initialize_database()
 
+    def promote_staging_state(self) -> None:
+        """Atomically exchange verified build schemas with the serving schemas."""
+
+        if not self._staging:
+            raise RuntimeError("staging promotion requires a staging runtime")
+        with self._connection.transaction(), self._connection.cursor() as cursor:
+            cursor.execute("SET LOCAL lock_timeout = '5s'")
+            previous = cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname IN "
+                "('xetra_loader_previous', 'xetra_loader_sync_previous'))"
+            ).fetchone()
+            if previous is None or bool(previous[0]):
+                raise RuntimeError("an earlier promotion is not finalized; refusing another swap")
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'xetra_loader')"
+            )
+            serving_schema_row = cursor.fetchone()
+            if serving_schema_row is None:
+                raise RuntimeError("could not inspect the current serving schema")
+            has_previous_serving = bool(serving_schema_row[0])
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'xetra_loader_sync')"
+            )
+            sync_schema_row = cursor.fetchone()
+            if sync_schema_row is None:
+                raise RuntimeError("could not inspect the current sync schema")
+            has_previous_sync = bool(sync_schema_row[0])
+            if has_previous_serving and has_previous_sync:
+                active_jobs = cursor.execute(
+                    "SELECT count(*) FROM xetra_loader.loader_jobs "
+                    "WHERE status IN ('queued', 'running')"
+                ).fetchone()
+                if active_jobs is None or int(active_jobs[0]) != 0:
+                    raise RuntimeError("cannot promote while API sync jobs are queued or running")
+                cursor.execute(
+                    "INSERT INTO xetra_loader_build.loader_jobs "
+                    "SELECT * FROM xetra_loader.loader_jobs "
+                    "WHERE status IN ('succeeded', 'failed')"
+                )
+            if has_previous_serving:
+                cursor.execute(
+                    'ALTER SCHEMA "xetra_loader" RENAME TO "xetra_loader_previous"'
+                )
+            if has_previous_sync:
+                cursor.execute(
+                    'ALTER SCHEMA "xetra_loader_sync" RENAME TO "xetra_loader_sync_previous"'
+                )
+            cursor.execute(
+                'ALTER SCHEMA "xetra_loader_build" RENAME TO "xetra_loader"'
+            )
+            cursor.execute(
+                'ALTER SCHEMA "xetra_loader_sync_build" RENAME TO "xetra_loader_sync"'
+            )
+            for signature in (
+                "xetra_loader.refresh_xetra_features()",
+                "xetra_loader.resolve_feature_work_mem()",
+                "xetra_loader.resolve_feature_temp_file_limit()",
+            ):
+                cursor.execute(
+                    f"ALTER FUNCTION {signature} SET search_path = pg_catalog, xetra_loader"
+                )
+            reader_sql = (
+                self._repository_root / "sql/roles/005_xetra_loader_feature_view_reader.sql"
+            ).read_text(encoding="utf-8")
+            cursor.execute(reader_sql.replace("BEGIN;", "").replace("COMMIT;", ""))
     def fetch_worker(self) -> PostgresEodhdBootstrapRuntime:
         """Return a fetch-only worker with independent HTTP state.
 
@@ -624,6 +713,7 @@ class PostgresEodhdBootstrapRuntime:
             repository_root=self._repository_root,
             quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
             cores=self._cores,
+            staging=getattr(self, "_staging", False),
         )
         worker._owns_connection = False
         return worker
@@ -643,6 +733,7 @@ class PostgresEodhdBootstrapRuntime:
             repository_root=self._repository_root,
             quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
             cores=worker_count,
+            staging=self._staging,
         )
 
     def fetch_listings(self) -> FetchBatch[ListingRecord]:
@@ -775,12 +866,20 @@ class PostgresEodhdBootstrapRuntime:
         *,
         fetched_at_by_key: Mapping[tuple[str, str, str], datetime] | None = None,
     ) -> SyncOutcome:
-        return sync_listings(self._connection, gold, fetched_at_by_key=fetched_at_by_key)
+        return sync_listings(
+            self._connection,
+            gold,
+            fetched_at_by_key=fetched_at_by_key,
+            serving_schema=self._serving_schema,
+            sync_schema=self._sync_schema,
+        )
 
     def prune_stale_listings(self, gold: ListingGoldResult) -> int:
         """Prune listing identities only after dependent datasets are published."""
 
-        return prune_stale_listings(self._connection, gold)
+        return prune_stale_listings(
+            self._connection, gold, serving_schema=self._serving_schema
+        )
 
     def publish_quotes(
         self,
@@ -794,6 +893,8 @@ class PostgresEodhdBootstrapRuntime:
             gold,
             fetched_at_by_key=fetched_at_by_key,
             authoritative_snapshot=authoritative_snapshot,
+            serving_schema=self._serving_schema,
+            sync_schema=self._sync_schema,
         )
 
     def publish_dividends(
@@ -808,6 +909,8 @@ class PostgresEodhdBootstrapRuntime:
             gold,
             fetched_at_by_key=fetched_at_by_key,
             authoritative_snapshot=authoritative_snapshot,
+            serving_schema=self._serving_schema,
+            sync_schema=self._sync_schema,
         )
 
     def publish_splits(
@@ -822,6 +925,8 @@ class PostgresEodhdBootstrapRuntime:
             gold,
             fetched_at_by_key=fetched_at_by_key,
             authoritative_snapshot=authoritative_snapshot,
+            serving_schema=self._serving_schema,
+            sync_schema=self._sync_schema,
         )
 
     def verify(
@@ -880,9 +985,11 @@ class PostgresEodhdBootstrapRuntime:
         if self._owns_connection:
             self._connection.close()
 
-    def _initialize_database(self) -> None:
+    def _initialize_database(self, *, staging: bool = False) -> None:
         for relative in SCHEMA_FILES:
             sql = (self._repository_root / relative).read_text(encoding="utf-8")
+            if staging:
+                sql = _rewrite_staging_schema_names(sql)
             self._connection.execute(sql)
 
     def _measurement_start(self) -> tuple[int, int, float]:
@@ -1094,18 +1201,23 @@ class PostgresEodhdBootstrapRuntime:
         )
 
     def _count(self, table: str) -> int:
-        row = self._connection.execute(f'SELECT count(*) FROM xetra_loader."{table}"').fetchone()
+        row = self._connection.execute(
+            f'SELECT count(*) FROM {self._serving_schema}."{table}"'
+        ).fetchone()
         if row is None:
             raise RuntimeError(f"missing count result for {table}")
         return int(row[0])
 
     def _keys(self, table: str, columns: str) -> set[tuple[str, ...]]:
-        rows = self._connection.execute(f'SELECT {columns} FROM xetra_loader."{table}"').fetchall()
+        rows = self._connection.execute(
+            f'SELECT {columns} FROM {self._serving_schema}."{table}"'
+        ).fetchall()
         return {tuple(str(value) for value in row) for row in rows}
 
     def _date_bounds(self, table: str, column: str) -> tuple[date | None, date | None]:
         row = self._connection.execute(
-            f'SELECT min("{column}"), max("{column}") FROM xetra_loader."{table}"'
+            f'SELECT min("{column}"), max("{column}") '
+            f'FROM {self._serving_schema}."{table}"'
         ).fetchone()
         if row is None:
             raise RuntimeError(f"missing date-bound result for {table}")
@@ -1114,12 +1226,21 @@ class PostgresEodhdBootstrapRuntime:
     def _sync_state_matches(self, dataset: str, outcome: SyncOutcome) -> bool:
         row = self._connection.execute(
             "SELECT semantic_fingerprint, row_count "
-            "FROM xetra_loader_sync.sync_state WHERE dataset = %s",
+            f"FROM {self._sync_schema}.sync_state WHERE dataset = %s",
             (dataset,),
         ).fetchone()
         if row is None:
             return False
         return str(row[0]) == outcome.semantic_fingerprint and int(row[1]) == outcome.row_count
+
+
+def drop_previous_serving_schemas(connection: Connection[Any]) -> None:
+    """Remove previous schemas after verification, without cascading into dependents."""
+
+    with connection.transaction(), connection.cursor() as cursor:
+        cursor.execute("SET LOCAL lock_timeout = '5s'")
+        cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_sync_previous"')
+        cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_previous"')
 
 
 def _dividend_silver(event: DividendEvent) -> dict[str, JSONValue]:
