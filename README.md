@@ -127,6 +127,11 @@ features. Fold-local standardization is a downstream operation documented in
 [`docs/train-fold-standardization.md`](docs/train-fold-standardization.md); it
 never changes Gold or the global feature view.
 
+Schema migrations build a replacement feature view under a staging name and
+swap it into place only after the full-history calculation and identity index
+are complete. The previous view remains available during the build; the
+transactional rename preserves it if the replacement fails.
+
 The feature catalog is currently version **4**. Its window metadata declares
 the counting domain explicitly: price lag/return/ROC/RSI windows count valid
 price levels (`n + 1` levels for an `n`-lag or period), high-low and intraday
@@ -140,25 +145,32 @@ Feature-view refresh memory is deployment-configurable through
 `config.yaml`. The validated range is **16MB through 4GB**, with a conservative
 default of **256MB**. PostgreSQL applies `work_mem` per operation and worker,
 so the setting is a resource budget rather than a transaction-wide memory cap;
-the migration and weekly refresh use the same setting.
+the migration and weekly refresh use the same setting. Temporary-file spill is
+also capped per PostgreSQL process through `XDL_FEATURE_TEMP_FILE_LIMIT` or
+`postgres.feature_temp_file_limit`, defaulting to **32GB** (validated range
+**1GB–64GB**). At six cores that allows at most 192GB across the leader and
+five workers; a failed build rolls back and preserves the previously served view.
 
 ## API and durable weekly worker
 
 `xdl-api` hosts both the REST application and its one durable sync worker in
-the same process. The cron entry runs `xdl-enqueue-weekly`, which submits a
-`weekly_sync` request; it does not start a second downloader or compute
-process.
+the same process. The API remains available for explicit job submission, but
+the scheduled Sunday job is the guarded direct full-refresh wrapper below; the
+cron does not also enqueue an API job.
 
 ```text
-Sunday cron ──POST /v1/jobs──> xdl-api REST routes
-                                   │ committed INSERT + NOTIFY
-                                   ▼
-                         xetra_loader.loader_jobs
-                                   │ LISTEN/NOTIFY
-                                   ▼
-                      in-process weekly job worker
-                                   │
-                                   └──> restart-safe EODHD → lake → PostgreSQL pipeline
+Sunday cron ──> scripts/run_full_refresh.sh
+                       │ guarded destructive reset + full history refresh
+                       ▼
+             restart-safe EODHD → lake → PostgreSQL pipeline
+
+Optional API submissions ──> xdl-api REST routes
+                                  │ committed INSERT + NOTIFY
+                                  ▼
+                        xetra_loader.loader_jobs
+                                  │ LISTEN/NOTIFY
+                                  ▼
+                     in-process weekly job worker
 ```
 
 The API exposes `GET /healthz`, authenticated `POST /v1/jobs` with
@@ -263,6 +275,44 @@ the measured result and environment are recorded in
 global plan was 14.26× faster than per-instrument plans. This synthetic
 microbenchmark does not measure total weekly-sync or PostgreSQL-refresh time.
 
+For PostgreSQL feature materialization, the per-instrument indicator arrays are
+now expanded together with `unnest(... ) WITH ORDINALITY`, rather than reading
+each element separately with `generate_subscripts` and array subscripting. A
+read-only PostgreSQL microbenchmark on 20,000 synthetic observations (three
+rounds, identical scalar EMA/MACD calculations, exact matching checksums)
+measured median **3.242s** for indexed extraction and **0.143s** for aligned
+multi-array `unnest` (about **22.7× faster**). `EXPLAIN` with six configured cores
+also planned a `Gather Merge` with five workers and reduced the largest
+intermediate row estimate from 1.09 billion to 10.9 million. These are
+microbenchmark/planner results, not an end-to-end refresh timing; dependent
+window calculations still run in PostgreSQL's leader process.
+
+The per-instrument EMA arrays are expanded behind a materialized CTE boundary
+so PostgreSQL cannot reorder the correlated `unnest` after the daily-row join
+and regenerate each instrument's complete arrays for every observation. On the
+production database, a read-only sample containing six complete instruments
+(12,950 quote rows) took **3.34s** with this boundary; the same sampled query
+without it exceeded a 120s diagnostic timeout. This is a sampled SQL-plan
+measurement, not a full-view refresh benchmark. The source scan planned and
+launched five parallel workers with the six-core budget; PostgreSQL still
+evaluates the dependent per-instrument window stages in the leader.
+
+On a broader 1/100 instrument sample (88,529 quote rows), sourcing daily market
+breadth/dispersion from the narrower `returns` CTE while materializing the wide
+`normalized` rows once reduced the measured query from **24.37s** to **17.68s**
+(27.5% faster). The sampled plan had no temporary-block reads or writes; this
+does not establish the temporary-storage requirement of a full-history build.
+
+A full production schema rebuild on **2026-10-22** completed in about **38
+minutes** with six configured cores, `work_mem=4GB`, and a **32GB per-process**
+temporary-file limit. The resulting materialized view contained **10,921,690
+rows and 105 columns**, matching the raw quote-row count; its relation size was
+10.4GB and peak temporary files reached **19.8GB**. The previous 16GB cap was
+insufficient, while the staged replacement kept the old view available until
+the replacement and identity index were ready. After commit, no staging view or
+temporary files remained. This is one observed production rebuild, not a
+runtime guarantee.
+
 ## PostgreSQL schema inventory
 
 The raw quote table `xetra_loader.eod_quotes` has **13 columns**: four identity
@@ -288,15 +338,21 @@ Stochastic, and Donchian features.
 
 ## Schedule and resource limits
 
-The repository cron artifact schedules a durable weekly job for Sunday
-`11:00` in `Europe/Vienna`; one in-process worker runs the restart-safe
-pipeline. The host's current user crontab is intentionally different: it runs a
-full historical refresh on Saturday at `09:00` and copies the Gold lake to
-`/volume1/Temp/Quotes` on Sunday at `22:00`. The API service is not installed
-for the current user, so the repository's Sunday enqueue entry is not the
-active host sync schedule. Install the cron file and API service separately
-before describing that deployment as active. `weekly.cores` defaults to **6** and can
-be overridden with `xdl-weekly --cores N`, `xdl-api --cores N`,
+The repository cron artifact schedules the guarded direct full-refresh wrapper
+for Sunday `09:00` in `Europe/Vienna`, logging to
+`artifacts/cron/full-refresh.log`. The active host user crontab runs the same
+full historical refresh at that time and copies the Gold lake to
+`/volume1/Temp/Quotes` on Sunday at `22:00` (also `Europe/Vienna`). Keep the
+REST enqueue out of the Sunday schedule while this direct full sync is active;
+running both at the same time could race. The full refresh is a guarded,
+destructive rewrite, not semantic-delta publication. It keeps
+timestamped recovery backups under `/home/dev_xetra/.xdl-full-backups`. After a
+verified `PASS` report is written, it keeps the four newest full-sync backup
+directories and the four newest archived weekly checkpoints, pruning older
+matching artifacts; failed runs never trigger pruning. Unrelated files in that
+directory are left untouched. `weekly.cores` defaults to **6** and can be
+overridden with
+`xdl-weekly --cores N`, `xdl-api --cores N`,
 `xdl-bootstrap --cores N`, `xdl-migrate --cores N`,
 `xdl-verify-production-sync --cores N`, or `XDL_CORES`.
 The API sets `POLARS_MAX_THREADS` before importing Polars, and the same budget bounds
@@ -305,12 +361,19 @@ Polars-heavy stage; PostgreSQL publication stays serialized except for the
 independent dividend/split writers, whose per-query PostgreSQL worker budgets
 are divided so their combined leader-plus-worker budget does not exceed
 `weekly.cores`. Feature-view refresh is one atomic PostgreSQL operation. API
-and weekly logs are rotated below ignored `.logs/`.
+and all loader-module logs are written at DEBUG level to ignored `.logs/` files
+named for their entrypoint (API, weekly, bootstrap, migration, verifier, and
+enqueue client). They rotate at UTC midnight; files older than 90 days are
+removed at startup and rollover. `XDL_LOG_DIR` can override the default log
+directory. Log records include module names, and credentials/tokens must never
+be written to logs.
 
 PostgreSQL `work_mem` for feature refresh is separately configurable through
 `XDL_FEATURE_WORK_MEM` or `postgres.feature_work_mem`; the default is `256MB`
 within the validated `16MB`–`4GB` range. It is a per-operation/per-worker
-budget, not a transaction-wide cap.
+budget, not a transaction-wide cap. Feature-view build/refresh sessions also
+set the configured `temp_file_limit` (default **32GB per PostgreSQL process**)
+to bound disk spill.
 
 Every data/runtime session opened through `connect_postgres` applies
 `max_parallel_workers_per_gather` and `max_parallel_maintenance_workers` as

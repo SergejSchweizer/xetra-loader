@@ -29,6 +29,9 @@ _FEATURE_WORK_MEM_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>kB|MB|GB)$"
 _FEATURE_WORK_MEM_DEFAULT = "256MB"
 _FEATURE_WORK_MEM_MIN_BYTES = 16 * 1024 * 1024
 _FEATURE_WORK_MEM_MAX_BYTES = 4 * 1024 * 1024 * 1024
+_FEATURE_TEMP_FILE_LIMIT_DEFAULT = "32GB"
+_FEATURE_TEMP_FILE_LIMIT_MIN_BYTES = 1 * 1024 * 1024 * 1024
+_FEATURE_TEMP_FILE_LIMIT_MAX_BYTES = 64 * 1024 * 1024 * 1024
 _CORES_DEFAULT = 6
 _CORES_MIN = 1
 _CORES_MAX = 64
@@ -140,6 +143,20 @@ def resolve_feature_work_mem(explicit: str | None = None) -> str:
     return _validate_feature_work_mem(configured or _FEATURE_WORK_MEM_DEFAULT)
 
 
+def resolve_feature_temp_file_limit(explicit: str | None = None) -> str:
+    """Resolve and validate the per-PostgreSQL-process feature temp-file cap."""
+
+    configured = explicit or os.getenv("XDL_FEATURE_TEMP_FILE_LIMIT")
+    if not configured:
+        configured = _string(
+            _section(load_file_configuration().values, "postgres"),
+            "feature_temp_file_limit",
+        )
+    return _validate_feature_temp_file_limit(
+        configured or _FEATURE_TEMP_FILE_LIMIT_DEFAULT
+    )
+
+
 def resolve_cores(explicit: int | str | None = None) -> int:
     """Resolve the single bounded CPU/concurrency budget for a loader run."""
 
@@ -236,4 +253,24 @@ def _validate_feature_work_mem(value: object) -> str:
     size_bytes = int(match["amount"]) * multiplier
     if not _FEATURE_WORK_MEM_MIN_BYTES <= size_bytes <= _FEATURE_WORK_MEM_MAX_BYTES:
         raise ConfigurationError("postgres.feature_work_mem must be between 16MB and 4GB")
+    return candidate
+
+
+def _validate_feature_temp_file_limit(value: object) -> str:
+    if not isinstance(value, str):
+        raise ConfigurationError(
+            "postgres.feature_temp_file_limit must be an integer size from 1GB through 64GB"
+        )
+    candidate = value.strip()
+    match = _FEATURE_WORK_MEM_RE.fullmatch(candidate)
+    if match is None:
+        raise ConfigurationError(
+            "postgres.feature_temp_file_limit must be an integer size from 1GB through 64GB"
+        )
+    multiplier = {"kB": 1024, "MB": 1024**2, "GB": 1024**3}[match["unit"]]
+    size_bytes = int(match["amount"]) * multiplier
+    if not _FEATURE_TEMP_FILE_LIMIT_MIN_BYTES <= size_bytes <= _FEATURE_TEMP_FILE_LIMIT_MAX_BYTES:
+        raise ConfigurationError(
+            "postgres.feature_temp_file_limit must be between 1GB and 64GB"
+        )
     return candidate

@@ -80,8 +80,16 @@ def test_schema_qa_uses_validated_configurable_refresh_memory_policy() -> None:
     assert "work_mem = '1GB'" not in VIEW_SQL
     assert "xetra_loader.resolve_feature_work_mem()" in VIEW_SQL
     assert "16MB and 4GB" in VIEW_SQL
+    assert "xetra_loader.resolve_feature_temp_file_limit()" in VIEW_SQL
+    assert "1GB and 64GB" in VIEW_SQL
     assert "xetra_loader.compute_cores" in VIEW_SQL
     assert "max_parallel_workers_per_gather" in VIEW_SQL
+    assert (
+        VIEW_SQL.count(
+            "'temp_file_limit', xetra_loader.resolve_feature_temp_file_limit(), true"
+        )
+        == 2
+    )
 
 
 def test_schema_qa_enables_parallel_source_scans_for_build_and_refresh() -> None:

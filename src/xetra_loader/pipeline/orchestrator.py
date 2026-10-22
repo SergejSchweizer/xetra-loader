@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-import argparse
-import importlib
-import json
-import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import cast
 
 from xetra_loader.sync.core import JSONValue
 
@@ -97,29 +92,6 @@ def run_weekly_pipeline(stages: PipelineStages) -> PipelineSummary:
     return PipelineSummary(tuple(reports))
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the weekly pipeline non-interactively from a configured stage factory."""
-
-    parser = argparse.ArgumentParser(prog="xdl-weekly")
-    parser.add_argument(
-        "--factory",
-        default=os.getenv("XDL_PIPELINE_FACTORY"),
-        help="Dotted factory in module:function form; may also come from XDL_PIPELINE_FACTORY.",
-    )
-    args = parser.parse_args(argv)
-    if args.factory is None:
-        parser.error("--factory or XDL_PIPELINE_FACTORY is required")
-
-    stages = _load_factory(str(args.factory))()
-    try:
-        summary = run_weekly_pipeline(stages)
-    except PipelineStageError as exc:
-        print(json.dumps(exc.summary.as_dict(), sort_keys=True, separators=(",", ":")))
-        return 1
-    print(json.dumps(summary.as_dict(), sort_keys=True, separators=(",", ":")))
-    return 0
-
-
 def _ordered_stages(stages: PipelineStages) -> tuple[tuple[str, StageCallable], ...]:
     return (
         ("listings", stages.listings),
@@ -133,18 +105,3 @@ def _ordered_stages(stages: PipelineStages) -> tuple[tuple[str, StageCallable], 
         ("postgres_splits_sync", stages.postgres_splits_sync),
         ("verification", stages.verification),
     )
-
-
-def _load_factory(spec: str) -> Callable[[], PipelineStages]:
-    if ":" not in spec:
-        raise ValueError("pipeline factory must use module:function form")
-    module_name, function_name = spec.split(":", 1)
-    module = importlib.import_module(module_name)
-    factory = getattr(module, function_name)
-    if not callable(factory):
-        raise TypeError("pipeline factory target must be callable")
-    return cast(Callable[[], PipelineStages], factory)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

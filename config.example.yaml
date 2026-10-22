@@ -12,6 +12,8 @@ postgres:
   admin_dsn: "postgresql://dbadmin:replace-admin-password@10.10.1.3:54321/xetra_loader"
   # Feature refresh budget per PostgreSQL operation/worker; valid range 16MB-4GB.
   feature_work_mem: "256MB"
+  # Feature refresh spill cap per PostgreSQL process; valid range 1GB-64GB.
+  feature_temp_file_limit: "32GB"
 
 medallion:
   root: "./lake"

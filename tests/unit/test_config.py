@@ -8,6 +8,7 @@ from xetra_loader.config import (
     resolve_api_token,
     resolve_cores,
     resolve_eodhd_token,
+    resolve_feature_temp_file_limit,
     resolve_feature_work_mem,
     resolve_medallion_root,
     resolve_postgres_admin_dsn,
@@ -27,6 +28,7 @@ postgres:
   password: p@ss/word
   database: market
   feature_work_mem: 512MB
+  feature_temp_file_limit: 24GB
 medallion:
   root: /tmp/medallion
 """,
@@ -56,6 +58,7 @@ def test_ignored_yaml_config_resolves_loader_values(
     )
     assert resolve_medallion_root() == "/tmp/medallion"
     assert resolve_feature_work_mem() == "512MB"
+    assert resolve_feature_temp_file_limit() == "24GB"
 
 
 def test_environment_values_override_yaml_config(
@@ -114,6 +117,24 @@ def test_feature_work_mem_environment_overrides_yaml(
     monkeypatch.setenv("XDL_FEATURE_WORK_MEM", "1GB")
 
     assert resolve_feature_work_mem() == "1GB"
+
+
+@pytest.mark.parametrize("value", ["512MB", "65GB", "0GB", "-1GB", "not-a-size"])
+def test_feature_temp_file_limit_validation_fails_closed(value: str) -> None:
+    with pytest.raises(ConfigurationError):
+        resolve_feature_temp_file_limit(value)
+
+
+def test_feature_temp_file_limit_environment_overrides_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    monkeypatch.setenv("XDL_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("XDL_FEATURE_TEMP_FILE_LIMIT", "32GB")
+
+    assert resolve_feature_temp_file_limit() == "32GB"
 
 
 def test_cores_resolve_from_yaml_and_environment(

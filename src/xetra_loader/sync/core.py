@@ -15,6 +15,7 @@ from psycopg import Connection, Cursor
 
 from xetra_loader.config import (
     resolve_cores,
+    resolve_feature_temp_file_limit,
     resolve_feature_work_mem,
     resolve_postgres_admin_dsn,
     resolve_postgres_writer_dsn,
@@ -84,6 +85,10 @@ def connect_postgres(
     connection.execute(
         "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
         (resolve_feature_work_mem(),),
+    )
+    connection.execute(
+        "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
+        (resolve_feature_temp_file_limit(),),
     )
     configured_cores = resolve_cores(cores)
     connection.execute(

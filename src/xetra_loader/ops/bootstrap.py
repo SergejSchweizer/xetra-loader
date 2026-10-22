@@ -37,6 +37,7 @@ from xetra_loader.ingestion.dividends import ingest_dividends
 from xetra_loader.ingestion.listings import ingest_xetra_listings
 from xetra_loader.ingestion.quotes import ingest_quotes
 from xetra_loader.ingestion.splits import ingest_splits
+from xetra_loader.logging_config import configure_logging
 from xetra_loader.medallion.core import (
     BronzePartition,
     GoldArtifact,
@@ -1210,6 +1211,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Execute the production bootstrap only after literal destructive confirmation."""
 
+    configure_logging("xdl-bootstrap")
     args = _parser().parse_args(argv)
     if not args.confirm_destructive_reset:
         print(canonical_json({"status": "BLOCKED", "reason": "confirmation-required"}))

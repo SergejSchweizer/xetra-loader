@@ -6,8 +6,11 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import shutil
 import socket
 import subprocess
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -27,6 +30,7 @@ from xetra_loader.gold.dividends import DividendGoldResult
 from xetra_loader.gold.listings import ListingGoldResult
 from xetra_loader.gold.quotes import QuoteGoldResult
 from xetra_loader.gold.splits import SplitGoldResult
+from xetra_loader.logging_config import configure_logging
 from xetra_loader.medallion.core import (
     JSONValue,
     Layer,
@@ -49,6 +53,11 @@ from xetra_loader.sync.core import SyncOutcome
 EXPECTED_HOST = "10.10.1.3"
 EXPECTED_PORT = 54321
 DATASETS = ("listings", "eod_quotes", "dividends", "splits")
+_FULL_SYNC_BACKUP_NAME = re.compile(r"xetra-loader-(\d{8}T\d{6}Z)")
+_WEEKLY_CHECKPOINT_BACKUP_NAME = re.compile(
+    r"weekly-checkpoint-(\d{8}T\d{6}Z)-\d+\.json"
+)
+_FULL_SYNC_BACKUP_RETENTION = 4
 
 _EXPECTED_TIMESTAMP_COLUMNS = {
     ("xetra_loader", "listings", "fetched_at_utc"),
@@ -426,6 +435,20 @@ def execute_production_full_sync_and_verify(
     write_production_report(report, output_path)
     if not report.passed:
         raise ProductionVerificationError("production PostgreSQL acceptance report is not PASS")
+    try:
+        removed_backups = _prune_full_sync_backups(backup_root)
+    except (OSError, ProductionVerificationError):
+        print(
+            "WARNING: full-sync passed, but backup retention cleanup failed; "
+            "existing backups were left in place",
+            file=sys.stderr,
+        )
+    else:
+        if removed_backups:
+            print(
+                f"backup_retention=kept_{_FULL_SYNC_BACKUP_RETENTION}_removed_{len(removed_backups)}",
+                file=sys.stderr,
+            )
     return report
 
 
@@ -730,19 +753,45 @@ def write_production_report(report: ProductionAcceptanceReport, path: Path) -> P
 def _require_scheduler_disabled() -> None:
     """Refuse a destructive rewrite while the recurring writer can still start."""
 
-    result = subprocess.run(["crontab", "-l"], check=False, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["crontab", "-l"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProductionVerificationError(
+            "unable to inspect the current user's cron schedule"
+        ) from exc
+    if result.returncode != 0:
+        no_crontab = (
+            result.returncode == 1
+            and not result.stdout.strip()
+            and re.search(r"\bno crontab for\b", result.stderr, re.IGNORECASE) is not None
+        )
+        if no_crontab:
+            return
+        raise ProductionVerificationError("unable to inspect the current user's cron schedule")
+
+    weekly_command = re.compile(r"(?<![\w-])xdl-(?:enqueue-)?weekly(?![\w-])", re.IGNORECASE)
     active = [
         line
         for line in result.stdout.splitlines()
-        if line.strip() and not line.lstrip().startswith("#") and "xdl-weekly" in line
+        if line.strip() and not line.lstrip().startswith("#") and weekly_command.search(line)
     ]
     if active:
-        raise ProductionVerificationError("disable the recurring xdl-weekly cron entry first")
+        raise ProductionVerificationError(
+            "disable the recurring xdl-weekly or xdl-enqueue-weekly cron entry first"
+        )
 
 
 def _require_private_backup_root(path: Path) -> None:
     repository = Path.cwd().resolve()
     resolved = path.resolve()
+    if path.is_symlink():
+        raise ProductionVerificationError("backup root must not be a symbolic link")
     if resolved == repository or repository in resolved.parents:
         raise ProductionVerificationError("backup root must be outside the repository")
 
@@ -776,6 +825,42 @@ def _backup_owned_state(medallion_root: Path, backup_root: Path) -> None:
     }
     (destination / "checksums.json").write_text(
         canonical_json(cast(JSONValue, checksums)) + "\n", encoding="utf-8"
+    )
+
+
+def _prune_full_sync_backups(backup_root: Path) -> tuple[str, ...]:
+    """Keep the four newest full-sync directories and checkpoint snapshots."""
+
+    _require_private_backup_root(backup_root)
+    if backup_root.is_symlink():
+        raise ProductionVerificationError("backup root must not be a symbolic link")
+    root = backup_root.resolve(strict=True)
+    if not root.is_dir():
+        raise ProductionVerificationError("backup root must be a directory")
+
+    backups: list[Path] = []
+    checkpoint_backups: list[Path] = []
+    for child in root.iterdir():
+        if child.is_symlink() or child.resolve(strict=True).parent != root:
+            continue
+        if _FULL_SYNC_BACKUP_NAME.fullmatch(child.name) is not None and child.is_dir():
+            backups.append(child)
+        elif (
+            _WEEKLY_CHECKPOINT_BACKUP_NAME.fullmatch(child.name) is not None
+            and child.is_file()
+        ):
+            checkpoint_backups.append(child)
+
+    backups.sort(key=lambda item: item.name)
+    checkpoint_backups.sort(key=lambda item: item.name)
+    obsolete_directories = backups[:-_FULL_SYNC_BACKUP_RETENTION]
+    obsolete_checkpoints = checkpoint_backups[:-_FULL_SYNC_BACKUP_RETENTION]
+    for backup in obsolete_directories:
+        shutil.rmtree(backup)
+    for checkpoint in obsolete_checkpoints:
+        checkpoint.unlink()
+    return tuple(
+        item.name for item in (*obsolete_directories, *obsolete_checkpoints)
     )
 
 
@@ -1241,6 +1326,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the mandatory real-target gate only with both explicit execution confirmations."""
 
+    configure_logging("xdl-verify-production-sync")
     args = _parser().parse_args(argv)
     if not args.execute_full_sync or not args.confirm_destructive_reset:
         print(

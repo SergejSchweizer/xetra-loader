@@ -7,6 +7,7 @@ import os
 from collections.abc import Sequence
 
 from xetra_loader.config import ConfigurationError, resolve_cores
+from xetra_loader.logging_config import configure_logging
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -17,6 +18,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cores = resolve_cores(arguments.cores)
     except ConfigurationError as exc:
         parser.error(str(exc))
+    configure_logging("xdl-verify-production-sync")
     os.environ["POLARS_MAX_THREADS"] = str(cores)
     os.environ["XDL_CORES"] = str(cores)
 
