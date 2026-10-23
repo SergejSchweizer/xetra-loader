@@ -23,6 +23,7 @@ from xetra_loader.ops.bootstrap import (
 from xetra_loader.pipeline.runtime import (
     _dividend_silver_row,
     _parallel_database_core_budgets,
+    _corporate_fingerprint,
     _replace_action_window,
     _split_silver_row,
     _WeeklyState,
@@ -154,6 +155,15 @@ def _seed_silver_rows(root: Path, dataset: str, rows: list[dict[str, object]]) -
     writer = object.__new__(PostgresEodhdBootstrapRuntime)
     writer._layout = MedallionLayout(root)
     writer.persist_silver(dataset, rows)  # type: ignore[arg-type]
+
+
+def test_corporate_fingerprint_is_independent_of_partition_read_order() -> None:
+    first = {"isin": "A", "exchange": "XETRA", "code": "AAA", "event_key": "1"}
+    second = {"isin": "B", "exchange": "XETRA", "code": "BBB", "event_key": "2"}
+
+    assert _corporate_fingerprint([first, second], ()) == _corporate_fingerprint(
+        [second, first], ()
+    )
 
 
 def test_weekly_quote_refresh_uses_delta_without_split(tmp_path: Path) -> None:

@@ -893,7 +893,17 @@ def _corporate_fingerprint(
     retracted: tuple[tuple[str, str, str, str], ...],
 ) -> str:
     payload: JSONValue = {
-        "rows": cast(JSONValue, rows),
+        # Dataset reads follow partition/file order, while Gold builders sort
+        # corporate actions by their stable event identity before hashing.
+        "rows": cast(
+            JSONValue,
+            sorted(
+                rows,
+                key=lambda row: tuple(
+                    str(row[field]) for field in ("isin", "exchange", "code", "event_key")
+                ),
+            ),
+        ),
         "retracted_keys": [list(key) for key in retracted],
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
