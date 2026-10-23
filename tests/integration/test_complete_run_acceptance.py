@@ -74,6 +74,7 @@ class _CompleteRunRuntime:
             for listing in self.listings
         )
         self.gold_commits: list[str] = []
+        self.silver_commits: list[str] = []
         self.publications: list[str] = []
 
     def reset_owned_state(self) -> None:
@@ -150,7 +151,7 @@ class _CompleteRunRuntime:
             PUBLISHED_AT,
         )
 
-    def persist_gold(
+    def persist_gold(  # noqa: PLR0913 - mirror production runtime protocol
         self,
         dataset: str,
         semantic_rows: Iterable[Mapping[str, object]],
@@ -158,9 +159,20 @@ class _CompleteRunRuntime:
         row_count: int,
         semantic_fingerprint: str,
         retracted_keys: Iterable[tuple[str, str, str, str]] = (),
+        durable_sync: bool = True,
     ) -> None:
-        del semantic_rows, row_count, semantic_fingerprint, retracted_keys
+        del semantic_rows, row_count, semantic_fingerprint, retracted_keys, durable_sync
         self.gold_commits.append(dataset)
+
+    def persist_silver(
+        self,
+        dataset: str,
+        semantic_rows: Iterable[Mapping[str, object]],
+        *,
+        durable_sync: bool = True,
+    ) -> None:
+        del semantic_rows, durable_sync
+        self.silver_commits.append(dataset)
 
     def publish_listings(self, gold: ListingGoldResult, **kwargs: object) -> object:
         self.publications.append("listings")
@@ -347,7 +359,7 @@ def test_complete_gold_postgres_feature_acceptance(tmp_path: Path) -> None:
         restart = run_restartable_pipeline(
             _stage_factory(),
             lock_path=tmp_path / "complete.lock",
-            checkpoint_path=tmp_path / "complete.checkpoint.json",
+            checkpoint_path=tmp_path / "complete.checkpoint.parquet",
         )
 
         raw_checks = {
@@ -380,14 +392,17 @@ def test_complete_gold_postgres_feature_acceptance(tmp_path: Path) -> None:
             "sync_state_hashes_and_counts": all(state_checks.values()),
             "feature_identity_matches_quotes": set(before_replay)
             == {(row.code, row.trade_date) for row in fixture},
-            "feature_columns_are_catalog_exact": columns
-            == (
-                "isin",
-                "exchange",
-                "code",
-                "trade_date",
-                "available_at_utc",
-                *feature_columns(),
+            "feature_columns_are_catalog_exact": (
+                len(columns) == 105
+                and set(columns)
+                == {
+                    "isin",
+                    "exchange",
+                    "code",
+                    "trade_date",
+                    "available_at_utc",
+                    *feature_columns(),
+                }
             ),
             "forbidden_ohlc_levels_absent": not {
                 "open_level",

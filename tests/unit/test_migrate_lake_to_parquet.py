@@ -1,21 +1,32 @@
 """Recoverable full-lake JSON-to-Parquet migration tests."""
 
 import hashlib
+import os
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Lock
+from typing import cast
 
 import polars as pl
 import pytest
 import scripts.migrate_lake_to_parquet as lake_migration
 from scripts.migrate_lake_to_parquet import (
     _archive_legacy_artifacts,
+    _canonical_quote_payload,
+    _convert_canonical_bronze_payloads,
     _convert_snapshot,
+    _decode_bronze_payload_json,
+    _legacy_artifact,
+    _nested_quote_canonical_target,
+    _obsolete_checkpoint_archives,
+    _semantically_equal,
     _unreferenced_canonical_artifacts,
     _unreferenced_snapshot_sidecars,
     _validate_canonical_lake,
+    _verify_nested_quote_legacy_sources,
     migrate_lake,
 )
 
@@ -36,6 +47,7 @@ from xetra_loader.medallion.core import (
     canonical_json,
     read_dataset_rows,
     read_parquet_rows,
+    write_manifest_parquet,
     write_parquet_rows,
     write_raw_listing_partitions,
 )
@@ -126,9 +138,7 @@ def _legacy_lake(root: Path) -> MedallionLayout:
     )
 
     bronze_partition = (
-        layout.dataset_path(Layer.BRONZE, "eod_quotes")
-        / "partitions"
-        / "AAA!XETRA!ISIN.parquet"
+        layout.dataset_path(Layer.BRONZE, "eod_quotes") / "partitions" / "AAA!XETRA!ISIN.parquet"
     )
     bronze_partition.parent.mkdir(parents=True, exist_ok=True)
     bronze_partition.with_suffix(".json").write_text(
@@ -145,17 +155,31 @@ def test_migration_writes_canonical_parquet_and_archives_legacy_artifacts(
     backup_parent = tmp_path / "backups"
     layout = _legacy_lake(root)
     obsolete_daily = (
-        root
-        / "bronze/dataset_type=eod_quotes/exchange=XETRA/instrument_type=unknown/"
+        root / "bronze/dataset_type=eod_quotes/exchange=XETRA/instrument_type=unknown/"
         "symbol=AAA/timeframe=1d/year=2026/month=2026-08/date=2026-08-21/data.parquet"
     )
     write_parquet_rows(obsolete_daily, [{"code": "AAA", "payload_json": "{}"}])
+    obsolete_checkpoint = root / "weekly.checkpoint.aborted-20260824T1644Z.parquet"
+    write_parquet_rows(
+        obsolete_checkpoint,
+        [{"version": 1, "completed": ["listings"]}],
+    )
+    probe_checkpoint = root / "weekly.checkpoint.aborted-role-probe-20261023.parquet"
+    write_parquet_rows(
+        probe_checkpoint,
+        [{"version": 1, "completed": ["listings"], "details": {"listings": {"probe": True}}}],
+    )
 
     report = migrate_lake(root, backup_parent)
 
     assert report["status"] == "PASS"
     assert report["datasets_fingerprint_valid"] == len(DATASETS)
+    assert report["obsolete_checkpoint_archives_preserved"] == 2
     backup = Path(str(report["recovery_backup"]))
+    assert (backup / obsolete_checkpoint.name).is_file()
+    assert (backup / probe_checkpoint.name).is_file()
+    assert not obsolete_checkpoint.exists()
+    assert not probe_checkpoint.exists()
     assert (backup / obsolete_daily.relative_to(root)).is_file()
     assert not obsolete_daily.exists()
     assert (backup / "silver" / "eod_quotes" / "data.json").exists()
@@ -184,7 +208,7 @@ def test_migration_writes_canonical_parquet_and_archives_legacy_artifacts(
             "isin": "ISIN",
             "exchange": "XETRA",
             "code": "AAA",
-            "payload_json": '{"Code":"AAA","Exchange":"XETRA","ISIN":"ISIN"}',
+            "provider_payload": {"Code": "AAA", "Exchange": "XETRA", "ISIN": "ISIN"},
         }
     ]
     assert (
@@ -208,7 +232,7 @@ def test_migration_writes_canonical_parquet_and_archives_legacy_artifacts(
             "isin": "ISIN",
             "exchange": "XETRA",
             "code": "AAA",
-            "payload_json": '{"close":12}',
+            "provider_payload": {"close": 12},
         }
     ]
 
@@ -348,6 +372,73 @@ def test_presorted_snapshot_writer_flushes_one_partition_before_consuming_the_ne
     assert written_symbols == ["AAA", "BBB", "CCC"]
 
 
+def test_partition_writer_uses_configured_bounded_parallelism() -> None:
+    barrier = Barrier(2)
+    guard = Lock()
+    active = 0
+    peak_active = 0
+
+    def write(symbol: str) -> str:
+        nonlocal active, peak_active
+        with guard:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            if symbol in {"AAA", "BBB"}:
+                barrier.wait(timeout=3)
+            return symbol
+        finally:
+            with guard:
+                active -= 1
+
+    paths = bootstrap_module._run_partition_writes(
+        (lambda symbol=symbol: write(symbol) for symbol in ("AAA", "BBB", "CCC")),
+        workers=2,
+    )
+
+    assert paths == ["AAA", "BBB", "CCC"]
+    assert peak_active == 2
+
+
+def test_snapshot_sort_uses_polars_and_preserves_canonical_order() -> None:
+    rows: list[dict[str, JSONValue]] = [
+        {
+            "isin": "DE0000000002",
+            "exchange": "XETRA",
+            "code": "BBB",
+            "trade_date": "2026-08-21",
+            "value": "z",
+        },
+        {
+            "isin": "DE0000000001",
+            "exchange": "XETRA",
+            "code": "AAA",
+            "trade_date": "2026-08-22",
+            "value": "a",
+        },
+        {
+            "isin": "DE0000000001",
+            "exchange": "XETRA",
+            "code": "AAA",
+            "trade_date": "2026-08-21",
+            "value": "b",
+        },
+        {
+            "isin": "DE0000000002",
+            "exchange": "XETRA",
+            "code": "BBB",
+            "trade_date": "2026-08-21",
+            "value": "a",
+        },
+    ]
+
+    actual = bootstrap_module._polars_sorted_snapshot_rows("eod_quotes", rows)
+    expected = sorted(rows, key=lambda row: bootstrap_module._snapshot_sort_key("eod_quotes", row))
+
+    assert actual == expected
+    assert bootstrap_module._polars_sorted_snapshot_rows("eod_quotes", reversed(rows)) == expected
+
+
 def test_empty_legacy_archive_does_not_create_backup_directory(tmp_path: Path) -> None:
     root = tmp_path / "lake"
     backup = tmp_path / "backup"
@@ -362,9 +453,7 @@ def test_migration_archives_unreferenced_canonical_snapshot_artifacts(
 ) -> None:
     root = tmp_path / "lake"
     layout = MedallionLayout(root)
-    silver = layout.silver_path(
-        SilverPartition("eod_quotes", "XETRA", "AAA", "1d", 2026)
-    )
+    silver = layout.silver_path(SilverPartition("eod_quotes", "XETRA", "AAA", "1d", 2026))
     gold_artifact = GoldArtifact(
         "xetra-eod_quotes-gold-v1",
         "XETRA",
@@ -430,9 +519,7 @@ def test_migration_archives_unreferenced_canonical_snapshot_artifacts(
             layer,
             semantic_metadata,
             {
-                "artifact_paths": [
-                    path.relative_to(root).as_posix() for path in artifact_paths
-                ],
+                "artifact_paths": [path.relative_to(root).as_posix() for path in artifact_paths],
                 "retractions_path": (
                     dividend_sidecar.relative_to(root).as_posix()
                     if dataset == "dividends"
@@ -442,7 +529,7 @@ def test_migration_archives_unreferenced_canonical_snapshot_artifacts(
         )
         manifest_path = layout.manifest_path(layer, dataset)
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(manifest.to_json(), encoding="utf-8")
+        write_manifest_parquet(manifest_path, manifest)
 
     orphaned = _unreferenced_canonical_artifacts(root)
     orphan_sidecar = layout.retractions_path(Layer.GOLD, "splits")
@@ -493,6 +580,415 @@ def test_archive_rejects_sources_outside_lake(tmp_path: Path) -> None:
     assert not (tmp_path / "backup").exists()
 
 
+def test_validator_accepts_valid_root_level_parquet_restart_checkpoint(tmp_path: Path) -> None:
+    root = tmp_path / "lake"
+    root.mkdir()
+    checkpoint = root / "weekly.checkpoint.parquet"
+    write_parquet_rows(
+        checkpoint,
+        [{"version": 1, "completed": ["listings"], "details": {"listings": {"count": 1}}}],
+    )
+
+    assert _validate_canonical_lake(root) == 0
+
+
+def test_validator_rejects_invalid_root_level_parquet_checkpoint(tmp_path: Path) -> None:
+    root = tmp_path / "lake"
+    root.mkdir()
+    write_parquet_rows(
+        root / "weekly.checkpoint.parquet",
+        [{"version": 99, "completed": ["listings"], "details": {"listings": {"count": 1}}}],
+    )
+
+    with pytest.raises(ValueError, match="invalid loader checkpoint"):
+        _validate_canonical_lake(root)
+
+
+def test_aborted_parquet_checkpoints_are_preserved_outside_lake_and_active_is_strict(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    root.mkdir()
+    active = root / "weekly.checkpoint.parquet"
+    write_parquet_rows(
+        active,
+        [{"version": 1, "completed": ["listings"], "details": {"listings": {"count": 1}}}],
+    )
+    malformed_archive = root / "weekly.checkpoint.aborted-20260824T1644Z.parquet"
+    write_parquet_rows(malformed_archive, [{"version": 1, "completed": ["listings"]}])
+    valid_archive = root / "weekly.checkpoint.aborted-role-probe-20261023.parquet"
+    write_parquet_rows(
+        valid_archive,
+        [{"version": 1, "completed": ["listings"], "details": {"listings": {"probe": True}}}],
+    )
+
+    archived_sources = _obsolete_checkpoint_archives(root)
+    backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+    assert _archive_legacy_artifacts(root, backup, additional_sources=archived_sources) == 2
+
+    assert active.is_file()
+    assert not malformed_archive.exists()
+    assert not valid_archive.exists()
+    assert read_parquet_rows(backup / malformed_archive.name) == [
+        {"version": 1, "completed": ["listings"]}
+    ]
+    assert read_parquet_rows(backup / valid_archive.name)[0]["details"] == {
+        "listings": {"probe": True}
+    }
+    assert _validate_canonical_lake(root) == 0
+
+    write_parquet_rows(active, [{"version": 1, "completed": ["listings"]}])
+    with pytest.raises(ValueError, match="checkpoint details must match completed stages"):
+        _validate_canonical_lake(root)
+
+
+def test_validator_still_rejects_unrecognized_root_level_parquet(tmp_path: Path) -> None:
+    root = tmp_path / "lake"
+    root.mkdir()
+    write_parquet_rows(root / "unrelated.parquet", [{"value": 1}])
+
+    with pytest.raises(ValueError, match="non-canonical Parquet row artifacts"):
+        _validate_canonical_lake(root)
+
+
+def _canonical_bronze_fixture(
+    root: Path,
+    dataset: str,
+    payload_text: str = '{"close":10.0,"provider_tag":"fixture"}',
+) -> Path:
+    layout = MedallionLayout(root)
+    path = layout.bronze_path(
+        BronzePartition(dataset, "XETRA", "ETF", "AAA", "1d", date(2026, 10, 1))
+    )
+    write_parquet_rows(
+        path,
+        [
+            {
+                "isin": "DE0000000001",
+                "exchange": "XETRA",
+                "code": "AAA",
+                "payload_json": payload_text,
+            },
+            {
+                "isin": "DE0000000001",
+                "exchange": "XETRA",
+                "code": "AAA",
+                "payload_json": payload_text,
+            },
+        ],
+    )
+    return path
+
+
+def test_canonical_bronze_payload_conversion_covers_all_datasets_and_preserves_multiplicity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+    sources = {dataset: _canonical_bronze_fixture(root, dataset) for dataset in DATASETS}
+
+    converted = _convert_canonical_bronze_payloads(root, backup, cores=3)
+
+    assert converted == len(DATASETS)
+    assert _validate_canonical_lake(root) == len(DATASETS)
+    assert backup.stat().st_mode & 0o777 == 0o700
+    for _dataset, source in sources.items():
+        live = read_parquet_rows(source)
+        original = read_parquet_rows(backup / source.relative_to(root))
+        assert len(live) == len(original) == 2
+        assert all(
+            row["provider_payload"]["provider_tag"] == "fixture" for row in live
+        )
+        assert all("payload_json" not in row for row in live)
+        assert all("payload_json" in row for row in original)
+        assert "provider_payload" in pl.read_parquet_schema(source)
+        assert "payload_json" not in pl.read_parquet_schema(source)
+        assert not list(source.parent.glob(".data.parquet.*.tmp"))
+
+
+def test_bronze_payload_conversion_preserves_decimal_precision_and_struct_key_union(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+    source = _canonical_bronze_fixture(
+        root,
+        "splits",
+        '{"precise":0.12345678901234567890123456789,"large":'
+        '12345678901234567890123456789,"nested":{"a":1}}',
+    )
+    source_rows = read_parquet_rows(source)
+    source_rows[1]["payload_json"] = '{"nested":{"b":2}}'
+    write_parquet_rows(source, source_rows)
+
+    assert _convert_canonical_bronze_payloads(root, backup, cores=1) == 1
+
+    payloads = [row["provider_payload"] for row in read_parquet_rows(source)]
+    assert payloads[0]["nested"] == {"a": 1, "b": None}
+    assert payloads[1]["nested"] == {"a": None, "b": 2}
+    decoded = _decode_bronze_payload_json(
+        '{"precise":0.12345678901234567890123456789,"large":'
+        '12345678901234567890123456789}',
+        source,
+        1,
+    )
+    assert decoded["precise"] == Decimal("0.12345678901234567890123456789")
+    assert decoded["large"] == 12345678901234567890123456789
+    assert _semantically_equal({"a": 1}, {"a": 1, "b": None})
+
+
+def test_empty_canonical_bronze_payload_file_is_backed_up_then_removed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+    source = MedallionLayout(root).bronze_path(
+        BronzePartition("splits", "XETRA", "ETF", "EMPTY", "event", date(2026, 10, 1))
+    )
+    empty = pl.DataFrame(
+        schema={
+            "isin": pl.String,
+            "exchange": pl.String,
+            "code": pl.String,
+            "payload_json": pl.String,
+        }
+    )
+    source.parent.mkdir(parents=True)
+    empty.write_parquet(source)
+    original_bytes = source.read_bytes()
+
+    assert _convert_canonical_bronze_payloads(root, backup, cores=2) == 1
+
+    assert not source.exists()
+    recovered = backup / source.relative_to(root)
+    assert recovered.read_bytes() == original_bytes
+    assert pl.read_parquet(recovered).height == 0
+    assert "payload_json" in pl.read_parquet_schema(recovered)
+    assert backup.stat().st_mode & 0o777 == 0o700
+    assert _validate_canonical_lake(root) == 0
+
+
+def test_invalid_canonical_bronze_payload_fails_closed_without_changing_source(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    source = _canonical_bronze_fixture(root, "splits", "not-json")
+    original_bytes = source.read_bytes()
+    backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+
+    with pytest.raises(ValueError, match="invalid Bronze payload_json"):
+        _convert_canonical_bronze_payloads(root, backup, cores=2)
+
+    assert source.read_bytes() == original_bytes
+    assert not backup.exists()
+    assert not list(source.parent.glob(".data.parquet.*.tmp"))
+
+
+def test_canonical_bronze_payload_conversion_backup_and_retry_are_restart_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "lake"
+    source = _canonical_bronze_fixture(root, "splits")
+    original_bytes = source.read_bytes()
+    first_backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+    real_replace = os.replace
+
+    def interrupt_live_replace(source_path: str | Path, target_path: str | Path) -> None:
+        if Path(target_path) == source:
+            raise OSError("simulated interruption before promotion")
+        real_replace(source_path, target_path)
+
+    monkeypatch.setattr(lake_migration.os, "replace", interrupt_live_replace)
+    with pytest.raises(OSError, match="simulated interruption"):
+        _convert_canonical_bronze_payloads(root, first_backup, cores=1)
+
+    assert source.read_bytes() == original_bytes
+    assert (first_backup / source.relative_to(root)).read_bytes() == original_bytes
+
+    monkeypatch.setattr(lake_migration.os, "replace", real_replace)
+    retry_backup = tmp_path / "private-backup" / "20261023T120001000000Z"
+    assert _convert_canonical_bronze_payloads(root, retry_backup, cores=1) == 1
+    assert len(read_parquet_rows(source)) == 2
+    assert all("provider_payload" in row for row in read_parquet_rows(source))
+    assert _convert_canonical_bronze_payloads(
+        root,
+        tmp_path / "private-backup" / "20261023T120002000000Z",
+        cores=1,
+    ) == 0
+
+
+def test_canonical_bronze_validator_rejects_legacy_or_missing_payload_schema(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    source = _canonical_bronze_fixture(root, "splits")
+
+    with pytest.raises(ValueError, match="legacy payload_json remains"):
+        _validate_canonical_lake(root)
+
+    native_without_payload = source.with_name("native-without-provider.parquet")
+    write_parquet_rows(
+        native_without_payload,
+        [{"isin": "DE0000000001", "exchange": "XETRA", "code": "AAA"}],
+    )
+    native_without_payload.rename(source)
+    with pytest.raises(ValueError, match="native provider_payload is missing"):
+        _validate_canonical_lake(root)
+
+    write_parquet_rows(
+        source,
+        [{"isin": "DE0000000001", "exchange": "XETRA", "code": "AAA", "provider_payload": "{}"}],
+    )
+    with pytest.raises(ValueError, match="provider_payload must be a native struct"):
+        _validate_canonical_lake(root)
+
+
+def _nested_quote_legacy_fixture(
+    root: Path,
+    legacy_quotes: list[dict[str, JSONValue]],
+    canonical_quotes: list[dict[str, JSONValue]] | None,
+) -> tuple[Path, Path | None]:
+    source = (
+        root
+        / "bronze/dataset_type=eod_quotes/exchange=XETRA/instrument_type=ETF/"
+        "symbol=ASRT/symbol=ASRR/timeframe=1d/year=2026/month=2026-10/data.parquet"
+    )
+    write_parquet_rows(
+        source,
+        [
+            {
+                "isin": "DE0000000001",
+                "exchange": "XETRA",
+                "code": "ASRR",
+                "payload_json": canonical_json(quote),
+            }
+            for quote in legacy_quotes
+        ],
+    )
+    target = _nested_quote_canonical_target(root, source)
+    if canonical_quotes is not None:
+        write_parquet_rows(
+            target,
+            [
+                {
+                    "isin": "DE0000000001",
+                    "exchange": "XETRA",
+                    "code": "ASRR",
+                    "provider_payload": quote,
+                }
+                for quote in canonical_quotes
+            ],
+        )
+        return source, target
+    return source, None
+
+
+def _quote_payload(day: str, close: float) -> dict[str, JSONValue]:
+    return {
+        "code": "ASRR",
+        "exchange": "XETRA",
+        "isin": "DE0000000001",
+        "type": "ETF",
+        "date": day,
+        "open": 8.5,
+        "high": 12.0,
+        "low": 8.0,
+        "close": close,
+        "adjusted_close": close,
+        "volume": 100,
+    }
+
+
+def test_quote_payload_normalization_is_limited_to_known_numeric_fields() -> None:
+    normalized = _canonical_quote_payload(
+        {
+            "close": 10.0,
+            "volume": Decimal("100.00"),
+            "provider_metric": 1.0,
+            "metadata": {"close": Decimal("10.00")},
+        }
+    )
+
+    assert normalized["close"] == "10"
+    assert normalized["volume"] == "100"
+    assert normalized["provider_metric"] == 1.0
+    assert normalized["metadata"] == {"close": Decimal("10.00")}
+
+
+def test_nested_quote_archival_requires_proof_and_accepts_canonical_superset(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    legacy = [_quote_payload("2026-10-01", 10.0), _quote_payload("2026-10-02", 11.0)]
+    newer = _quote_payload("2026-10-03", 12.0)
+    canonical = []
+    for quote in [*legacy, newer]:
+        canonical.append(
+            {
+                key: (
+                    cast(JSONValue, Decimal(str(value)).quantize(Decimal("0.01")))
+                    if key in {"open", "high", "low", "close", "adjusted_close", "volume"}
+                    and isinstance(value, (int, float))
+                    else value
+                )
+                for key, value in quote.items()
+            }
+        )
+    source, target = _nested_quote_legacy_fixture(root, legacy, canonical)
+    assert target is not None
+
+    verified = _verify_nested_quote_legacy_sources(root)
+
+    assert verified == [source]
+    assert target is not None
+    assert "instrument_type=ETF" in target.as_posix()
+    assert sum(part.startswith("symbol=") for part in target.relative_to(root).parts) == 1
+    assert not _legacy_artifact(source, root)
+    backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+    assert _archive_legacy_artifacts(root, backup) == 0
+    assert source.is_file()
+    assert _archive_legacy_artifacts(root, backup, additional_sources=verified) == 1
+    assert not source.exists()
+    assert (backup / source.relative_to(root)).is_file()
+    assert target.is_file()
+
+
+def test_nested_quote_archival_fails_closed_when_canonical_target_is_missing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    source, _ = _nested_quote_legacy_fixture(
+        root,
+        [_quote_payload("2026-10-01", 10.0)],
+        None,
+    )
+
+    with pytest.raises(ValueError, match="have no canonical target"):
+        _verify_nested_quote_legacy_sources(root)
+
+    assert source.is_file()
+    assert _archive_legacy_artifacts(root, tmp_path / "backup") == 0
+    assert source.is_file()
+    assert not (tmp_path / "backup").exists()
+
+
+def test_nested_quote_archival_fails_closed_when_any_payload_row_is_missing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    legacy = [_quote_payload("2026-10-01", 10.0), _quote_payload("2026-10-02", 11.0)]
+    source, _ = _nested_quote_legacy_fixture(root, legacy, legacy[:1])
+
+    with pytest.raises(ValueError, match="1 missing"):
+        _verify_nested_quote_legacy_sources(root)
+
+    assert source.is_file()
+    assert _archive_legacy_artifacts(root, tmp_path / "backup") == 0
+    assert source.is_file()
+    assert not (tmp_path / "backup").exists()
+
+
 def test_streaming_gold_fingerprint_validation_matches_canonical_hashes(
     tmp_path: Path,
 ) -> None:
@@ -537,7 +1033,7 @@ def test_streaming_gold_fingerprint_validation_matches_canonical_hashes(
                 "event_date": "2026-08-20",
                 "amount": "0.50",
                 "payment_date": None,
-            }
+            },
         ],
         "splits": [
             {
@@ -591,16 +1087,19 @@ def test_lake_migration_cli_passes_explicit_core_budget(
     monkeypatch.setattr(lake_migration, "resolve_medallion_root", resolve_root)
     monkeypatch.setattr(lake_migration, "migrate_lake", migrate)
 
-    assert lake_migration.main(
-        [
-            "--root",
-            str(tmp_path / "lake"),
-            "--backup-root",
-            str(tmp_path / "backup"),
-            "--cores",
-            "3",
-        ]
-    ) == 0
+    assert (
+        lake_migration.main(
+            [
+                "--root",
+                str(tmp_path / "lake"),
+                "--backup-root",
+                str(tmp_path / "backup"),
+                "--cores",
+                "3",
+            ]
+        )
+        == 0
+    )
     assert observed["root"] == tmp_path / "lake"
     assert observed["backup_root"] == tmp_path / "backup"
     assert observed["cores"] == 3

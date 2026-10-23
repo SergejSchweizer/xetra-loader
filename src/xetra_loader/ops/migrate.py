@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from psycopg import Connection
+from psycopg import Connection, sql
 
 from xetra_loader.config import (
     resolve_cores,
@@ -62,13 +62,27 @@ def apply_postgres_schema(
             db.commit()
         applied_files = list(SCHEMA_FILES)
         for relative in SCHEMA_FILES:
-            sql = (root / relative).read_text(encoding="utf-8")
-            db.execute(sql)
+            sql_text = (root / relative).read_text(encoding="utf-8")
+            db.execute(sql_text)
         role_exists = db.execute(
             "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)",
             ("xetra_loader",),
         ).fetchone()
+        version_row = db.execute("SHOW server_version_num").fetchone()
+        if version_row is None:
+            raise RuntimeError("PostgreSQL server version could not be determined")
+        server_version = int(version_row[0])
         db.commit()
+        if server_version < 150000:
+            # PostgreSQL 14 cannot delegate SET on a superuser-context GUC.
+            # Apply the validated cap at login for the dedicated writer role.
+            db.execute(
+                sql.SQL("ALTER ROLE {} SET temp_file_limit TO {}").format(
+                    sql.Identifier("xetra_data_loader_writer"),
+                    sql.Literal(resolve_feature_temp_file_limit()),
+                )
+            )
+            db.commit()
         if role_exists is not None and role_exists[0]:
             # 004 drops and recreates the materialized view, which removes
             # object grants. Reapply the external reader contract afterward.

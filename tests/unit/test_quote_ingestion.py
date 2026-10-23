@@ -74,7 +74,7 @@ def test_unchanged_replay_has_no_semantic_delta() -> None:
     )
     assert replay.inserted_keys == ()
     assert replay.corrected_keys == ()
-    assert replay.bronze_payload == first.bronze_payload
+    assert replay.bronze_rows == first.bronze_rows
 
 
 def test_correction_is_detected_once() -> None:
@@ -137,7 +137,7 @@ def test_zero_high_low_and_zero_volume_keep_valid_close_without_invalid_ohlc() -
     assert quote.low is None
     assert str(quote.close) == "20.15"
     assert quote.volume == 0
-    assert '"high":0' in result.bronze_payload
+    assert result.bronze_rows[0]["high"] == 0
 
 
 def test_invalid_open_is_nulled_while_valid_quote_fields_are_retained() -> None:
@@ -156,7 +156,7 @@ def test_invalid_open_is_nulled_while_valid_quote_fields_are_retained() -> None:
     assert invalid.low == 9
     assert invalid.close == 10
     assert result.silver_records[1].trade_date == date(2026, 8, 22)
-    assert '"date":"2026-08-21"' in result.bronze_payload
+    assert result.bronze_rows[0]["date"] == "2026-08-21"
 
 
 def test_adjusted_close_outside_raw_range_nuls_only_close() -> None:
@@ -181,4 +181,4 @@ def test_adjusted_close_outside_raw_range_nuls_only_close() -> None:
     assert quote.adjusted_close == Decimal("95.2765")
     assert quote.open == quote.high == quote.low == Decimal("95.62")
     assert quote.volume == 0
-    assert '"close":95.2765' in result.bronze_payload
+    assert Decimal(str(result.bronze_rows[0]["close"])) == Decimal("95.2765")

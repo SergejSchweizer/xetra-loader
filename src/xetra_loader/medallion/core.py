@@ -9,6 +9,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import TextIO, cast
@@ -116,7 +117,7 @@ class MedallionLayout:
         )
 
     def metadata_path(self, layer: Layer, dataset: str) -> Path:
-        """Resolve the JSON control-metadata directory, outside row partitions."""
+        """Resolve the Parquet control-metadata directory, outside row partitions."""
 
         return self.root / layer.value / "_metadata" / _hive("dataset_type", dataset)
 
@@ -127,6 +128,9 @@ class MedallionLayout:
         return self.root / layer.value / dataset
 
     def manifest_path(self, layer: Layer, dataset: str) -> Path:
+        return self.metadata_path(layer, dataset) / "manifest.parquet"
+
+    def legacy_metadata_manifest_path(self, layer: Layer, dataset: str) -> Path:
         return self.metadata_path(layer, dataset) / "manifest.json"
 
     def legacy_manifest_path(self, layer: Layer, dataset: str) -> Path:
@@ -184,33 +188,106 @@ def write_parquet_rows(
     sync_file: bool = True,
     sync_directory: bool = True,
 ) -> None:
-    """Write semantic rows with Polars, encoding nested Bronze payloads losslessly."""
+    """Write rows with Polars, preserving nested values as native Parquet types."""
 
-    normalized: list[dict[str, object]] = []
-    for row in rows:
-        normalized.append(
-            {
-                key: canonical_json(value) if isinstance(value, (dict, list)) else value
-                for key, value in row.items()
-            }
-        )
-    if not normalized:
-        return
-    atomic_write_parquet(
+    write_native_parquet_rows(
         path,
-        pl.DataFrame(normalized, infer_schema_length=None, strict=False),
+        rows,
         sync_file=sync_file,
         sync_directory=sync_directory,
     )
 
 
-def write_raw_listing_partitions(
+def write_native_parquet_row(
+    path: Path,
+    row: Mapping[str, object],
+    *,
+    sync_file: bool = True,
+    sync_directory: bool = True,
+) -> None:
+    """Write one typed metadata row without JSON-encoding nested values."""
+
+    write_native_parquet_rows(
+        path,
+        [row],
+        sync_file=sync_file,
+        sync_directory=sync_directory,
+    )
+
+
+def write_native_parquet_rows(
+    path: Path,
+    rows: Iterable[Mapping[str, object]],
+    *,
+    sync_file: bool = True,
+    sync_directory: bool = True,
+) -> None:
+    """Write typed rows with nested structs/lists preserved as Parquet values."""
+
+    materialized = [dict(row) for row in rows]
+    if not materialized:
+        return
+    atomic_write_parquet(
+        path,
+        pl.DataFrame(materialized, infer_schema_length=None, strict=False),
+        sync_file=sync_file,
+        sync_directory=sync_directory,
+    )
+
+
+def read_manifest_payload(path: Path) -> dict[str, JSONValue]:
+    """Read only the canonical Parquet manifest, never a legacy JSON sidecar."""
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+    rows = pl.read_parquet(path, low_memory=True).to_dicts()
+    if len(rows) != 1:
+        raise ValueError(f"manifest must contain exactly one row: {path}")
+    payload = rows[0]
+    if not isinstance(payload, dict):
+        raise ValueError(f"manifest must contain an object: {path}")
+    return cast(dict[str, JSONValue], payload)
+
+
+def write_manifest_parquet(path: Path, manifest: Manifest) -> None:
+    """Atomically publish a typed one-row Parquet manifest."""
+
+    payload: dict[str, object] = {
+        "dataset": manifest.dataset,
+        "layer": manifest.layer.value,
+        "semantic_fingerprint": manifest.semantic_fingerprint(),
+        "semantic_metadata": dict(manifest.semantic_metadata),
+        "run_metadata": dict(manifest.run_metadata),
+    }
+    write_native_parquet_row(path, payload)
+    path.with_suffix(".json").unlink(missing_ok=True)
+
+
+def migrate_json_manifests(root: Path) -> int:
+    """Convert canonical legacy JSON manifests to verified Parquet in place."""
+
+    migrated = 0
+    for json_path in sorted(root.glob("*/_metadata/dataset_type=*/manifest.json")):
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"manifest must contain an object: {json_path}")
+        parquet_path = json_path.with_suffix(".parquet")
+        write_native_parquet_row(parquet_path, payload)
+        if read_manifest_payload(parquet_path) != payload:
+            raise ValueError(f"manifest Parquet verification failed: {parquet_path}")
+        json_path.unlink()
+        migrated += 1
+    return migrated
+
+
+def write_raw_listing_partitions(  # noqa: PLR0913 - explicit partition write policy inputs
     layout: MedallionLayout,
     dataset: str,
     payload_rows: Iterable[Mapping[str, JSONValue]],
     *,
     skip_existing: bool = False,
     snapshot_date: date | None = None,
+    durable_sync: bool = True,
 ) -> int:
     """Persist raw provider listing objects in the canonical monthly Bronze layout."""
 
@@ -223,7 +300,13 @@ def write_raw_listing_partitions(
         code_text = code if isinstance(code, str) else ""
         exchange_text = exchange if isinstance(exchange, str) else ""
         isin_text = isin if isinstance(isin, str) else ""
-        encoded = canonical_json(cast(JSONValue, dict(payload))).encode("utf-8")
+        encoded = json.dumps(
+            cast(JSONValue, dict(payload)),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
         symbol = code_text or f"unidentified-{hashlib.sha256(encoded).hexdigest()[:16]}"
         path = layout.bronze_path(
             BronzePartition(
@@ -240,7 +323,7 @@ def write_raw_listing_partitions(
                 "isin": isin_text or None,
                 "exchange": exchange_text or "unknown",
                 "code": code_text or symbol,
-                "payload_json": canonical_json(cast(JSONValue, dict(payload))),
+                "provider_payload": dict(payload),
             }
         )
 
@@ -248,27 +331,72 @@ def write_raw_listing_partitions(
     for path, rows in grouped.items():
         if skip_existing and path.exists():
             continue
-        write_parquet_rows(path, rows)
+        write_native_parquet_rows(
+            path,
+            rows,
+            sync_file=durable_sync,
+            sync_directory=durable_sync,
+        )
         written += 1
     return written
 
 
 def read_parquet_rows(path: Path) -> list[dict[str, JSONValue]]:
-    """Read one Parquet artifact with Polars and restore canonical JSON scalars."""
+    """Read one Parquet artifact and normalize nested Polars values."""
 
     rows: list[dict[str, JSONValue]] = []
     for row in pl.read_parquet(path, low_memory=True).to_dicts():
         normalized: dict[str, JSONValue] = {}
         for key, value in row.items():
-            if value is None or isinstance(value, (str, int, float, bool)):
-                normalized[key] = value
-            elif hasattr(value, "isoformat"):
-                normalized[key] = value.isoformat()
-            else:
-                value_type = type(value).__name__
-                raise ValueError(f"unsupported Parquet value in {path}: {key}={value_type}")
+            normalized[key] = _normalize_parquet_value(value, path=path, column=key)
         rows.append(normalized)
     return rows
+
+
+def _normalize_parquet_value(value: object, *, path: Path, column: str) -> JSONValue:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, list):
+        return [
+            _normalize_parquet_value(item, path=path, column=column) for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_parquet_value(item, path=path, column=column)
+            for key, item in value.items()
+        }
+    if hasattr(value, "isoformat"):
+        return cast(str, value.isoformat())
+    value_type = type(value).__name__
+    raise ValueError(f"unsupported Parquet value in {path}: {column}={value_type}")
+
+
+def bronze_provider_payload(row: Mapping[str, JSONValue], path: Path) -> dict[str, JSONValue]:
+    """Read only a native Bronze provider-payload struct."""
+
+    payload = row.get("provider_payload")
+    if isinstance(payload, dict):
+        return payload
+    raise ValueError(f"Bronze provider payload is invalid in {path}")
+
+
+def read_legacy_bronze_provider_payload(
+    row: Mapping[str, JSONValue],
+    path: Path,
+) -> dict[str, JSONValue]:
+    """Decode a retired payload_json field for the explicit migration path only."""
+
+    payload = row.get("provider_payload")
+    if isinstance(payload, dict):
+        return payload
+    legacy_payload = row.get("payload_json")
+    if isinstance(legacy_payload, str):
+        decoded = json.loads(legacy_payload)
+        if isinstance(decoded, dict):
+            return cast(dict[str, JSONValue], decoded)
+    raise ValueError(f"Bronze provider payload is invalid in {path}")
 
 
 def read_parquet_partitions(directory: Path) -> list[dict[str, JSONValue]]:
@@ -288,11 +416,12 @@ def read_dataset_rows(
     """Read only the canonical manifest-backed lake artifacts."""
 
     manifest_path = layout.manifest_path(layer, dataset)
-    if not manifest_path.exists():
+    legacy_metadata_path = layout.legacy_metadata_manifest_path(layer, dataset)
+    if not manifest_path.exists() and not legacy_metadata_path.exists():
         if _has_legacy_dataset(layout, layer, dataset):
             raise ValueError(f"legacy lake layout requires migration: {layer.value}/{dataset}")
         return []
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_manifest_payload(manifest_path)
     run_metadata = manifest.get("run_metadata")
     artifact_paths = run_metadata.get("artifact_paths") if isinstance(run_metadata, dict) else None
     if not isinstance(artifact_paths, list):
@@ -337,11 +466,12 @@ def read_snapshot_retractions(
     """Read the canonical Parquet retraction sidecar named by its manifest."""
 
     manifest_path = layout.manifest_path(layer, dataset)
-    if not manifest_path.exists():
+    legacy_metadata_path = layout.legacy_metadata_manifest_path(layer, dataset)
+    if not manifest_path.exists() and not legacy_metadata_path.exists():
         if _has_legacy_dataset(layout, layer, dataset):
             raise ValueError(f"legacy lake layout requires migration: {layer.value}/{dataset}")
         return []
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_manifest_payload(manifest_path)
     run_metadata = manifest.get("run_metadata")
     retraction_path = (
         run_metadata.get("retractions_path") if isinstance(run_metadata, dict) else None
@@ -385,6 +515,7 @@ def _has_legacy_dataset(layout: MedallionLayout, layer: Layer, dataset: str) -> 
     directory = layout.dataset_path(layer, dataset)
     return (
         layout.legacy_manifest_path(layer, dataset).exists()
+        or layout.legacy_metadata_manifest_path(layer, dataset).exists()
         or (directory / "data.json").exists()
         or (directory / "data.parquet").exists()
         or (directory / "versions").exists()
@@ -495,7 +626,7 @@ def _manifest_artifact_path(layout: MedallionLayout, relative_path: str) -> Path
 
 def _read_manifest_artifacts(
     layout: MedallionLayout,
-    artifact_paths: list[object],
+    artifact_paths: list[JSONValue],
 ) -> list[dict[str, JSONValue]]:
     if not all(isinstance(path, str) for path in artifact_paths):
         raise ValueError("manifest artifact_paths must contain only strings")

@@ -29,7 +29,7 @@ class JsonTransport(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class SplitIngestionResult:
-    bronze_payload: str
+    bronze_rows: tuple[dict[str, JSONValue], ...]
     silver_records: tuple[SplitEvent, ...]
     added_count: int
     removed_count: int
@@ -80,13 +80,7 @@ def ingest_splits(
         retract=retract_split,
     )
     return SplitIngestionResult(
-        bronze_payload=json.dumps(
-            bronze_rows,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ),
+        bronze_rows=tuple(bronze_rows),
         silver_records=reconciliation.records,
         added_count=reconciliation.added_count,
         removed_count=reconciliation.removed_count,

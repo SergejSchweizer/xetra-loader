@@ -3,6 +3,8 @@
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Lock
+from typing import cast
 
 import pytest
 
@@ -21,9 +23,12 @@ from xetra_loader.ops.bootstrap import (
     PostgresEodhdBootstrapRuntime,
 )
 from xetra_loader.pipeline.runtime import (
-    _dividend_silver_row,
-    _parallel_database_core_budgets,
     _corporate_fingerprint,
+    _dividend_silver_row,
+    _fetch_times_from_checkpoint,
+    _parallel_database_core_budgets,
+    _parallel_fetch,
+    _QuoteFetchTimeIndex,
     _replace_action_window,
     _split_silver_row,
     _WeeklyState,
@@ -68,6 +73,93 @@ def _split(day: int) -> SplitEvent:
     )
 
 
+def test_quote_fetch_checkpoint_compresses_per_row_times_into_listing_windows() -> None:
+    fetched_at = datetime(2026, 10, 23, 17, tzinfo=UTC)
+    index = _QuoteFetchTimeIndex()
+    first = _quote(3, "10")
+    last = _quote(7, "11")
+    index.record_batch((first, last), fetched_at)
+
+    serialized = index.checkpoint_rows()
+    restored = _fetch_times_from_checkpoint(
+        "eod_quotes",
+        {"fetched_at_by_window": serialized},
+    )
+    fallback = datetime(2026, 10, 24, tzinfo=UTC)
+
+    assert len(serialized) == 1
+    assert isinstance(restored, _QuoteFetchTimeIndex)
+    assert restored.get(first.key, fallback) == fetched_at
+    assert restored.get(last.key, fallback) == fetched_at
+    assert restored.get((*first.key[:3], date(2026, 8, 8)), fallback) == fallback
+
+
+def test_legacy_quote_checkpoint_rows_restore_as_compact_windows() -> None:
+    fetched_at = "2026-10-23T17:00:00+00:00"
+    details = {
+        "fetched_at_by_key": [
+            {
+                "key": ["DE0000000001", "XETRA", "AAA", "2026-08-03"],
+                "fetched_at_utc": fetched_at,
+            },
+            {
+                "key": ["DE0000000001", "XETRA", "AAA", "2026-08-07"],
+                "fetched_at_utc": fetched_at,
+            },
+        ]
+    }
+
+    restored = _fetch_times_from_checkpoint("eod_quotes", details)
+
+    assert isinstance(restored, _QuoteFetchTimeIndex)
+    assert len(restored.checkpoint_rows()) == 1
+    assert restored.get(_quote(3, "10").key, datetime.min.replace(tzinfo=UTC)).isoformat() == (
+        fetched_at
+    )
+
+
+def test_provider_fetch_streams_with_core_bounded_concurrency() -> None:
+    cores = 4
+    barrier = Barrier(cores)
+    guard = Lock()
+    active = 0
+    peak_active = 0
+
+    class Worker:
+        def close(self) -> None:
+            return None
+
+    class Runtime:
+        def fetch_worker(self) -> Worker:
+            return Worker()
+
+    def fetch(worker: PostgresEodhdBootstrapRuntime, job: int) -> FetchBatch[int]:
+        nonlocal active, peak_active
+        del worker
+        with guard:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            barrier.wait(timeout=5)
+            return FetchBatch((job,), FetchMetrics())
+        finally:
+            with guard:
+                active -= 1
+
+    completed = list(
+        _parallel_fetch(
+            cast(PostgresEodhdBootstrapRuntime, Runtime()),
+            list(range(8)),
+            fetch,
+            cores,
+        )
+    )
+
+    assert {job for job, _ in completed} == set(range(8))
+    assert all(batch.rows == (job,) for job, batch in completed)
+    assert peak_active == cores
+
+
 class _Runtime:
     def __init__(self, root: Path) -> None:
         self._layout = MedallionLayout(root)
@@ -83,6 +175,15 @@ class _Runtime:
         self.dividend_snapshot = (_dividend(10),)
         self.split_snapshot = (_split(10),)
         self.persisted_silver_by_dataset: dict[str, list[dict[str, object]]] = {}
+        self.persistence_events: list[tuple[str, str]] = []
+
+    def fetch_listings(self) -> FetchBatch[ListingRecord]:
+        rows = (ListingRecord("DE0000000001", "XETRA", "AAA"),)
+        return FetchBatch(
+            rows,
+            FetchMetrics(logical_requests=2, attempts=2, rows=1),
+            datetime(2026, 8, 23, 10, 0, tzinfo=UTC),
+        )
 
     def fetch_quotes(
         self,
@@ -134,9 +235,18 @@ class _Runtime:
         )
 
     def persist_gold(self, *args: object, **kwargs: object) -> None:
-        del args, kwargs
+        del kwargs
+        self.persistence_events.append(("gold", str(args[0])))
 
-    def persist_silver(self, dataset: str, rows: list[dict[str, object]]) -> None:
+    def persist_silver(
+        self,
+        dataset: str,
+        rows: list[dict[str, object]],
+        *,
+        durable_sync: bool = True,
+    ) -> None:
+        del durable_sync
+        self.persistence_events.append(("silver", dataset))
         self.persisted_silver_by_dataset[dataset] = rows
         if dataset == "eod_quotes":
             self.persisted_silver = rows
@@ -189,6 +299,10 @@ def test_weekly_quote_refresh_uses_delta_without_split(tmp_path: Path) -> None:
         "2026-08-22",
     ]
     assert runtime.persisted_silver[2]["close"] == "12"
+    assert runtime.persistence_events == [
+        ("silver", "eod_quotes"),
+        ("gold", "eod_quotes"),
+    ]
     assert details["requests"] == 1
     assert details["source_fetch_mode"] == "delta"
     assert details["publication_mode"] == "semantic_delta"
@@ -300,12 +414,33 @@ def test_weekly_corporate_actions_fetch_complete_history(tmp_path: Path) -> None
     assert runtime.action_calls == [("dividends", None, ()), ("splits", None, ())]
     assert dividends["source_fetch_mode"] == splits["source_fetch_mode"] == "full_history"
     assert dividends["publication_mode"] == splits["publication_mode"] == "semantic_delta"
+    assert runtime.persistence_events == [
+        ("silver", "dividends"),
+        ("gold", "dividends"),
+        ("silver", "splits"),
+        ("gold", "splits"),
+    ]
+
+
+def test_weekly_listings_publish_silver_before_gold(tmp_path: Path) -> None:
+    runtime = _Runtime(tmp_path)
+    state = _WeeklyState(runtime)  # type: ignore[arg-type]
+
+    state.ingest_listings()
+
+    assert runtime.persistence_events == [("silver", "listings"), ("gold", "listings")]
 
 
 def test_weekly_stages_quarantine_invalid_provider_ohlc(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     captured: dict[str, bool | int] = {}
+    caplog.set_level("INFO", logger="xetra_loader.pipeline.runtime")
+
+    class Runtime:
+        def validate_weekly_schema_contract(self) -> None:
+            captured["schema_preflight"] = True
 
     def from_environment(
         *,
@@ -314,7 +449,7 @@ def test_weekly_stages_quarantine_invalid_provider_ohlc(
     ) -> object:
         captured["quarantine_invalid_ohlc"] = quarantine_invalid_ohlc
         captured["cores"] = cores or 0
-        return object()
+        return Runtime()
 
     monkeypatch.setattr(
         "xetra_loader.pipeline.runtime.PostgresEodhdBootstrapRuntime.from_environment",
@@ -323,7 +458,12 @@ def test_weekly_stages_quarantine_invalid_provider_ohlc(
 
     build_weekly_stages(cores=4)
 
-    assert captured == {"quarantine_invalid_ohlc": True, "cores": 4}
+    assert captured == {
+        "quarantine_invalid_ohlc": True,
+        "cores": 4,
+        "schema_preflight": True,
+    }
+    assert "weekly_configuration cores=4 provider_cores=4" in caplog.text
 
 
 @pytest.mark.parametrize(

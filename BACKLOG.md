@@ -1,6 +1,6 @@
 # XETRA Data Loader — Backlog Archive
 
-Last reviewed: 2026-10-22
+Last reviewed: 2026-10-23
 
 ## Contents
 
@@ -29,17 +29,19 @@ migrations, and executable tests rather than these retired plans.
   `volume_level`; OHLC values are internal inputs only for approved derived
   features. The complete view contains 105 columns: four identities,
   availability, two levels, and 98 derived feature columns.
-- The runtime writes market-data artifacts as Polars-written Parquet. The
-  one-time migration completed after validating Gold fingerprints; retired
-  source artifacts were archived outside the lake. JSON manifests and
-  restart/checkpoint files remain control metadata.
-- The repository cron artifact schedules Sunday 09:00 Vienna and enqueues a
-  durable PostgreSQL job for the in-process API worker. The current host
-  crontab instead runs a guarded full historical refresh Sunday at 09:00 and
-  copies Gold to `/volume1/Temp/Quotes` Sunday at 22:00; the API service is not
-  installed. After a verified PASS report, the guarded full-refresh command
-  retains the four newest timestamped backup directories and weekly checkpoints;
-  failed runs do not prune. The CPU budget is six cores by default.
+- The runtime writes row data, manifests, retractions, and restart/checkpoint
+  metadata as Polars-written Parquet. Legacy JSON is read only by the explicit
+  migration path; verified retired sources are removed from the lake or
+  archived outside it.
+- The repository cron artifact directly runs the restart-safe Sunday 09:00
+  Vienna weekly delta and separately copies Gold at 22:00. The optional durable
+  PostgreSQL API job is not part of that cron schedule. A previously recorded
+  host-state note reported a guarded full historical refresh at 09:00 and the
+  Gold copy at 22:00, with the API service not installed; that host state has
+  not been revalidated here and must not be treated as current deployment
+  evidence. After a verified PASS report, the guarded full-refresh command
+  retains the four newest timestamped backup directories and weekly
+  checkpoints; failed runs do not prune. The CPU budget is six cores by default.
 - The repository feature-view contract has 105 columns: four identities, one
   availability column, two base levels, and 98 catalog-derived features.
 - PostgreSQL access follows least privilege; credentials are provisioned

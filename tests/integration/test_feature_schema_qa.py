@@ -92,7 +92,9 @@ def test_feature_schema_catalog_grants_and_types(tmp_path: Path) -> None:
         ),
         "identity_types": columns[:4]
         == ["isin:text", "exchange:text", "code:text", "trade_date:date"],
-        "availability_type": columns[4] == "available_at_utc:timestamp with time zone",
+        "availability_type": (
+            columns[4] == "available_at_utc:timestamp(6) with time zone"
+        ),
         "base_level_types": columns[5:7] == [
             "adjusted_close_level:double precision",
             "volume_level:double precision",

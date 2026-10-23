@@ -19,6 +19,7 @@ from xetra_loader.medallion.core import (
     Layer,
     MedallionLayout,
     canonical_json,
+    read_manifest_payload,
     write_parquet_rows,
 )
 from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime
@@ -191,7 +192,7 @@ def test_gold_persistence_writes_sorted_tombstone_sidecar(tmp_path: Path) -> Non
         {"isin": key[0], "exchange": key[1], "code": key[2], "event_key": key[3]}
         for key in sorted(retracted)
     ]
-    manifest = json.loads(layout.manifest_path(Layer.GOLD, "dividends").read_text())
+    manifest = read_manifest_payload(layout.manifest_path(Layer.GOLD, "dividends"))
     assert manifest["semantic_metadata"]["retractions_fingerprint"] == hashlib.sha256(
         canonical_json([list(key) for key in sorted(retracted)]).encode("utf-8")
     ).hexdigest()

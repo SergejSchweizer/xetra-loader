@@ -212,6 +212,19 @@ class DurableJobWorker:
                 type(exc).__name__,
             )
             return
+        if result.get("status") == "failed":
+            with connection.transaction():
+                connection.execute(
+                    "UPDATE xetra_loader.loader_jobs SET status = 'failed', result = %s, "
+                    "error_code = 'weekly_sync_failed', finished_at_utc = clock_timestamp() "
+                    "WHERE job_id = %s AND status = 'running'",
+                    (Jsonb(result), job.job_id),
+                )
+            _LOGGER.error(
+                "durable_job_failed id=%s error_type=PipelineReportedFailure",
+                job.job_id,
+            )
+            return
         with connection.transaction():
             connection.execute(
                 "UPDATE xetra_loader.loader_jobs SET status = 'succeeded', result = %s, "

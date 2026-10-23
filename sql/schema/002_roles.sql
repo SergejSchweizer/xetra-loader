@@ -25,6 +25,16 @@ END
 $$;
 
 GRANT "xetra-data-loader" TO xetra_data_loader_writer;
+DO $$
+BEGIN
+    -- Parameter-level SET grants are available on PostgreSQL 15+. On older
+    -- supported servers, temp_file_limit remains governed by its role/database
+    -- setting and this newer privilege statement must not block provisioning.
+    IF current_setting('server_version_num')::integer >= 150000 THEN
+        EXECUTE 'GRANT SET ON PARAMETER temp_file_limit TO "xetra-data-loader"';
+    END IF;
+END
+$$;
 
 REVOKE ALL ON SCHEMA xetra_loader FROM PUBLIC;
 GRANT USAGE ON SCHEMA xetra_loader TO "xetra-data-loader", portfell_app;

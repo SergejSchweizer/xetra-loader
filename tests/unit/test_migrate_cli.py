@@ -10,14 +10,25 @@ from xetra_loader.ops import migrate
 
 
 class _RecordingConnection:
-    def __init__(self, *, reader_role_exists: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        reader_role_exists: bool = False,
+        server_version: int = 160000,
+    ) -> None:
         self.statements: list[tuple[str, tuple[object, ...]]] = []
         self.reader_role_exists = reader_role_exists
+        self.server_version = server_version
         self.commit_count = 0
 
     def execute(self, statement: str, params: tuple[object, ...] = ()) -> Any:
         self.statements.append((statement, params))
-        result = (self.reader_role_exists,) if "FROM pg_roles" in statement else None
+        if "FROM pg_roles" in statement:
+            result = (self.reader_role_exists,)
+        elif statement == "SHOW server_version_num":
+            result = (self.server_version,)
+        else:
+            result = None
         return _RecordingResult(result)
 
     def commit(self) -> None:
@@ -77,9 +88,40 @@ def test_schema_provisioner_sets_database_core_budget(
         ("16GB",),
     )
     assert connection.statements[-1] == (
+        "SHOW server_version_num",
+        (),
+    )
+    assert connection.statements[-2] == (
         "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)",
         ("xetra_loader",),
     )
+
+
+def test_schema_provisioner_configures_pg14_writer_login_temp_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDL_FEATURE_WORK_MEM", "256MB")
+    monkeypatch.setenv("XDL_FEATURE_TEMP_FILE_LIMIT", "24GB")
+    connection = _RecordingConnection(server_version=140000)
+    for relative in migrate.SCHEMA_FILES:
+        sql_path = tmp_path / relative
+        sql_path.parent.mkdir(parents=True, exist_ok=True)
+        sql_path.write_text("SELECT 1;", encoding="utf-8")
+
+    migrate.apply_postgres_schema(
+        repository_root=tmp_path,
+        connection=cast(Connection[Any], connection),
+        cores=4,
+    )
+
+    statement, params = connection.statements[-1]
+    statement_text = str(statement)
+    assert "ALTER ROLE" in statement_text
+    assert "xetra_data_loader_writer" in statement_text
+    assert "temp_file_limit" in statement_text
+    assert "24GB" in statement_text
+    assert params == ()
 
 
 def test_schema_provisioner_reapplies_reader_contract_after_view_rebuild(

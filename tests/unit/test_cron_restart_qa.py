@@ -107,7 +107,7 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
     assert failure.value.stage == "gold_validation"
 
     resumed_calls: list[str] = []
-    checkpoint = tmp_path / "weekly.checkpoint.json"
+    checkpoint = tmp_path / "weekly.checkpoint.parquet"
     with pytest.raises(PipelineStageError):
         run_restartable_pipeline(
             _stages(resumed_calls, "quotes"),

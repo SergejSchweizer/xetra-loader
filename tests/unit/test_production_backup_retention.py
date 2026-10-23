@@ -21,7 +21,7 @@ def test_full_sync_backup_retention_keeps_four_newest_owned_directories(
         (backup_root / name).mkdir()
 
     checkpoint_names = tuple(
-        f"weekly-checkpoint-202610{day:02d}T090000Z-{day}.json"
+        f"weekly-checkpoint-202610{day:02d}T090000Z-{day}.parquet"
         for day in range(1, 7)
     )
     for name in checkpoint_names:
@@ -72,6 +72,26 @@ def test_full_sync_backup_retention_rejects_a_symlink_root(tmp_path: Path) -> No
         raise AssertionError("a symlink backup root must not be pruned")
 
 
+def test_weekly_checkpoint_archives_are_moved_by_full_sync_helper(tmp_path: Path) -> None:
+    lake = tmp_path / "lake"
+    backup_root = tmp_path / "backups"
+    lake.mkdir()
+    backup_root.mkdir()
+    parquet_checkpoint = lake / "weekly.checkpoint.parquet"
+    legacy_checkpoint = lake / "weekly.checkpoint.json"
+    parquet_checkpoint.write_bytes(b"parquet checkpoint")
+    legacy_checkpoint.write_text('{"version":1}', encoding="utf-8")
+
+    archived = verifier._archive_weekly_checkpoints(lake, backup_root)
+
+    assert len(archived) == 2
+    assert {path.suffix for path in archived} == {".parquet", ".json"}
+    assert all(path.is_file() for path in archived)
+    assert not parquet_checkpoint.exists()
+    assert not legacy_checkpoint.exists()
+    assert len(verifier._prune_full_sync_backups(backup_root)) == 0
+
+
 class _FakeConnection:
     autocommit = False
 
@@ -85,6 +105,9 @@ class _FakeConnection:
     class _Cursor(_Context):
         def execute(self, *_args: object, **_kwargs: object) -> None:
             return None
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return []
 
     def transaction(self) -> _Context:
         return self._Context()
@@ -186,6 +209,12 @@ def test_failed_production_sync_does_not_prune_backups(
     names = _make_backup_set(backup_root)
     output_path = tmp_path / "report.json"
     _patch_full_sync(monkeypatch, passed=False)
+    cleanup_calls: list[object] = []
+    monkeypatch.setattr(
+        verifier,
+        "drop_previous_serving_schemas",
+        lambda connection: cleanup_calls.append(connection),
+    )
 
     with pytest.raises(verifier.ProductionVerificationError, match="not PASS"):
         verifier.execute_production_full_sync_and_verify(
@@ -197,6 +226,7 @@ def test_failed_production_sync_does_not_prune_backups(
 
     assert json.loads(output_path.read_text(encoding="utf-8"))["status"] == "FAIL"
     assert all((backup_root / name).is_dir() for name in names)
+    assert cleanup_calls == []
 
 
 def test_backup_cleanup_failure_does_not_fail_a_completed_production_sync(

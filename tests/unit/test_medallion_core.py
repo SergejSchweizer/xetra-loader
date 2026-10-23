@@ -10,6 +10,7 @@ from xetra_loader.medallion.core import (
     SilverPartition,
     read_dataset_rows,
     read_legacy_dataset_rows,
+    read_manifest_payload,
 )
 
 
@@ -18,7 +19,7 @@ def test_layout_resolves_each_layer() -> None:
     assert layout.dataset_path(Layer.BRONZE, "listings") == Path("/data/xetra/bronze/listings")
     assert layout.dataset_path(Layer.SILVER, "quotes") == Path("/data/xetra/silver/quotes")
     assert layout.manifest_path(Layer.GOLD, "splits") == Path(
-        "/data/xetra/gold/_metadata/dataset_type=splits/manifest.json"
+        "/data/xetra/gold/_metadata/dataset_type=splits/manifest.parquet"
     )
 
 
@@ -70,6 +71,20 @@ def test_runtime_reader_rejects_legacy_json_and_migration_reader_can_read_it(
     assert read_legacy_dataset_rows(layout, Layer.SILVER, "eod_quotes") == [{"code": "AAA"}]
     with pytest.raises(ValueError, match="requires migration"):
         read_dataset_rows(layout, Layer.SILVER, "eod_quotes")
+
+
+def test_manifest_reader_rejects_legacy_json_metadata(tmp_path: Path) -> None:
+    layout = MedallionLayout(tmp_path)
+    legacy_path = layout.legacy_metadata_manifest_path(Layer.GOLD, "quotes")
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(
+        '{"dataset":"quotes","layer":"gold","semantic_metadata":{},'
+        '"run_metadata":{"artifact_paths":[]}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError, match="manifest.parquet"):
+        read_manifest_payload(layout.manifest_path(Layer.GOLD, "quotes"))
 
 
 def test_semantic_fingerprint_ignores_run_metadata() -> None:

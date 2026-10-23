@@ -2,7 +2,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import psycopg
 import pytest
+
+from xetra_loader.ops.bootstrap import PostgresEodhdBootstrapRuntime
 
 DSN = os.getenv("XDL_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.integration
@@ -85,3 +88,20 @@ def test_generated_availability_columns_follow_source_dates() -> None:
         "FROM xetra_loader.splits ORDER BY 1",
     )
     assert result.stdout.splitlines() == ["2026-10-26"] * 4
+
+
+def test_weekly_schema_preflight_rejects_deployed_not_null_close() -> None:
+    _psql("-c", "DROP SCHEMA IF EXISTS xetra_loader CASCADE")
+    schema_sql = Path("sql/schema/001_xetra_loader.sql").read_text(encoding="utf-8")
+    _psql(input_text=schema_sql)
+    _psql("-c", "ALTER TABLE xetra_loader.eod_quotes ALTER COLUMN close SET NOT NULL")
+    assert DSN is not None
+    connection = psycopg.connect(DSN)
+    runtime = object.__new__(PostgresEodhdBootstrapRuntime)
+    runtime._connection = connection
+    runtime._serving_schema = "xetra_loader"
+    try:
+        with pytest.raises(RuntimeError, match="must be nullable.*xdl-migrate"):
+            runtime.validate_weekly_schema_contract()
+    finally:
+        connection.close()

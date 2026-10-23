@@ -99,45 +99,64 @@ def connect_postgres(
 
     resolved = resolve_postgres_admin_dsn(dsn) if admin else resolve_postgres_writer_dsn(dsn)
     connection = psycopg.connect(resolved, autocommit=False)
-    connection.execute(
-        "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
-        (resolve_feature_work_mem(),),
-    )
-    connection.execute(
-        "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
-        (resolve_feature_temp_file_limit(),),
-    )
-    configured_cores = resolve_cores(cores)
-    connection.execute(
-        "SELECT set_config('xetra_loader.compute_cores', %s, false)",
-        (str(configured_cores),),
-    )
-    parallel_workers = str(max(configured_cores - 1, 0))
-    for setting in (
-        "max_parallel_workers_per_gather",
-        "max_parallel_maintenance_workers",
-    ):
+    try:
         connection.execute(
-            "SELECT set_config(%s, %s, false)",
-            (setting, parallel_workers),
+            "SELECT set_config('xetra_loader.feature_work_mem', %s, false)",
+            (resolve_feature_work_mem(),),
         )
-    connection.execute(
-        "SELECT set_config('parallel_leader_participation', 'on', false)"
-    )
-    connection.commit()
-    if require_non_superuser:
-        row = connection.execute(
-            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
-        ).fetchone()
-        if row is None or bool(row[0]):
-            connection.close()
-            raise PermissionError("weekly PostgreSQL connection must not use a superuser")
-        # The probe above starts a transaction on psycopg connections with
-        # autocommit disabled.  End it before callers open their own
-        # transaction blocks; otherwise ``connection.transaction()`` creates
-        # a savepoint and a later close can roll back the publication.
+        configured_temp_limit = resolve_feature_temp_file_limit()
+        version_row = connection.execute("SHOW server_version_num").fetchone()
+        if version_row is None:
+            raise RuntimeError("PostgreSQL server version could not be determined")
+        server_version = int(version_row[0])
+        if admin or server_version >= 150000:
+            connection.execute(
+                "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
+                (configured_temp_limit,),
+            )
+        else:
+            # PostgreSQL 14 has no parameter-level SET grants. xdl-migrate
+            # installs the configured cap as a login-role session default.
+            matches_config = connection.execute(
+                "SELECT pg_size_bytes(current_setting('temp_file_limit')) "
+                "= pg_size_bytes(%s)",
+                (configured_temp_limit,),
+            ).fetchone()
+            if matches_config is None or not matches_config[0]:
+                raise RuntimeError(
+                    "PostgreSQL 14 writer temp_file_limit differs from configuration; "
+                    "run xdl-migrate as the database administrator"
+                )
+        configured_cores = resolve_cores(cores)
+        connection.execute(
+            "SELECT set_config('xetra_loader.compute_cores', %s, false)",
+            (str(configured_cores),),
+        )
+        parallel_workers = str(max(configured_cores - 1, 0))
+        for setting in (
+            "max_parallel_workers_per_gather",
+            "max_parallel_maintenance_workers",
+        ):
+            connection.execute(
+                "SELECT set_config(%s, %s, false)",
+                (setting, parallel_workers),
+            )
+        connection.execute(
+            "SELECT set_config('parallel_leader_participation', 'on', false)"
+        )
+        if require_non_superuser:
+            row = connection.execute(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+            ).fetchone()
+            if row is None or bool(row[0]):
+                raise PermissionError("weekly PostgreSQL connection must not use a superuser")
+        # End configuration/probe queries before callers open their own
+        # transaction blocks.
         connection.commit()
-    return connection
+        return connection
+    except BaseException:
+        connection.close()
+        raise
 
 
 def semantic_fingerprint(rows: Iterable[SemanticRow]) -> tuple[str, int]:

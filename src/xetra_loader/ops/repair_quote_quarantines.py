@@ -28,6 +28,7 @@ from xetra_loader.medallion.core import (
     JSONValue,
     Layer,
     MedallionLayout,
+    bronze_provider_payload,
     read_dataset_rows,
     read_parquet_rows,
 )
@@ -219,13 +220,7 @@ def _bronze_row_matches_listing(
 
 
 def _bronze_payload(row: Mapping[str, JSONValue], path: Path) -> dict[str, JSONValue]:
-    encoded = row.get("payload_json")
-    if not isinstance(encoded, str):
-        raise ValueError(f"Bronze payload_json is invalid in {path}")
-    payload = json.loads(encoded)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Bronze quote payload is not an object in {path}")
-    return cast(dict[str, JSONValue], payload)
+    return bronze_provider_payload(row, path)
 
 
 def repair_full_sync_quarantines(

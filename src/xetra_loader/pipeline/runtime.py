@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -31,6 +30,7 @@ from xetra_loader.medallion.core import (
     MedallionLayout,
     canonical_json,
     read_dataset_rows,
+    read_manifest_payload,
     read_snapshot_retractions,
 )
 from xetra_loader.ops.bootstrap import FetchBatch, PostgresEodhdBootstrapRuntime
@@ -38,6 +38,82 @@ from xetra_loader.pipeline.orchestrator import PipelineStages
 from xetra_loader.sync.core import SyncCounters, SyncOutcome
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _QuoteFetchTimeIndex:
+    """Compact fetch timestamps by listing and inclusive fetched-date windows."""
+
+    _windows: dict[
+        tuple[str, str, str],
+        list[tuple[date, date, datetime]],
+    ] = field(default_factory=dict)
+
+    def record_batch(
+        self,
+        rows: Sequence[QuoteRecord],
+        fetched_at_utc: datetime,
+    ) -> None:
+        if not rows:
+            return
+        identity = rows[0].key[:3]
+        first_date = rows[0].trade_date
+        last_date = first_date
+        for row in rows[1:]:
+            if row.key[:3] != identity:
+                raise ValueError("one EODHD quote fetch batch must contain one listing identity")
+            first_date = min(first_date, row.trade_date)
+            last_date = max(last_date, row.trade_date)
+        self.record_window(identity, first_date, last_date, fetched_at_utc)
+
+    def record_window(
+        self,
+        identity: tuple[str, str, str],
+        start_date: date,
+        end_date: date,
+        fetched_at_utc: datetime,
+    ) -> None:
+        if start_date > end_date:
+            raise ValueError("quote fetch window start must not exceed its end")
+        if fetched_at_utc.tzinfo is None or fetched_at_utc.utcoffset() != UTC.utcoffset(
+            fetched_at_utc
+        ):
+            raise ValueError("quote fetch time must be UTC")
+        windows = self._windows.setdefault(identity, [])
+        for index, (existing_start, existing_end, existing_time) in enumerate(windows):
+            if existing_time == fetched_at_utc:
+                windows[index] = (
+                    min(existing_start, start_date),
+                    max(existing_end, end_date),
+                    fetched_at_utc,
+                )
+                return
+        windows.append((start_date, end_date, fetched_at_utc))
+        windows.sort(key=lambda window: (window[0], window[1], window[2]))
+
+    def get(
+        self,
+        key: tuple[str, str, str, date],
+        default: datetime,
+    ) -> datetime:
+        for start_date, end_date, fetched_at_utc in self._windows.get(key[:3], ()):
+            if start_date <= key[3] <= end_date:
+                return fetched_at_utc
+        return default
+
+    def checkpoint_rows(self) -> list[JSONValue]:
+        return [
+            {
+                "listing_key": list(identity),
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "fetched_at_utc": fetched.isoformat(),
+            }
+            for identity, windows in sorted(self._windows.items())
+            for start, end, fetched in windows
+        ]
+
+
 @dataclass(slots=True)
 class _WeeklyState:
     runtime: PostgresEodhdBootstrapRuntime
@@ -49,7 +125,9 @@ class _WeeklyState:
     splits: SplitGoldResult | None = None
     outcomes: dict[str, SyncOutcome] = field(default_factory=dict)
     action_changed_listings: set[tuple[str, str, str]] = field(default_factory=set)
-    fetched_at_by_dataset: dict[str, dict[object, datetime]] = field(default_factory=dict)
+    fetched_at_by_dataset: dict[str, dict[object, datetime] | _QuoteFetchTimeIndex] = field(
+        default_factory=dict
+    )
     authoritative_snapshot: GoldValidationSummary | None = None
     _publication_executor: ThreadPoolExecutor | None = None
     _publication_futures: dict[str, Future[SyncOutcome]] = field(default_factory=dict)
@@ -58,11 +136,17 @@ class _WeeklyState:
         batch = self.runtime.fetch_listings()
         self._record_fetch_times("listings", batch.rows, batch.fetched_at_utc)
         self.listings = build_listing_gold(batch.rows)
+        self.runtime.persist_silver(
+            "listings",
+            self.listings.semantic_rows(),
+            durable_sync=False,
+        )
         self.runtime.persist_gold(
             "listings",
             self.listings.semantic_rows(),
             row_count=self.listings.row_count,
             semantic_fingerprint=self.listings.semantic_fingerprint,
+            durable_sync=False,
         )
         return self._with_fetch_provenance(
             "listings",
@@ -95,7 +179,8 @@ class _WeeklyState:
             len(jobs),
             self.provider_cores,
         )
-        batches = _parallel_fetch(
+        completed = 0
+        for job, batch in _parallel_fetch(
             self.runtime,
             jobs,
             lambda worker, job: worker.fetch_quotes(
@@ -103,19 +188,15 @@ class _WeeklyState:
                 # Changed dividends or splits can alter adjusted history, so
                 # replay that listing fully. Otherwise refresh from its latest
                 # stored quote with the provider overlap handled downstream.
-                last_business_date=(
-                    None if job[2] else _latest_date(job[1])
-                ),
+                last_business_date=(None if job[2] else _latest_date(job[1])),
                 previous_records=job[1],
             ),
             self.provider_cores,
-        )
-        for job, batch in zip(jobs, batches, strict=True):
+        ):
+            completed += 1
             listing, listing_previous, action_changed = job
             last_business_date = None if action_changed else _latest_date(listing_previous)
-            records.extend(
-                _replace_quote_window(listing_previous, batch.rows, last_business_date)
-            )
+            records.extend(_replace_quote_window(listing_previous, batch.rows, last_business_date))
             self._record_fetch_times("eod_quotes", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
             _LOGGER.debug(
@@ -128,16 +209,25 @@ class _WeeklyState:
                 "full_snapshot" if action_changed or not listing_previous else "delta",
                 action_changed,
             )
+            if completed % 100 == 0 or completed == len(jobs):
+                _LOGGER.info(
+                    "provider_stage_progress dataset=eod_quotes completed=%d total=%d cores=%d",
+                    completed,
+                    len(jobs),
+                    self.provider_cores,
+                )
         self.quotes = build_quote_gold(records)
+        self.runtime.persist_silver(
+            "eod_quotes",
+            [record.semantic_dict() for record in self.quotes.rows],
+            durable_sync=False,
+        )
         self.runtime.persist_gold(
             "eod_quotes",
             self.quotes.semantic_rows(),
             row_count=self.quotes.row_count,
             semantic_fingerprint=self.quotes.semantic_fingerprint,
-        )
-        self.runtime.persist_silver(
-            "eod_quotes",
-            [record.semantic_dict() for record in self.quotes.rows],
+            durable_sync=False,
         )
         details = self._with_fetch_provenance(
             "eod_quotes",
@@ -172,15 +262,16 @@ class _WeeklyState:
             len(jobs),
             self.provider_cores,
         )
-        batches = _parallel_fetch(
+        completed = 0
+        for job, batch in _parallel_fetch(
             self.runtime,
             jobs,
             lambda worker, job: worker.fetch_dividends(
                 job[0], last_event_date=None, previous_records=job[1]
             ),
             self.provider_cores,
-        )
-        for job, batch in zip(jobs, batches, strict=True):
+        ):
+            completed += 1
             listing, listing_previous = job
             merged = _replace_action_window(listing_previous, batch.rows, None)
             if _action_set_changed(listing_previous, merged):
@@ -196,17 +287,26 @@ class _WeeklyState:
                 len(batch.rows),
                 batch.metrics.logical_requests,
             )
+            if completed % 100 == 0 or completed == len(jobs):
+                _LOGGER.info(
+                    "provider_stage_progress dataset=dividends completed=%d total=%d cores=%d",
+                    completed,
+                    len(jobs),
+                    self.provider_cores,
+                )
         self.dividends = build_dividend_gold(records)
+        self.runtime.persist_silver(
+            "dividends",
+            [_dividend_silver_row(record) for record in records],
+            durable_sync=False,
+        )
         self.runtime.persist_gold(
             "dividends",
             self.dividends.semantic_rows(),
             row_count=self.dividends.row_count,
             semantic_fingerprint=self.dividends.semantic_fingerprint,
             retracted_keys=self.dividends.retracted_keys,
-        )
-        self.runtime.persist_silver(
-            "dividends",
-            [_dividend_silver_row(record) for record in records],
+            durable_sync=False,
         )
         details = self._with_fetch_provenance(
             "dividends",
@@ -242,15 +342,16 @@ class _WeeklyState:
             len(jobs),
             self.provider_cores,
         )
-        batches = _parallel_fetch(
+        completed = 0
+        for job, batch in _parallel_fetch(
             self.runtime,
             jobs,
             lambda worker, job: worker.fetch_splits(
                 job[0], last_event_date=None, previous_records=job[1]
             ),
             self.provider_cores,
-        )
-        for job, batch in zip(jobs, batches, strict=True):
+        ):
+            completed += 1
             listing, listing_previous = job
             merged = _replace_action_window(listing_previous, batch.rows, None)
             if _action_set_changed(listing_previous, merged):
@@ -266,17 +367,26 @@ class _WeeklyState:
                 len(batch.rows),
                 batch.metrics.logical_requests,
             )
+            if completed % 100 == 0 or completed == len(jobs):
+                _LOGGER.info(
+                    "provider_stage_progress dataset=splits completed=%d total=%d cores=%d",
+                    completed,
+                    len(jobs),
+                    self.provider_cores,
+                )
         self.splits = build_split_gold(records)
+        self.runtime.persist_silver(
+            "splits",
+            [_split_silver_row(record) for record in records],
+            durable_sync=False,
+        )
         self.runtime.persist_gold(
             "splits",
             self.splits.semantic_rows(),
             row_count=self.splits.row_count,
             semantic_fingerprint=self.splits.semantic_fingerprint,
             retracted_keys=self.splits.retracted_keys,
-        )
-        self.runtime.persist_silver(
-            "splits",
-            [_split_silver_row(record) for record in records],
+            durable_sync=False,
         )
         details = self._with_fetch_provenance(
             "splits",
@@ -312,7 +422,7 @@ class _WeeklyState:
         outcome = self.runtime.publish_quotes(
             self._require_quotes(),
             fetched_at_by_key=cast(
-                dict[tuple[str, str, str, date], datetime],
+                _QuoteFetchTimeIndex,
                 self.fetched_at_by_dataset["eod_quotes"],
             ),
             authoritative_snapshot=self._require_authoritative_snapshot(),
@@ -553,20 +663,28 @@ class _WeeklyState:
     ) -> None:
         if fetched_at_utc is None:
             raise ValueError(f"provider fetch time is required for {dataset}")
-        self.fetched_at_by_dataset.setdefault(dataset, {}).update(
-            {cast(object, row.key): fetched_at_utc for row in rows}
-        )
+        if dataset == "eod_quotes":
+            index = self.fetched_at_by_dataset.setdefault(dataset, _QuoteFetchTimeIndex())
+            if not isinstance(index, _QuoteFetchTimeIndex):
+                raise ValueError("quote fetch provenance has an invalid checkpoint type")
+            index.record_batch(cast(Sequence[QuoteRecord], rows), fetched_at_utc)
+            return
+        exact_times = self.fetched_at_by_dataset.setdefault(dataset, {})
+        if isinstance(exact_times, _QuoteFetchTimeIndex):
+            raise ValueError(f"unexpected quote fetch index for {dataset}")
+        exact_times.update({cast(object, row.key): fetched_at_utc for row in rows})
 
     def _with_fetch_provenance(
         self,
         dataset: str,
         details: dict[str, JSONValue],
     ) -> dict[str, JSONValue]:
+        provenance = self.fetched_at_by_dataset[dataset]
+        if isinstance(provenance, _QuoteFetchTimeIndex):
+            details["fetched_at_by_window"] = provenance.checkpoint_rows()
+            return details
         entries: list[JSONValue] = []
-        for key, value in sorted(
-            self.fetched_at_by_dataset[dataset].items(),
-            key=lambda item: str(item[0]),
-        ):
+        for key, value in sorted(provenance.items(), key=lambda item: str(item[0])):
             if not isinstance(key, tuple):
                 raise ValueError(f"invalid fetch provenance key for {dataset}")
             entries.append(
@@ -614,11 +732,11 @@ def build_weekly_stages(cores: int | None = None) -> PipelineStages:
             cores=worker_count,
         ),
         cores=worker_count,
-        # The provider began stalling on six simultaneous API connections.
-        # Keep EODHD concurrency to two while SQL synchronization retains the
-        # full caller-selected core budget.
-        provider_cores=min(worker_count, 2),
+        # Use the caller-selected core budget for independent EODHD instrument
+        # fetches as well as for Polars and PostgreSQL work.
+        provider_cores=worker_count,
     )
+    state.runtime.validate_weekly_schema_contract()
     _LOGGER.info(
         "weekly_configuration cores=%d provider_cores=%d",
         state.cores,
@@ -709,42 +827,77 @@ def _parallel_fetch[JobT, ResultT](
     jobs: Sequence[JobT],
     fetch: Callable[[PostgresEodhdBootstrapRuntime, JobT], FetchBatch[ResultT]],
     cores: int,
-) -> tuple[FetchBatch[ResultT], ...]:
-    """Fetch independent provider jobs concurrently while preserving input order."""
+) -> Iterator[tuple[JobT, FetchBatch[ResultT]]]:
+    """Fetch with bounded in-flight work and release each completed batch promptly."""
 
     def run(job: JobT) -> FetchBatch[ResultT]:
-        fetch_worker = getattr(runtime, "fetch_worker", None)
-        for attempt in range(1, 4):
-            worker = runtime
+        return _fetch_with_retry(runtime, job, fetch)
+
+    if cores < 1:
+        raise ValueError("provider fetch core budget must be positive")
+    if cores == 1 or len(jobs) <= 1:
+        for job in jobs:
+            yield job, run(job)
+        return
+
+    job_iterator = iter(jobs)
+    with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-fetch") as executor:
+        pending: dict[Future[FetchBatch[ResultT]], JobT] = {}
+
+        def submit_next() -> bool:
             try:
-                if callable(fetch_worker):
-                    worker = fetch_worker()
-                return fetch(worker, job)
-            except RuntimeError as exc:
-                if attempt == 3:
-                    raise
-                _LOGGER.warning(
-                    "provider_fetch_retry attempt=%d error=%s",
-                    attempt,
-                    exc,
-                )
-                time.sleep(float(2**attempt))
-            finally:
-                if worker is not runtime:
-                    close_worker = getattr(worker, "close", None)
-                    if callable(close_worker):
-                        close_worker()
-        raise AssertionError("provider fetch retry loop exhausted")
+                job = next(job_iterator)
+            except StopIteration:
+                return False
+            pending[executor.submit(run, job)] = job
+            return True
 
-    def execute(worker_count: int) -> tuple[FetchBatch[ResultT], ...]:
-        if worker_count == 1 or len(jobs) <= 1:
-            return tuple(run(job) for job in jobs)
-        with ThreadPoolExecutor(
-            max_workers=worker_count, thread_name_prefix="xdl-fetch"
-        ) as executor:
-            return tuple(executor.map(run, jobs))
+        for _ in range(min(len(jobs), cores)):
+            submit_next()
+        while pending:
+            completed_futures, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed_futures:
+                job = pending.pop(future)
+                batch = future.result()
+                submit_next()
+                yield job, batch
 
-    return execute(cores)
+
+def _fetch_with_retry[JobT, ResultT](
+    runtime: PostgresEodhdBootstrapRuntime,
+    job: JobT,
+    fetch: Callable[[PostgresEodhdBootstrapRuntime, JobT], FetchBatch[ResultT]],
+) -> FetchBatch[ResultT]:
+    fetch_worker = getattr(runtime, "fetch_worker", None)
+    for attempt in range(1, 4):
+        worker = runtime
+        try:
+            if callable(fetch_worker):
+                worker = fetch_worker()
+            return fetch(worker, job)
+        except RuntimeError as exc:
+            if attempt == 3:
+                raise
+            _LOGGER.warning(
+                "provider_fetch_retry attempt=%d error_type=%s",
+                attempt,
+                type(exc).__name__,
+            )
+            time.sleep(float(2**attempt))
+        finally:
+            _close_fetch_worker(worker, runtime)
+    raise AssertionError("provider fetch retry loop exhausted")
+
+
+def _close_fetch_worker(
+    worker: PostgresEodhdBootstrapRuntime,
+    runtime: PostgresEodhdBootstrapRuntime,
+) -> None:
+    if worker is runtime:
+        return
+    close_worker = getattr(worker, "close", None)
+    if callable(close_worker):
+        close_worker()
 
 
 def _changed_listing_keys(keys: set[tuple[str, str, str]]) -> list[JSONValue]:
@@ -774,12 +927,30 @@ def _changed_listing_keys_from_checkpoint(
 def _fetch_times_from_checkpoint(
     dataset: str,
     details: Mapping[str, JSONValue],
+) -> dict[object, datetime] | _QuoteFetchTimeIndex:
+    if dataset == "eod_quotes":
+        compact = details.get("fetched_at_by_window")
+        if compact is not None:
+            if not isinstance(compact, list):
+                raise ValueError("checkpoint quote fetch windows must be a list")
+            return _quote_fetch_windows_from_checkpoint(compact)
+        legacy = details.get("fetched_at_by_key")
+        if not isinstance(legacy, list):
+            raise ValueError("checkpoint fetch provenance is missing for eod_quotes")
+        return _quote_fetch_windows_from_legacy_checkpoint(legacy)
+
+    return _exact_fetch_times_from_checkpoint(dataset, details)
+
+
+def _exact_fetch_times_from_checkpoint(
+    dataset: str,
+    details: Mapping[str, JSONValue],
 ) -> dict[object, datetime]:
     raw = details.get("fetched_at_by_key")
     if not isinstance(raw, list):
         raise ValueError(f"checkpoint fetch provenance is missing for {dataset}")
     result: dict[object, datetime] = {}
-    expected_size = 4 if dataset in {"eod_quotes", "dividends", "splits"} else 3
+    expected_size = 4 if dataset in {"dividends", "splits"} else 3
     for item in raw:
         if not isinstance(item, dict):
             raise ValueError(f"checkpoint fetch provenance is invalid for {dataset}")
@@ -796,19 +967,72 @@ def _fetch_times_from_checkpoint(
         if fetched_at.tzinfo is None or fetched_at.utcoffset() != UTC.utcoffset(fetched_at):
             raise ValueError(f"checkpoint fetch provenance must be UTC for {dataset}")
         key: object
-        if dataset == "eod_quotes":
-            key = (
-                cast(str, raw_key[0]),
-                cast(str, raw_key[1]),
-                cast(str, raw_key[2]),
-                date.fromisoformat(cast(str, raw_key[3])),
-            )
-        else:
-            key = tuple(raw_key)
+        key = tuple(raw_key)
         if key in result:
             raise ValueError(f"checkpoint fetch provenance has duplicate key for {dataset}")
         result[key] = fetched_at
     return result
+
+
+def _quote_fetch_windows_from_checkpoint(raw: list[JSONValue]) -> _QuoteFetchTimeIndex:
+    index = _QuoteFetchTimeIndex()
+    previous: tuple[tuple[str, str, str], date, date, datetime] | None = None
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("checkpoint quote fetch window is invalid")
+        raw_key = item.get("listing_key")
+        raw_start = item.get("start_date")
+        raw_end = item.get("end_date")
+        raw_time = item.get("fetched_at_utc")
+        if (
+            not isinstance(raw_key, list)
+            or len(raw_key) != 3
+            or not all(isinstance(part, str) for part in raw_key)
+            or not isinstance(raw_start, str)
+            or not isinstance(raw_end, str)
+            or not isinstance(raw_time, str)
+        ):
+            raise ValueError("checkpoint quote fetch window is invalid")
+        identity = cast(tuple[str, str, str], tuple(raw_key))
+        start = date.fromisoformat(raw_start)
+        end = date.fromisoformat(raw_end)
+        fetched_at = datetime.fromisoformat(raw_time)
+        _require_checkpoint_utc(fetched_at, "eod_quotes")
+        current = (identity, start, end, fetched_at)
+        if previous is not None and current <= previous:
+            raise ValueError("checkpoint quote fetch windows must be uniquely ordered")
+        index.record_window(identity, start, end, fetched_at)
+        previous = current
+    return index
+
+
+def _quote_fetch_windows_from_legacy_checkpoint(
+    raw: list[JSONValue],
+) -> _QuoteFetchTimeIndex:
+    index = _QuoteFetchTimeIndex()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("checkpoint fetch provenance is invalid for eod_quotes")
+        raw_key = item.get("key")
+        raw_time = item.get("fetched_at_utc")
+        if (
+            not isinstance(raw_key, list)
+            or len(raw_key) != 4
+            or not all(isinstance(part, str) for part in raw_key)
+            or not isinstance(raw_time, str)
+        ):
+            raise ValueError("checkpoint fetch provenance is invalid for eod_quotes")
+        identity = cast(tuple[str, str, str], tuple(raw_key[:3]))
+        trade_date = date.fromisoformat(cast(str, raw_key[3]))
+        fetched_at = datetime.fromisoformat(raw_time)
+        _require_checkpoint_utc(fetched_at, "eod_quotes")
+        index.record_window(identity, trade_date, trade_date, fetched_at)
+    return index
+
+
+def _require_checkpoint_utc(value: datetime, dataset: str) -> None:
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+        raise ValueError(f"checkpoint fetch provenance must be UTC for {dataset}")
 
 
 def _load_gold_artifact(
@@ -827,7 +1051,8 @@ def _load_gold_manifest(
     dataset: str,
 ) -> tuple[dict[str, JSONValue], str]:
     manifest_payload = cast(
-        JSONValue, json.loads(layout.manifest_path(Layer.GOLD, dataset).read_text())
+        JSONValue,
+        read_manifest_payload(layout.manifest_path(Layer.GOLD, dataset)),
     )
     if not isinstance(manifest_payload, dict):
         raise ValueError(f"invalid Gold manifest for {dataset}")
@@ -987,9 +1212,7 @@ def _replace_action_window[T: DividendEvent | SplitEvent](
 ) -> tuple[T, ...]:
     if last_date is None:
         by_key = {
-            record.key: record
-            for record in previous
-            if record.status is ActionStatus.RETRACTED
+            record.key: record for record in previous if record.status is ActionStatus.RETRACTED
         }
         by_key.update({record.key: record for record in refreshed})
         return tuple(

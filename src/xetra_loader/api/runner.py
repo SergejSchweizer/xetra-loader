@@ -38,7 +38,7 @@ def _run_weekly_sync(job_id: str, cores: int) -> dict[str, JSONValue]:
     summary = run_restartable_pipeline(
         build_weekly_stages(cores),
         lock_path=root / "weekly.lock",
-        checkpoint_path=root / "weekly.checkpoint.json",
+        checkpoint_path=root / "weekly.checkpoint.parquet",
     )
     return {
         "status": "success" if summary.succeeded else "failed",

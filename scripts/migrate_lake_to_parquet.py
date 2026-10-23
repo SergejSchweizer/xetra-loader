@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -18,9 +20,11 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from itertools import groupby
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from typing import cast
 
 from xetra_loader.config import resolve_cores, resolve_medallion_root
+from xetra_loader.contracts.numeric import canonical_decimal
 
 # Polars initializes its thread pool at import, so resolve the CLI override first.
 _core_parser = argparse.ArgumentParser(add_help=False)
@@ -37,10 +41,14 @@ from xetra_loader.medallion.core import (  # noqa: E402 - see Polars initializat
     Layer,
     MedallionLayout,
     canonical_json,
+    migrate_json_manifests,
     read_dataset_rows,
+    read_legacy_bronze_provider_payload,
     read_legacy_dataset_rows,
     read_legacy_snapshot_retractions,
+    read_manifest_payload,
     read_parquet_rows,
+    write_native_parquet_rows,
     write_parquet_rows,
     write_raw_listing_partitions,
 )
@@ -53,7 +61,11 @@ from xetra_loader.ops.verify_postgres_sync import (  # noqa: E402
     DATASETS,
     validate_gold_fingerprints_streaming,
 )
-from xetra_loader.pipeline.restart import LoaderLock  # noqa: E402
+from xetra_loader.pipeline.restart import (  # noqa: E402
+    LoaderLock,
+    _checkpoint_from_payload,
+    _read_checkpoint_parquet,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,14 +112,7 @@ def _frame_rows(
 
 def _convert_bronze_partitions(root: Path, *, cores: int) -> int:
     layout = MedallionLayout(root)
-    listing_manifest = layout.manifest_path(Layer.SILVER, "listings")
-    listing_rows = (
-        read_dataset_rows(layout, Layer.SILVER, "listings")
-        if listing_manifest.exists()
-        else read_legacy_dataset_rows(layout, Layer.SILVER, "listings")
-    )
-    instrument_types = _listing_instrument_types(listing_rows)
-    context = _BronzeMigrationContext(layout, instrument_types)
+    context = _bronze_migration_context(layout)
     groups = _group_bronze_sources(_legacy_bronze_sources(root))
     converted = 0
     with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-bronze-migrate") as pool:
@@ -143,6 +148,234 @@ def _convert_bronze_partitions(root: Path, *, cores: int) -> int:
             skip_existing=True,
             snapshot_date=datetime.fromtimestamp(listings.stat().st_mtime, UTC).date(),
         )
+    return converted
+
+
+def _bronze_migration_context(layout: MedallionLayout) -> _BronzeMigrationContext:
+    listing_manifest = layout.manifest_path(Layer.SILVER, "listings")
+    listing_rows = (
+        read_dataset_rows(layout, Layer.SILVER, "listings")
+        if listing_manifest.exists()
+        else read_legacy_dataset_rows(layout, Layer.SILVER, "listings")
+    )
+    return _BronzeMigrationContext(layout, _listing_instrument_types(listing_rows))
+
+
+def _has_legacy_bronze_payload(path: Path) -> bool:
+    return "payload_json" in pl.read_parquet_schema(path)
+
+
+def _canonical_bronze_payload_files(root: Path, *, cores: int) -> list[Path]:
+    bronze_root = root / Layer.BRONZE.value
+    if not bronze_root.is_dir():
+        return []
+    candidates = sorted(
+        path
+        for path in bronze_root.rglob("data.parquet")
+        if _canonical_bronze_path(PurePosixPath(path.relative_to(root).as_posix()))
+    )
+    with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-bronze-schema") as pool:
+        legacy_flags = pool.map(
+            _has_legacy_bronze_payload,
+            candidates,
+            buffersize=max(cores * 2, 1),
+        )
+        return [path for path, is_legacy in zip(candidates, legacy_flags, strict=True) if is_legacy]
+
+
+def _decode_bronze_payload_json(value: object, path: Path, row_number: int) -> dict[str, object]:
+    if not isinstance(value, str):
+        raise ValueError(f"invalid Bronze payload_json value at row {row_number}: {path}")
+    try:
+        payload = json.loads(value, parse_float=Decimal)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid Bronze payload_json at row {row_number}: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Bronze payload_json must be an object at row {row_number}: {path}")
+    return payload
+
+
+def _semantically_equal(left: object, right: object) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, (int, float, Decimal)) and isinstance(right, (int, float, Decimal)):
+        try:
+            return Decimal(str(left)) == Decimal(str(right))
+        except Exception:
+            return False
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        # Polars structs union keys across rows; a missing key becomes null.
+        return all(
+            _semantically_equal(left.get(key), right.get(key))
+            for key in left.keys() | right.keys()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _semantically_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_recovery_original(source: Path, root: Path, backup_root: Path) -> None:
+    if not backup_root.is_dir() or backup_root.is_symlink():
+        raise ValueError(f"invalid recovery backup directory: {backup_root}")
+    destination = backup_root / source.relative_to(root)
+    destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(destination.parent, 0o700)
+    if destination.exists():
+        raise FileExistsError(f"recovery backup file already exists: {destination}")
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        unsupported_link = {
+            errno.EXDEV,
+            errno.EPERM,
+            errno.EACCES,
+            errno.EOPNOTSUPP,
+            errno.ENOTSUP,
+        }
+        if exc.errno not in unsupported_link:
+            raise
+    else:
+        _fsync_directory(destination.parent)
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".backup.tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with source.open("rb") as original, os.fdopen(descriptor, "wb") as backup:
+            shutil.copyfileobj(original, backup)
+            backup.flush()
+            os.fsync(backup.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _convert_canonical_bronze_payload_file(
+    source: Path,
+    root: Path,
+    backup_root: Path,
+    staging_root: Path,
+    backup_lock: Lock,
+) -> None:
+    original_frame = pl.read_parquet(source, low_memory=True)
+    if "provider_payload" in original_frame.columns:
+        raise ValueError(f"ambiguous Bronze payload columns: {source}")
+    if original_frame.height == 0:
+        with backup_lock:
+            _copy_recovery_original(source, root, backup_root)
+        source.unlink()
+        _fsync_directory(source.parent)
+        return
+    rows: list[dict[str, object]] = []
+    for row_number, source_row in enumerate(original_frame.to_dicts(), start=1):
+        row = dict(source_row)
+        row["provider_payload"] = _decode_bronze_payload_json(
+            row.pop("payload_json"), source, row_number
+        )
+        rows.append(row)
+    try:
+        staged_frame = pl.DataFrame(rows, infer_schema_length=None, strict=False)
+    except Exception as exc:
+        raise ValueError(f"could not stage native Bronze provider payload: {source}") from exc
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=staging_root,
+        prefix=f".{source.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        staged_frame.write_parquet(temporary, compression="zstd", statistics=True)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        staged_rows = pl.read_parquet(temporary, low_memory=True).to_dicts()
+        if len(staged_rows) != len(rows) or not all(
+            _semantically_equal(expected, actual)
+            for expected, actual in zip(rows, staged_rows, strict=True)
+        ):
+            raise ValueError(f"staged Bronze payload verification failed: {source}")
+        with backup_lock:
+            _copy_recovery_original(source, root, backup_root)
+        os.replace(temporary, source)
+        _fsync_directory(source.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _convert_canonical_bronze_payloads(root: Path, backup_root: Path, *, cores: int) -> int:
+    """Convert canonical JSON-text Bronze payloads with bounded parallelism."""
+
+    sources = _canonical_bronze_payload_files(root, cores=cores)
+    if not sources:
+        return 0
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.bronze-stage-", dir=root.parent)
+    )
+    os.chmod(staging_root, 0o700)
+    if os.stat(staging_root).st_dev != os.stat(root).st_dev:
+        shutil.rmtree(staging_root)
+        raise ValueError("Bronze staging directory must be on the lake filesystem")
+    backup_root.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    backup_root.mkdir(mode=0o700, exist_ok=False)
+    os.chmod(backup_root, 0o700)
+    _fsync_directory(backup_root.parent)
+    backup_lock = Lock()
+    converted = 0
+    try:
+        with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-bronze-native") as pool:
+            results = pool.map(
+                lambda source: _convert_canonical_bronze_payload_file(
+                    source,
+                    root,
+                    backup_root,
+                    staging_root,
+                    backup_lock,
+                ),
+                sources,
+                buffersize=max(cores * 2, 1),
+            )
+            for result in results:
+                del result
+                converted += 1
+                if converted % 1000 == 0 or converted == len(sources):
+                    print(
+                        canonical_json(
+                            {
+                                "stage": "canonical-bronze-payload-migration",
+                                "files_converted": converted,
+                                "files_total": len(sources),
+                            }
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+    except BaseException:
+        shutil.rmtree(staging_root)
+        try:
+            backup_root.rmdir()
+        except OSError:
+            pass
+        else:
+            _fsync_directory(backup_root.parent)
+        raise
+    shutil.rmtree(staging_root)
     return converted
 
 
@@ -210,20 +443,32 @@ def _convert_bronze_sources(
 
     written = 0
     for path, incoming in grouped.items():
-        prior = read_parquet_rows(path) if path.exists() else []
+        prior = (
+            [
+                {
+                    "isin": row.get("isin"),
+                    "exchange": row.get("exchange"),
+                    "code": row.get("code"),
+                    "provider_payload": read_legacy_bronze_provider_payload(row, path),
+                }
+                for row in read_parquet_rows(path)
+            ]
+            if path.exists()
+            else []
+        )
         unique = {canonical_json(cast(JSONValue, row)): row for row in prior}
         unique.update(incoming)
         ordered = [unique[key] for key in sorted(unique)]
         if ordered != prior:
             # Legacy sources remain authoritative until final validation, so
             # missing or unflushed Parquet output is safely replayable.
-            write_parquet_rows(path, ordered, sync_file=False, sync_directory=False)
+            write_native_parquet_rows(path, ordered, sync_file=False, sync_directory=False)
             written += 1
     return written
 
 
 def _provider_payload_rows(outer: Mapping[str, JSONValue]) -> list[dict[str, JSONValue]]:
-    raw = outer.get("payload", outer.get("payload_json"))
+    raw = outer.get("provider_payload", outer.get("payload", outer.get("payload_json")))
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -273,7 +518,7 @@ def _bronze_entry(
         "isin": isin,
         "exchange": exchange,
         "code": symbol,
-        "payload_json": canonical_json(cast(JSONValue, dict(item))),
+        "provider_payload": dict(item),
     }
 
 
@@ -304,12 +549,12 @@ def _convert_snapshot(
     if _canonical_snapshot_ready(layout, layer, dataset, manifest_path):
         return False
     legacy_manifest_path = layout.legacy_manifest_path(layer, dataset)
-    metadata_source = legacy_manifest_path if legacy_manifest_path.exists() else manifest_path
-    manifest = (
-        json.loads(metadata_source.read_text(encoding="utf-8"))
-        if metadata_source.exists()
-        else {}
-    )
+    if legacy_manifest_path.exists():
+        manifest = json.loads(legacy_manifest_path.read_text(encoding="utf-8"))
+    elif manifest_path.exists():
+        manifest = read_manifest_payload(manifest_path)
+    else:
+        manifest = {}
     if source.exists():
         # Inspect the full JSON input so late non-null strings are not inferred as Null.
         frame = pl.read_json(source, infer_schema_length=None)
@@ -516,7 +761,7 @@ def _canonical_snapshot_ready(
 ) -> bool:
     if not manifest_path.exists():
         return False
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = read_manifest_payload(manifest_path)
     run_metadata = manifest.get("run_metadata", {})
     paths = run_metadata.get("artifact_paths") if isinstance(run_metadata, dict) else None
     if not isinstance(paths, list):
@@ -601,14 +846,52 @@ def _canonical_bronze_path(path: PurePosixPath) -> bool:
     )
 
 
-def _validate_canonical_lake(root: Path) -> int:
+def _validate_canonical_bronze_schema(path: Path) -> None:
+    schema = pl.read_parquet_schema(path)
+    if "payload_json" in schema:
+        raise ValueError(f"legacy payload_json remains in canonical Bronze schema: {path}")
+    if "provider_payload" not in schema:
+        raise ValueError(f"native provider_payload is missing from canonical Bronze schema: {path}")
+    if not isinstance(schema["provider_payload"], pl.Struct):
+        raise ValueError(
+            f"provider_payload must be a native struct in canonical Bronze schema: {path}"
+        )
+
+
+def _is_root_restart_checkpoint(path: PurePosixPath) -> bool:
+    """Recognize only the active root-level restart checkpoint."""
+
+    return len(path.parts) == 1 and path.name == "weekly.checkpoint.parquet"
+
+
+def _obsolete_checkpoint_archives(root: Path) -> list[Path]:
+    """Find root-level aborted checkpoints for preservation outside the live lake."""
+
+    return sorted(
+        path
+        for path in root.glob("weekly.checkpoint.aborted*.parquet")
+        if path.is_file()
+    )
+
+
+def _validate_restart_checkpoint(path: Path) -> None:
+    """Validate a recognized Parquet checkpoint using the runtime contract."""
+
+    _checkpoint_from_payload(_read_checkpoint_parquet(path))
+
+
+def _validate_canonical_lake(root: Path) -> int:  # noqa: C901
     """Reject any row artifact left outside the goal's canonical lake layout."""
 
     row_artifact_count = 0
     canonical_snapshot_artifacts: set[str] = set()
+    canonical_bronze_artifacts: list[Path] = []
     invalid_paths: list[str] = []
     for artifact in root.rglob("*.parquet"):
         relative = PurePosixPath(artifact.relative_to(root).as_posix())
+        if _is_root_restart_checkpoint(relative):
+            _validate_restart_checkpoint(artifact)
+            continue
         if "_metadata" in relative.parts:
             continue
         layer_is_canonical = (
@@ -622,7 +905,9 @@ def _validate_canonical_lake(root: Path) -> int:
         )
         if layer_is_canonical:
             row_artifact_count += 1
-            if relative.parts[0] in {Layer.SILVER.value, Layer.GOLD.value}:
+            if relative.parts[0] == Layer.BRONZE.value:
+                canonical_bronze_artifacts.append(artifact)
+            else:
                 canonical_snapshot_artifacts.add(relative.as_posix())
         elif len(invalid_paths) < 10:
             invalid_paths.append(relative.as_posix())
@@ -631,6 +916,17 @@ def _validate_canonical_lake(root: Path) -> int:
             "non-canonical Parquet row artifacts remain in the lake: "
             + ", ".join(invalid_paths)
         )
+
+    with ThreadPoolExecutor(
+        max_workers=_POLARS_CORES,
+        thread_name_prefix="xdl-bronze-schema-validate",
+    ) as pool:
+        for _ in pool.map(
+            _validate_canonical_bronze_schema,
+            canonical_bronze_artifacts,
+            buffersize=max(_POLARS_CORES * 2, 1),
+        ):
+            pass
 
     referenced_artifacts = set(_canonical_snapshot_references(root))
     orphaned_artifacts = canonical_snapshot_artifacts - referenced_artifacts
@@ -670,8 +966,8 @@ def _canonical_snapshot_references(root: Path) -> dict[str, str]:  # noqa: C901,
     resolved_root = root.resolve()
     for layer in (Layer.SILVER, Layer.GOLD):
         metadata_root = root / layer.value / "_metadata"
-        for manifest_path in sorted(metadata_root.rglob("manifest.json")):
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for manifest_path in sorted(metadata_root.rglob("manifest.parquet")):
+            manifest = read_manifest_payload(manifest_path)
             if not isinstance(manifest, dict) or manifest.get("layer") != layer.value:
                 raise ValueError(f"invalid canonical {layer.value} manifest: {manifest_path}")
             dataset = manifest.get("dataset")
@@ -752,6 +1048,153 @@ def _unreferenced_snapshot_sidecars(root: Path) -> list[Path]:
     )
 
 
+def _is_nested_quote_legacy_source(path: Path, root: Path) -> bool:
+    relative = PurePosixPath(path.relative_to(root).as_posix())
+    return (
+        path.suffix == ".parquet"
+        and len(relative.parts) > 2
+        and relative.parts[0] == "bronze"
+        and relative.parts[1] == "dataset_type=eod_quotes"
+        and sum(part.startswith("symbol=") for part in relative.parts) > 1
+    )
+
+
+def _nested_quote_legacy_sources(root: Path) -> list[Path]:
+    """Find quote Parquets hidden below more than one legacy symbol directory."""
+
+    bronze_quotes = root / "bronze" / "dataset_type=eod_quotes"
+    if not bronze_quotes.is_dir():
+        return []
+    return sorted(
+        path
+        for path in bronze_quotes.rglob("*.parquet")
+        if _is_nested_quote_legacy_source(path, root)
+    )
+
+
+def _nested_quote_expected_rows(
+    source: Path,
+    context: _BronzeMigrationContext,
+) -> Counter[str]:
+    legacy_rows = read_parquet_rows(source)
+    if not legacy_rows:
+        raise ValueError(f"nested legacy quote partition is empty: {source}")
+    expected: Counter[str] = Counter()
+    fallback_date = datetime.fromtimestamp(source.stat().st_mtime, UTC).date()
+    for outer in legacy_rows:
+        payload_text = outer.get("payload_json")
+        if not isinstance(payload_text, str):
+            raise ValueError(f"nested legacy quote row lacks payload_json: {source}")
+        try:
+            payload_value = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"nested legacy quote payload is invalid: {source}") from exc
+        if not isinstance(payload_value, dict) and not (
+            isinstance(payload_value, list)
+            and payload_value
+            and all(isinstance(item, dict) for item in payload_value)
+        ):
+            raise ValueError(f"nested legacy quote payload is not an object list: {source}")
+        for item in _provider_payload_rows(outer):
+            _, normalized = _bronze_entry(
+                context,
+                "eod_quotes",
+                outer,
+                item,
+                fallback_date,
+            )
+            normalized["provider_payload"] = _canonical_quote_payload(item)
+            expected[canonical_json(normalized)] += 1
+    return expected
+
+
+_QUOTE_NUMERIC_FIELDS = frozenset({"open", "high", "low", "close", "adjusted_close", "volume"})
+
+
+def _canonical_quote_payload(payload: Mapping[str, object]) -> dict[str, JSONValue]:
+    """Normalize only defined quote numeric fields across JSON/Parquet scalar types."""
+
+    normalized: dict[str, JSONValue] = {}
+    for key, value in payload.items():
+        if (
+            key in _QUOTE_NUMERIC_FIELDS
+            and isinstance(value, (int, float, Decimal, str))
+            and not isinstance(value, bool)
+        ):
+            normalized[key] = canonical_decimal(Decimal(str(value)))
+        else:
+            normalized[key] = cast(JSONValue, value)
+    return normalized
+
+
+def _nested_quote_canonical_target(root: Path, source: Path) -> Path:
+    """Collapse repeated symbol directories without changing other partition keys."""
+
+    relative = PurePosixPath(source.relative_to(root).as_posix())
+    symbol_indexes = [
+        index for index, part in enumerate(relative.parts) if part.startswith("symbol=")
+    ]
+    if len(symbol_indexes) < 2:
+        raise ValueError(f"nested quote source has no repeated symbol partition: {source}")
+    final_symbol_index = symbol_indexes[-1]
+    target_parts = tuple(
+        part
+        for index, part in enumerate(relative.parts)
+        if not part.startswith("symbol=") or index == final_symbol_index
+    )
+    canonical_relative = PurePosixPath(*target_parts)
+    if not _canonical_bronze_path(canonical_relative):
+        raise ValueError(f"nested quote source does not collapse to canonical Bronze: {source}")
+    return root.joinpath(*canonical_relative.parts)
+
+
+def _verify_nested_quote_target(
+    root: Path,
+    target: Path,
+    expected: Counter[str],
+) -> None:
+    if not target.is_file():
+        raise ValueError(
+            "nested legacy quote rows have no canonical target: "
+            f"{target.relative_to(root).as_posix()}"
+        )
+    actual: Counter[str] = Counter()
+    for row in read_parquet_rows(target):
+        normalized = {
+            "isin": row.get("isin"),
+            "exchange": row.get("exchange"),
+            "code": row.get("code"),
+            "provider_payload": _canonical_quote_payload(
+                read_legacy_bronze_provider_payload(row, target)
+            ),
+        }
+        actual[canonical_json(cast(JSONValue, normalized))] += 1
+    missing = sum(max(count - actual[key], 0) for key, count in expected.items())
+    if missing:
+        raise ValueError(
+            "nested legacy quote rows are not fully present in canonical target "
+            f"({missing} missing): {target.relative_to(root).as_posix()}"
+        )
+
+
+def _verify_nested_quote_legacy_sources(root: Path) -> list[Path]:
+    """Prove each nested legacy payload row already exists in canonical Bronze."""
+
+    sources = _nested_quote_legacy_sources(root)
+    if not sources:
+        return []
+    context = _bronze_migration_context(MedallionLayout(root))
+    expected_by_target: dict[Path, Counter[str]] = {}
+    for source in sources:
+        target = _nested_quote_canonical_target(root, source)
+        expected_by_target.setdefault(target, Counter()).update(
+            _nested_quote_expected_rows(source, context)
+        )
+    for target, expected in expected_by_target.items():
+        _verify_nested_quote_target(root, target, expected)
+    return sources
+
+
 def _gold_migration_metadata(
     layout: MedallionLayout,
     dataset: str,
@@ -788,7 +1231,11 @@ def _gold_migration_metadata(
 def _legacy_artifact(path: Path, root: Path) -> bool:
     relative = path.relative_to(root)
     parts = relative.parts
-    if not parts or parts[0] not in {layer.value for layer in Layer}:
+    if (
+        not parts
+        or parts[0] not in {layer.value for layer in Layer}
+        or _is_nested_quote_legacy_source(path, root)
+    ):
         return False
     if "_metadata" in parts:
         return False
@@ -815,6 +1262,7 @@ def _archive_legacy_artifacts(
     backup_root: Path,
     *,
     additional_sources: Iterable[Path] = (),
+    allow_existing_backup: bool = False,
 ) -> int:
     resolved_root = root.resolve()
     sources = {
@@ -830,7 +1278,11 @@ def _archive_legacy_artifacts(
     for source in sorted(sources):
         if actual_backup is None:
             actual_backup = backup_root
-            actual_backup.mkdir(parents=True, mode=0o700, exist_ok=False)
+            if actual_backup.exists():
+                if not allow_existing_backup or not actual_backup.is_dir():
+                    raise FileExistsError(f"recovery backup already exists: {actual_backup}")
+            else:
+                actual_backup.mkdir(parents=True, mode=0o700, exist_ok=False)
             os.chmod(actual_backup, 0o700)
         relative = source.relative_to(root)
         destination = actual_backup / relative
@@ -865,6 +1317,24 @@ def migrate_lake(
     with LoaderLock(resolved_root / "authoritative-rewrite.lock"), LoaderLock(
         resolved_root / "weekly.lock"
     ):
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        actual_backup = resolved_backup_root / stamp
+        if actual_backup.exists():
+            raise FileExistsError(f"recovery backup already exists: {actual_backup}")
+        canonical_bronze_payloads_migrated = _convert_canonical_bronze_payloads(
+            resolved_root,
+            actual_backup,
+            cores=worker_count,
+        )
+        migrated_manifests = migrate_json_manifests(resolved_root)
+        if migrated_manifests:
+            print(
+                canonical_json(
+                    {"stage": "control-metadata-migration", "manifests": migrated_manifests}
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         bronze_partitions = _convert_bronze_partitions(
             resolved_root,
             cores=worker_count,
@@ -890,14 +1360,20 @@ def migrate_lake(
 
         validated_datasets = validate_gold_fingerprints_streaming(resolved_root)
 
+        verified_nested_quote_sources = _verify_nested_quote_legacy_sources(resolved_root)
+        obsolete_checkpoint_archives = _obsolete_checkpoint_archives(resolved_root)
         orphaned_artifacts = _unreferenced_canonical_artifacts(resolved_root)
         orphaned_sidecars = _unreferenced_snapshot_sidecars(resolved_root)
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        actual_backup = resolved_backup_root / stamp
         archived = _archive_legacy_artifacts(
             resolved_root,
             actual_backup,
-            additional_sources=(*orphaned_artifacts, *orphaned_sidecars),
+            additional_sources=(
+                *orphaned_artifacts,
+                *orphaned_sidecars,
+                *verified_nested_quote_sources,
+                *obsolete_checkpoint_archives,
+            ),
+            allow_existing_backup=canonical_bronze_payloads_migrated > 0,
         )
         canonical_row_artifacts = _validate_canonical_lake(resolved_root)
         return {
@@ -906,10 +1382,15 @@ def migrate_lake(
             "bronze_parquet_artifacts": bronze_partitions,
             "silver_gold_snapshots": converted_snapshots,
             "datasets_fingerprint_valid": validated_datasets,
+            "canonical_bronze_payload_files_migrated": canonical_bronze_payloads_migrated,
             "legacy_artifacts_archived": archived,
             "orphaned_canonical_artifacts_archived": len(orphaned_artifacts),
             "orphaned_retraction_sidecars_archived": len(orphaned_sidecars),
-            "recovery_backup": str(actual_backup) if archived else None,
+            "verified_nested_quote_partitions_archived": len(verified_nested_quote_sources),
+            "obsolete_checkpoint_archives_preserved": len(obsolete_checkpoint_archives),
+            "recovery_backup": str(actual_backup)
+            if archived or canonical_bronze_payloads_migrated
+            else None,
             "canonical_row_artifacts": canonical_row_artifacts,
         }
 

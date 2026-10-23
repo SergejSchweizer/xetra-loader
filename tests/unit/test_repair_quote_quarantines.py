@@ -1,4 +1,3 @@
-import json
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -90,7 +89,7 @@ def test_recovery_preserves_good_fields_and_nulls_only_invalid_close(tmp_path) -
                 "isin": listing.isin,
                 "exchange": listing.exchange,
                 "code": listing.code,
-                "payload_json": json.dumps(raw, sort_keys=True),
+                "provider_payload": raw,
             }
         ],
     )
