@@ -215,6 +215,12 @@ class BootstrapRuntime(Protocol):
         previous_records: Iterable[SplitEvent] = (),
     ) -> FetchBatch[SplitEvent]: ...
 
+    def persist_silver(
+        self,
+        dataset: str,
+        semantic_rows: Sequence[Mapping[str, JSONValue]],
+    ) -> None: ...
+
     def persist_gold(
         self,
         dataset: str,
@@ -509,6 +515,7 @@ def _persist_all_gold(
             splits.semantic_fingerprint,
         ),
     ):
+        runtime.persist_silver(dataset, rows)
         runtime.persist_gold(
             dataset,
             rows,

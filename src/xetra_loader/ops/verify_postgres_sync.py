@@ -86,7 +86,9 @@ class GoldDatasetSnapshot:
 
     dataset: str
     source_count: int
+    source_rows_fingerprint: str
     rows: tuple[dict[str, JSONValue], ...]
+    gold_rows_fingerprint: str
     retracted_keys: tuple[tuple[str, str, str, str], ...]
     manifest_fingerprint: str
     computed_fingerprint: str
@@ -105,7 +107,9 @@ class DatasetVerification:
     """Exact comparison of one validated Gold dataset with PostgreSQL."""
 
     source_count: int
+    source_rows_fingerprint: str
     gold_count: int
+    gold_rows_fingerprint: str
     postgres_count: int
     missing_keys: int
     extra_keys: int
@@ -121,7 +125,9 @@ class DatasetVerification:
     @property
     def passed(self) -> bool:
         return (
-            self.gold_count == self.postgres_count
+            self.source_count == self.gold_count
+            and self.source_rows_fingerprint == self.gold_rows_fingerprint
+            and self.gold_count == self.postgres_count
             and self.missing_keys == 0
             and self.extra_keys == 0
             and self.duplicate_keys == 0
@@ -134,7 +140,9 @@ class DatasetVerification:
     def as_dict(self) -> dict[str, JSONValue]:
         return {
             "source_count": self.source_count,
+            "source_rows_fingerprint": self.source_rows_fingerprint,
             "gold_count": self.gold_count,
+            "gold_rows_fingerprint": self.gold_rows_fingerprint,
             "postgres_count": self.postgres_count,
             "missing_keys": self.missing_keys,
             "extra_keys": self.extra_keys,
@@ -333,6 +341,13 @@ class _AdminResetWriterPublishRuntime:
             previous_records=previous_records,
         )
 
+    def persist_silver(
+        self,
+        dataset: str,
+        semantic_rows: Sequence[Mapping[str, JSONValue]],
+    ) -> None:
+        self._admin.persist_silver(dataset, semantic_rows)
+
     def persist_gold(self, *args: Any, **kwargs: Any) -> None:
         self._admin.persist_gold(*args, **kwargs)
 
@@ -494,7 +509,9 @@ def verify_postgres_sync(
         db_min, db_max = _date_bounds(dataset, db_rows)
         datasets[dataset] = DatasetVerification(
             source_count=gold_snapshot.source_count,
+            source_rows_fingerprint=gold_snapshot.source_rows_fingerprint,
             gold_count=gold_snapshot.row_count,
+            gold_rows_fingerprint=gold_snapshot.gold_rows_fingerprint,
             postgres_count=len(db_rows),
             missing_keys=missing_keys,
             extra_keys=extra_keys,
@@ -567,7 +584,9 @@ def load_gold_snapshots(root: Path) -> dict[str, GoldDatasetSnapshot]:
         result[dataset] = GoldDatasetSnapshot(
             dataset=dataset,
             source_count=len(source_rows),
+            source_rows_fingerprint=_semantic_rows_fingerprint(dataset, source_rows),
             rows=ordered,
+            gold_rows_fingerprint=_semantic_rows_fingerprint(dataset, ordered),
             retracted_keys=retracted_keys,
             manifest_fingerprint=manifest_fingerprint,
             computed_fingerprint=semantic_fingerprint(
@@ -756,6 +775,19 @@ def semantic_fingerprint(
     else:
         payload = ordered
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _semantic_rows_fingerprint(
+    dataset: str,
+    rows: Sequence[Mapping[str, JSONValue]],
+) -> str:
+    """Fingerprint normalized dataset rows without Gold-only retraction metadata."""
+
+    ordered: list[JSONValue] = [
+        cast(JSONValue, dict(row))
+        for row in sorted(rows, key=lambda row: _business_key(dataset, row))
+    ]
+    return hashlib.sha256(canonical_json(ordered).encode("utf-8")).hexdigest()
 
 
 def write_production_report(report: ProductionAcceptanceReport, path: Path) -> Path:

@@ -171,7 +171,7 @@ CREATE TEMP TABLE xdl_desired_eod_quotes (
     open numeric,
     high numeric,
     low numeric,
-    close numeric NOT NULL,
+    close numeric,
     adjusted_close numeric,
     volume bigint,
     fetched_at_utc timestamptz NOT NULL,

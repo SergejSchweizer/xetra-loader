@@ -82,6 +82,40 @@ def test_logging_startup_prunes_only_this_component_logs_older_than_90_days(
         package_logger.propagate = original_propagate
 
 
+def test_switching_log_components_detaches_the_previous_file_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    log_dir = tmp_path / ".logs"
+    monkeypatch.setenv("XDL_LOG_DIR", str(log_dir))
+    package_logger = logging.getLogger("xetra_loader")
+    original_handlers = package_logger.handlers
+    original_level = package_logger.level
+    original_propagate = package_logger.propagate
+    package_logger.handlers = []
+
+    try:
+        weekly_path = configure_logging("xdl-weekly")
+        weekly_handler = package_logger.handlers[0]
+        verifier_path = configure_logging("xdl-verify-production-sync")
+        logging.getLogger("xetra_loader.pipeline.test_module").debug(
+            "verifier_only_record"
+        )
+        for handler in package_logger.handlers:
+            handler.flush()
+
+        assert weekly_handler not in package_logger.handlers
+        assert len(package_logger.handlers) == 1
+        assert "verifier_only_record" not in weekly_path.read_text(encoding="utf-8")
+        assert "verifier_only_record" in verifier_path.read_text(encoding="utf-8")
+    finally:
+        for handler in package_logger.handlers:
+            handler.close()
+        package_logger.handlers = original_handlers
+        package_logger.setLevel(original_level)
+        package_logger.propagate = original_propagate
+
+
 def test_logging_component_rejects_path_traversal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

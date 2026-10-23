@@ -61,7 +61,13 @@ def ingest_quotes(
             raise ValueError("each EODHD quote must be a JSON object")
         bronze_rows.append(item)
         try:
-            silver.append(_normalize_quote(listing, item))
+            silver.append(
+                _normalize_quote(
+                    listing,
+                    item,
+                    sanitize_invalid_ohlc=quarantine_invalid_ohlc,
+                )
+            )
         except ValueError as exc:
             if not quarantine_invalid_ohlc or not _is_invalid_ohlc(exc):
                 raise
@@ -98,13 +104,52 @@ def ingest_quotes(
     )
 
 
-def _normalize_quote(listing: ListingRecord, row: Mapping[str, JSONValue]) -> QuoteRecord:
+def _normalize_quote(
+    listing: ListingRecord,
+    row: Mapping[str, JSONValue],
+    *,
+    sanitize_invalid_ohlc: bool,
+) -> QuoteRecord:
     trade_date = date.fromisoformat(_required_text(row, "date"))
     open_price = _decimal(row.get("open"))
     high = _decimal(row.get("high"))
     low = _decimal(row.get("low"))
-    close = _required_decimal(row, "close")
-    open_price, high, low = _missing_ohlc_sentinel(open_price, high, low, close)
+    close_value = _required_decimal(row, "close")
+    close: Decimal | None = close_value
+    volume = _integer(row.get("volume"))
+    open_price, high, low = _missing_ohlc_sentinel(
+        open_price,
+        high,
+        low,
+        close_value,
+        volume=volume,
+    )
+    invalid_fields: list[str] = []
+    if high is not None and low is not None and low > high:
+        if not sanitize_invalid_ohlc:
+            raise ValueError("quote low must not exceed high")
+        high = None
+        low = None
+        invalid_fields.extend(("high", "low"))
+    elif high is not None and low is not None:
+        if open_price is not None and not low <= open_price <= high:
+            if not sanitize_invalid_ohlc:
+                raise ValueError("open must be between low and high")
+            open_price = None
+            invalid_fields.append("open")
+        if close is not None and not low <= close <= high:
+            if not sanitize_invalid_ohlc:
+                raise ValueError("close must be between low and high")
+            close = None
+            invalid_fields.append("close")
+    if invalid_fields:
+        _LOGGER.warning(
+            "nulled invalid EODHD OHLC field(s)=%s for %s.%s on %s",
+            ",".join(invalid_fields),
+            listing.code,
+            listing.exchange,
+            trade_date,
+        )
     return QuoteRecord(
         isin=listing.isin,
         exchange=listing.exchange,
@@ -115,7 +160,7 @@ def _normalize_quote(listing: ListingRecord, row: Mapping[str, JSONValue]) -> Qu
         low=low,
         close=close,
         adjusted_close=_decimal(row.get("adjusted_close", row.get("adjustedClose"))),
-        volume=_integer(row.get("volume")),
+        volume=volume,
     )
 
 
@@ -124,10 +169,14 @@ def _missing_ohlc_sentinel(
     high: Decimal | None,
     low: Decimal | None,
     close: Decimal,
+    *,
+    volume: int | None,
 ) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
-    """Map EODHD's all-zero missing-OHLC sentinel without masking bad prices."""
+    """Map EODHD's zero-volume missing-OHLC sentinels without masking bad prices."""
 
     if open_price == high == low == Decimal(0) and close > 0:
+        return None, None, None
+    if high == low == Decimal(0) and close > 0 and volume == 0:
         return None, None, None
     return open_price, high, low
 

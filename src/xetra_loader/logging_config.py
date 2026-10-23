@@ -59,14 +59,17 @@ def configure_logging(component: str) -> Path:
     log_path = log_dir / f"{component}.log"
 
     for handler in tuple(_PACKAGE_LOGGER.handlers):
-        if getattr(handler, "xdl_log_component", None) == component:
-            if (
-                isinstance(handler, logging.FileHandler)
-                and Path(handler.baseFilename).resolve() == log_path
-            ):
-                return log_path
-            _PACKAGE_LOGGER.removeHandler(handler)
-            handler.close()
+        existing_component = getattr(handler, "xdl_log_component", None)
+        if existing_component is None:
+            continue
+        if (
+            existing_component == component
+            and isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).resolve() == log_path
+        ):
+            return log_path
+        _PACKAGE_LOGGER.removeHandler(handler)
+        handler.close()
 
     _prune_expired_logs(log_dir, log_path.name)
     handler = _ThreeMonthTimedRotatingFileHandler(

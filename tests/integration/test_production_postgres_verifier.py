@@ -211,7 +211,9 @@ def test_decimal_text_normalizes_postgres_numeric_scale() -> None:
 def _passing_dataset() -> DatasetVerification:
     return DatasetVerification(
         source_count=1,
+        source_rows_fingerprint="b" * 64,
         gold_count=1,
+        gold_rows_fingerprint="b" * 64,
         postgres_count=1,
         missing_keys=0,
         extra_keys=0,
@@ -293,6 +295,24 @@ def test_acceptance_report_is_sanitized_and_fails_closed(tmp_path: Path) -> None
         replay_mutations=passing.replay_mutations,
     )
     assert not failing.passed
+
+    missing_silver_rows = replace(
+        passing,
+        datasets={
+            **passing.datasets,
+            "eod_quotes": replace(_passing_dataset(), source_count=0),
+        },
+    )
+    assert not missing_silver_rows.passed
+
+    different_silver_rows = replace(
+        passing,
+        datasets={
+            **passing.datasets,
+            "eod_quotes": replace(_passing_dataset(), source_rows_fingerprint="c" * 64),
+        },
+    )
+    assert not different_silver_rows.passed
 
 
 def test_full_sync_parser_can_disable_delta_replay() -> None:

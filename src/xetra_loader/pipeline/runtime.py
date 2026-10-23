@@ -99,23 +99,32 @@ class _WeeklyState:
             jobs,
             lambda worker, job: worker.fetch_quotes(
                 job[0],
-                last_business_date=None,
+                # Changed dividends or splits can alter adjusted history, so
+                # replay that listing fully. Otherwise refresh from its latest
+                # stored quote with the provider overlap handled downstream.
+                last_business_date=(
+                    None if job[2] else _latest_date(job[1])
+                ),
                 previous_records=job[1],
             ),
             self.cores,
         )
         for job, batch in zip(jobs, batches, strict=True):
             listing, listing_previous, action_changed = job
-            records.extend(_replace_quote_window(listing_previous, batch.rows, None))
+            last_business_date = None if action_changed else _latest_date(listing_previous)
+            records.extend(
+                _replace_quote_window(listing_previous, batch.rows, last_business_date)
+            )
             self._record_fetch_times("eod_quotes", batch.rows, batch.fetched_at_utc)
             requests += batch.metrics.logical_requests
             _LOGGER.debug(
                 "provider_fetch_complete dataset=eod_quotes code=%s exchange=%s "
-                "rows=%d requests=%d history_mode=full_snapshot action_changed=%s",
+                "rows=%d requests=%d history_mode=%s action_changed=%s",
                 listing.code,
                 listing.exchange,
                 len(batch.rows),
                 batch.metrics.logical_requests,
+                "full_snapshot" if action_changed or not listing_previous else "delta",
                 action_changed,
             )
         self.quotes = build_quote_gold(records)
@@ -133,7 +142,9 @@ class _WeeklyState:
             "eod_quotes",
             _ingest_details(self.quotes.row_count, requests, self.quotes.semantic_fingerprint),
         )
-        details["source_fetch_mode"] = "full_history"
+        details["source_fetch_mode"] = (
+            "full_history" if any(job[2] or not job[1] for job in jobs) else "delta"
+        )
         details["publication_mode"] = "semantic_delta"
         return details
 
@@ -915,7 +926,7 @@ def _quotes_from_rows(rows: list[dict[str, JSONValue]]) -> tuple[QuoteRecord, ..
             open=_optional_decimal(row, "open"),
             high=_optional_decimal(row, "high"),
             low=_optional_decimal(row, "low"),
-            close=Decimal(_required_text(row, "close")),
+            close=_optional_decimal(row, "close"),
             adjusted_close=_optional_decimal(row, "adjusted_close"),
             volume=cast(int | None, row.get("volume")),
         )

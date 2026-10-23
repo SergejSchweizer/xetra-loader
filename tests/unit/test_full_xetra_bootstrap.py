@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping, Sequence
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -11,7 +12,7 @@ import xetra_loader.ops.bootstrap as bootstrap_module
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.contracts.quotes import QuoteRecord
-from xetra_loader.medallion.core import MedallionLayout
+from xetra_loader.medallion.core import JSONValue, MedallionLayout
 from xetra_loader.ops.bootstrap import (
     BootstrapVerification,
     DestructiveConfirmationRequired,
@@ -28,6 +29,7 @@ class FixtureRuntime:
         self.calls: list[str] = []
         self.fingerprints: dict[str, str] = {}
         self.persisted: dict[str, int] = {}
+        self.persisted_silver: dict[str, int] = {}
         self.listings = (
             ListingRecord(isin="DE0000000001", exchange="XETRA", code="AAA"),
             ListingRecord(isin="DE0000000002", exchange="XETRA", code="BBB"),
@@ -37,6 +39,7 @@ class FixtureRuntime:
         self.calls.append("reset")
         self.fingerprints.clear()
         self.persisted.clear()
+        self.persisted_silver.clear()
 
     def fetch_listings(self) -> FetchBatch[ListingRecord]:
         self.calls.append("fetch-listings")
@@ -108,6 +111,14 @@ class FixtureRuntime:
         del semantic_rows, semantic_fingerprint, retracted_keys
         self.calls.append(f"persist:{dataset}")
         self.persisted[dataset] = row_count
+
+    def persist_silver(
+        self,
+        dataset: str,
+        semantic_rows: Sequence[Mapping[str, JSONValue]],
+    ) -> None:
+        self.calls.append(f"persist-silver:{dataset}")
+        self.persisted_silver[dataset] = len(semantic_rows)
 
     def _publish(self, dataset: str, fingerprint: str, row_count: int) -> SyncOutcome:
         self.calls.append(f"publish:{dataset}")
@@ -220,6 +231,12 @@ def test_clean_full_universe_bootstrap_then_unchanged_replay_is_noop() -> None:
     assert runtime.calls[0] == "reset"
     assert runtime.calls.count("verify") == 1
     assert all(outcome.counters.total_mutations > 0 for outcome in first.sync_outcomes.values())
+    assert runtime.persisted_silver == runtime.persisted
+    assert all(
+        runtime.calls.index(f"persist-silver:{dataset}")
+        < runtime.calls.index(f"persist:{dataset}")
+        for dataset in ("listings", "eod_quotes", "dividends", "splits")
+    )
 
     runtime.calls.clear()
     replay = run_full_bootstrap(runtime, confirmed=True, reset_owned_state=False)
