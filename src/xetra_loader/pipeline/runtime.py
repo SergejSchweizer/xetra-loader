@@ -42,6 +42,7 @@ _LOGGER = logging.getLogger(__name__)
 class _WeeklyState:
     runtime: PostgresEodhdBootstrapRuntime
     cores: int = 1
+    provider_cores: int = 1
     listings: ListingGoldResult | None = None
     quotes: QuoteGoldResult | None = None
     dividends: DividendGoldResult | None = None
@@ -92,7 +93,7 @@ class _WeeklyState:
         _LOGGER.info(
             "provider_stage_start dataset=eod_quotes jobs=%d cores=%d",
             len(jobs),
-            self.cores,
+            self.provider_cores,
         )
         batches = _parallel_fetch(
             self.runtime,
@@ -107,7 +108,7 @@ class _WeeklyState:
                 ),
                 previous_records=job[1],
             ),
-            self.cores,
+            self.provider_cores,
         )
         for job, batch in zip(jobs, batches, strict=True):
             listing, listing_previous, action_changed = job
@@ -169,7 +170,7 @@ class _WeeklyState:
         _LOGGER.info(
             "provider_stage_start dataset=dividends jobs=%d cores=%d",
             len(jobs),
-            self.cores,
+            self.provider_cores,
         )
         batches = _parallel_fetch(
             self.runtime,
@@ -177,7 +178,7 @@ class _WeeklyState:
             lambda worker, job: worker.fetch_dividends(
                 job[0], last_event_date=None, previous_records=job[1]
             ),
-            self.cores,
+            self.provider_cores,
         )
         for job, batch in zip(jobs, batches, strict=True):
             listing, listing_previous = job
@@ -239,7 +240,7 @@ class _WeeklyState:
         _LOGGER.info(
             "provider_stage_start dataset=splits jobs=%d cores=%d",
             len(jobs),
-            self.cores,
+            self.provider_cores,
         )
         batches = _parallel_fetch(
             self.runtime,
@@ -247,7 +248,7 @@ class _WeeklyState:
             lambda worker, job: worker.fetch_splits(
                 job[0], last_event_date=None, previous_records=job[1]
             ),
-            self.cores,
+            self.provider_cores,
         )
         for job, batch in zip(jobs, batches, strict=True):
             listing, listing_previous = job
@@ -613,8 +614,16 @@ def build_weekly_stages(cores: int | None = None) -> PipelineStages:
             cores=worker_count,
         ),
         cores=worker_count,
+        # The provider began stalling on six simultaneous API connections.
+        # Keep EODHD concurrency to two while SQL synchronization retains the
+        # full caller-selected core budget.
+        provider_cores=min(worker_count, 2),
     )
-    _LOGGER.info("weekly_configuration cores=%d", state.cores)
+    _LOGGER.info(
+        "weekly_configuration cores=%d provider_cores=%d",
+        state.cores,
+        state.provider_cores,
+    )
     return PipelineStages(
         listings=state.ingest_listings,
         quotes=state.ingest_quotes,
