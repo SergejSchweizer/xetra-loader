@@ -31,7 +31,9 @@ def _stages(calls: list[str]) -> PipelineStages:
 
 def test_weekly_runner_uses_medallion_root_and_core_budget(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setenv("XDL_LOG_DIR", str(tmp_path / "logs"))
     calls: list[str] = []
     budgets: list[int] = []
 
@@ -76,6 +78,7 @@ def test_polars_thread_limit_is_set_before_runtime_import(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("XDL_LOG_DIR", str(tmp_path / "logs"))
     observed: list[tuple[int, str | None]] = []
     fake_runtime = ModuleType("xetra_loader.pipeline.runtime")
 

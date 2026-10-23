@@ -1,4 +1,4 @@
-"""Weekly refresh checks full provider history and publishes only semantic deltas."""
+"""Weekly refresh uses quote deltas except after corporate-action changes."""
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -12,7 +12,7 @@ from xetra_loader.contracts.corporate_actions import (
     retract_dividend,
 )
 from xetra_loader.contracts.listings import ListingRecord
-from xetra_loader.contracts.quotes import QuoteRecord
+from xetra_loader.contracts.quotes import QuoteRecord, overlap_start
 from xetra_loader.gold.listings import build_listing_gold
 from xetra_loader.medallion.core import MedallionLayout
 from xetra_loader.ops.bootstrap import (
@@ -21,8 +21,10 @@ from xetra_loader.ops.bootstrap import (
     PostgresEodhdBootstrapRuntime,
 )
 from xetra_loader.pipeline.runtime import (
+    _dividend_silver_row,
     _parallel_database_core_budgets,
     _replace_action_window,
+    _split_silver_row,
     _WeeklyState,
     build_weekly_stages,
 )
@@ -77,6 +79,9 @@ class _Runtime:
             _quote(20, "12"),
             _quote(22, "13"),
         )
+        self.dividend_snapshot = (_dividend(10),)
+        self.split_snapshot = (_split(10),)
+        self.persisted_silver_by_dataset: dict[str, list[dict[str, object]]] = {}
 
     def fetch_quotes(
         self,
@@ -85,11 +90,15 @@ class _Runtime:
         last_business_date: date | None = None,
         previous_records: tuple[QuoteRecord, ...] = (),
     ) -> FetchBatch[QuoteRecord]:
-        del listing
         self.calls.append((last_business_date, previous_records))
+        rows = tuple(
+            row
+            for row in self.full_snapshot
+            if last_business_date is None or row.trade_date >= overlap_start(last_business_date)
+        )
         return FetchBatch(
-            self.full_snapshot,
-            FetchMetrics(logical_requests=1, attempts=1, rows=len(self.full_snapshot)),
+            rows,
+            FetchMetrics(logical_requests=1, attempts=1, rows=len(rows)),
             datetime(2026, 8, 23, 10, 0, tzinfo=UTC),
         )
 
@@ -103,7 +112,7 @@ class _Runtime:
         del listing
         self.action_calls.append(("dividends", last_event_date, previous_records))
         return FetchBatch(
-            (_dividend(10),),
+            self.dividend_snapshot,
             FetchMetrics(logical_requests=1, attempts=1, rows=1),
             datetime(2026, 8, 23, 10, 0, tzinfo=UTC),
         )
@@ -118,7 +127,7 @@ class _Runtime:
         del listing
         self.action_calls.append(("splits", last_event_date, previous_records))
         return FetchBatch(
-            (_split(10),),
+            self.split_snapshot,
             FetchMetrics(logical_requests=1, attempts=1, rows=1),
             datetime(2026, 8, 23, 10, 0, tzinfo=UTC),
         )
@@ -127,6 +136,7 @@ class _Runtime:
         del args, kwargs
 
     def persist_silver(self, dataset: str, rows: list[dict[str, object]]) -> None:
+        self.persisted_silver_by_dataset[dataset] = rows
         if dataset == "eod_quotes":
             self.persisted_silver = rows
 
@@ -140,7 +150,13 @@ def _seed_silver(root: Path, records: tuple[QuoteRecord, ...]) -> None:
     )
 
 
-def test_weekly_quote_refresh_replaces_gold_with_full_provider_history(tmp_path: Path) -> None:
+def _seed_silver_rows(root: Path, dataset: str, rows: list[dict[str, object]]) -> None:
+    writer = object.__new__(PostgresEodhdBootstrapRuntime)
+    writer._layout = MedallionLayout(root)
+    writer.persist_silver(dataset, rows)  # type: ignore[arg-type]
+
+
+def test_weekly_quote_refresh_uses_delta_without_split(tmp_path: Path) -> None:
     runtime = _Runtime(tmp_path)
     old_history = (_quote(14, "10"), _quote(18, "11"), _quote(20, "10"), _quote(22, "12"))
     _seed_silver(tmp_path, old_history)
@@ -149,7 +165,7 @@ def test_weekly_quote_refresh_replaces_gold_with_full_provider_history(tmp_path:
 
     details = state.ingest_quotes()
 
-    assert runtime.calls[0][0] is None
+    assert runtime.calls[0][0] == date(2026, 8, 22)
     assert [record.trade_date for record in runtime.calls[0][1]] == [
         date(2026, 8, 14),
         date(2026, 8, 18),
@@ -164,17 +180,36 @@ def test_weekly_quote_refresh_replaces_gold_with_full_provider_history(tmp_path:
     ]
     assert runtime.persisted_silver[2]["close"] == "12"
     assert details["requests"] == 1
-    assert details["source_fetch_mode"] == "full_history"
+    assert details["source_fetch_mode"] == "delta"
     assert details["publication_mode"] == "semantic_delta"
 
 
-def test_quote_history_is_full_even_without_a_corporate_action_change(tmp_path: Path) -> None:
+def test_new_listing_receives_initial_full_quote_history(tmp_path: Path) -> None:
+    runtime = _Runtime(tmp_path)
+    listing = ListingRecord("DE0000000002", "XETRA", "NEW")
+    state = _WeeklyState(runtime)  # type: ignore[arg-type]
+    state.listings = build_listing_gold([listing])
+
+    details = state.ingest_quotes()
+
+    assert runtime.calls == [(None, ())]
+    assert details["source_fetch_mode"] == "full_history"
+    assert [row["trade_date"] for row in runtime.persisted_silver] == [
+        "2026-08-14",
+        "2026-08-18",
+        "2026-08-20",
+        "2026-08-22",
+    ]
+
+
+def test_quote_history_is_full_after_split_change(tmp_path: Path) -> None:
     runtime = _Runtime(tmp_path)
     old_history = (_quote(14, "10"), _quote(22, "12"))
     _seed_silver(tmp_path, old_history)
     listing = ListingRecord("DE0000000001", "XETRA", "AAA")
     state = _WeeklyState(runtime)  # type: ignore[arg-type]
     state.listings = build_listing_gold([listing])
+    state.action_changed_listings.add(listing.key)
     details = state.ingest_quotes()
 
     assert runtime.calls == [(None, old_history)]
@@ -184,6 +219,44 @@ def test_quote_history_is_full_even_without_a_corporate_action_change(tmp_path: 
         "2026-08-20",
         "2026-08-22",
     ]
+    assert details["source_fetch_mode"] == "full_history"
+
+
+@pytest.mark.parametrize("changed_dataset", ["dividends", "splits"])
+def test_corporate_action_change_triggers_full_quote_history(
+    tmp_path: Path, changed_dataset: str
+) -> None:
+    runtime = _Runtime(tmp_path)
+    listing = ListingRecord("DE0000000001", "XETRA", "AAA")
+    old_history = (_quote(14, "10"), _quote(22, "12"))
+    _seed_silver(tmp_path, old_history)
+    state = _WeeklyState(runtime)  # type: ignore[arg-type]
+    state.listings = build_listing_gold([listing])
+
+    if changed_dataset == "dividends":
+        prior = _dividend(10, "1.25")
+        runtime.dividend_snapshot = (_dividend(10, "1.50"),)
+        _seed_silver_rows(tmp_path, "dividends", [_dividend_silver_row(prior)])
+        state.ingest_dividends()
+    else:
+        prior = _split(10)
+        runtime.split_snapshot = (
+            SplitEvent(
+                isin=prior.isin,
+                exchange=prior.exchange,
+                code=prior.code,
+                event_date=prior.event_date,
+                split_ratio="3:1",
+                split_factor=Decimal("3"),
+            ),
+        )
+        _seed_silver_rows(tmp_path, "splits", [_split_silver_row(prior)])
+        state.ingest_splits()
+
+    assert listing.key in state.action_changed_listings
+    details = state.ingest_quotes()
+
+    assert runtime.calls == [(None, old_history)]
     assert details["source_fetch_mode"] == "full_history"
 
 

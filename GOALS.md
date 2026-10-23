@@ -41,11 +41,15 @@ Non-negotiable invariants:
 
 - Identity is `(isin, exchange, code)`; quote identity adds `trade_date`, and
   corporate-action identity adds a deterministic content-addressed `event_key`.
-- Provider corrections to any historical observation must replace the old
+- Provider corrections observed in a fetched quote range must replace the old
   semantic value in the lake and PostgreSQL. The system must not assume that
-  provider history is immutable.
-- The weekly path checks complete provider history for active listings, then
-  publishes only semantic changes. A zero-change run is an idempotent no-op.
+  provider history is immutable; corporate-action changes trigger a full quote
+  history replay for the affected listing.
+- The weekly path checks complete dividend and split event snapshots for active
+  listings, but requests quote deltas by default. If either corporate-action
+  event set changes for an ISIN, it reloads that listing's full quote history.
+  New listings without stored quotes also receive an initial full history.
+  Only semantic changes are published; a zero-change run is an idempotent no-op.
 - Delisted listings and their retained histories remain available. Absence
   from the active listing response is not permission to erase historical data.
 - All row-bearing lake files are Parquet written/read with Polars. JSON is for
@@ -75,7 +79,7 @@ provider contracts → Bronze → Silver → Gold → cross-dataset validation
                                                    ▼
                        xetra_loader.xetra_features materialized view
 
-Sunday full-refresh wrapper ──> staged complete rebuild ──> acceptance ──> cleanup
+Sunday weekly wrapper ──> restart-safe delta ──> action-triggered quote replay ──> publish
 Optional REST submission ──> PostgreSQL durable job ──LISTEN/NOTIFY──> API worker
 ```
 
@@ -115,15 +119,20 @@ rewrites cannot mutate the same lake concurrently.
 - `timestamp_eod` is a UTC midnight date anchor, not a claimed exchange-close
   timestamp. Source fetch and publication timestamps are separate UTC audit
   fields and are excluded from semantic identity/fingerprints.
-- For weekly reconciliation, fetch complete history for active instruments so
-  arbitrary historical provider revisions can be detected. Compare semantic
-  records with the prior lake snapshot and publish only inserts, updates, and
-  retractions that are actually needed. Keep inactive instruments' prior
-  history unless provider evidence authoritatively changes it.
-- Incremental provider endpoints may be used only when paired with an explicit
-  correction/reconciliation policy that still detects revisions outside the
-  overlap. A short overlap alone cannot guarantee complete historical
-  correction capture.
+- For weekly quote reconciliation, request only the date range after the latest
+  stored quote, with the provider overlap, by default. Compare the complete
+  dividend and split event snapshots with the prior Silver state; if either
+  event set changes, request that listing's complete quote history because an
+  action may revise adjusted historical values. New listings without quote
+  history also get a full initial snapshot. Merge the result with prior rows
+  and publish only semantic inserts, updates, or retractions. Keep inactive
+  instruments' prior history unless provider evidence authoritatively changes it.
+- The weekly policy guarantees recent quote correction capture through its
+  overlap and action-driven historical adjusted-price correction capture
+  through full quote replay when the dividend/split snapshot changes. It does
+  not detect an unrelated provider edit to an old quote outside the overlap;
+  use the explicit full-refresh recovery when that broader reconciliation is
+  required.
 
 ### Dividends and splits
 
@@ -310,9 +319,12 @@ limits, and role grants.
 - Use a cross-process lock under the lake root to prevent a second weekly or
   authoritative rewrite. Lock conflict is a clear blocked result, not silent
   concurrent execution.
-- Weekly histories are provider-full-history checks with semantic-delta lake
-  and PostgreSQL publication. The Sunday full-refresh wrapper is a complete
-  staged rebuild, not a delta-only download.
+- Weekly quotes are delta downloads by default, with a full-history quote
+  replay only for a newly listed instrument or when its dividend/split event
+  snapshot has changed. The full event snapshots are checked each run so
+  retrospective additions, changes, and removals trigger the replay. Lake and
+  PostgreSQL publication remain semantic deltas. A complete staged rebuild is
+  reserved for an explicitly requested operational recovery, not the schedule.
 - When a PostgreSQL transaction fails, its market rows, feature refresh,
   digests, state, and run log must roll back together. Restart replays safely.
 - Gold manifests and recovery backups must be verifiable using SHA-256 before
@@ -338,18 +350,18 @@ exactly one active job; mark terminal success/failure. Establish `LISTEN`
 before scanning the queue, then block on `NOTIFY` while idle—never poll.
 Shutdown notification wakes the listener and waits for an active run to finish.
 
-The direct Sunday full-refresh schedule is currently the active canonical
-schedule. Do not also enqueue a normal REST weekly job at the same time. API job
-submission remains an optional explicit mechanism unless deployment policy
-changes.
+The direct Sunday restart-safe delta runner is the active canonical schedule.
+Do not also enqueue a REST weekly job at the same time. API job submission
+remains an optional explicit mechanism unless deployment policy changes.
 
 ## Scheduling and deployment
 
 - Cron artifact: `deploy/cron/xetra-loader.cron`.
-- Sunday full refresh: 09:00 `Europe/Vienna`, invokes
-  `scripts/run_full_refresh.sh`, which delegates to
-  `xdl-verify-production-sync --execute-full-sync` with required destructive
-  confirmation and reporting/backup paths.
+- Sunday weekly delta: 09:00 `Europe/Vienna`, invokes
+  `scripts/run_weekly_sync.sh`, which runs `xdl-weekly` with the configured
+  core budget (default 6), restart checkpoint, and process lock. The wrapper
+  stores its private log in
+  `.logs/`. Full refresh is an explicit recovery/maintenance operation only.
 - API service artifact: `deploy/systemd/xetra-loader-api.service`; installation
   and enablement are separate host-operator actions.
 - Keep Gold lake copying or other host-specific schedules separate from the

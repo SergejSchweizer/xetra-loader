@@ -13,6 +13,7 @@ from xetra_loader.ops import bootstrap_cli, verify_cli
 
 def test_bootstrap_cli_sets_core_environment_before_importing_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     observed: dict[str, object] = {}
     fake_bootstrap = ModuleType("xetra_loader.ops.bootstrap")
@@ -25,6 +26,7 @@ def test_bootstrap_cli_sets_core_environment_before_importing_runtime(
 
     fake_bootstrap.main = bootstrap_main  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "xetra_loader.ops.bootstrap", fake_bootstrap)
+    monkeypatch.setenv("XDL_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("POLARS_MAX_THREADS", "6")
     monkeypatch.setenv("XDL_CORES", "6")
     arguments = ["--confirm-destructive-reset", "--cores", "3"]
@@ -62,6 +64,7 @@ def test_production_verifier_passes_explicit_core_budget(
         "execute_production_full_sync_and_verify",
         verify,
     )
+    monkeypatch.setenv("XDL_LOG_DIR", str(tmp_path / "logs"))
 
     assert production_verifier.main(
         [
@@ -79,6 +82,7 @@ def test_production_verifier_passes_explicit_core_budget(
 
 def test_verifier_cli_sets_core_environment_before_importing_polars_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     observed: dict[str, object] = {}
     fake_verifier = ModuleType("xetra_loader.ops.verify_postgres_sync")
@@ -91,6 +95,7 @@ def test_verifier_cli_sets_core_environment_before_importing_polars_runtime(
 
     fake_verifier.main = verifier_main  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "xetra_loader.ops.verify_postgres_sync", fake_verifier)
+    monkeypatch.setenv("XDL_LOG_DIR", str(tmp_path / "logs"))
     arguments = ["--execute-full-sync", "--backup-root", "/tmp/backup", "--cores", "2"]
 
     assert verify_cli.main(arguments) == 0

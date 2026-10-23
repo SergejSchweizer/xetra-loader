@@ -138,8 +138,9 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
         encoding="utf-8"
     )
     weekly_full_history = (
-        "last_business_date=None" in weekly_runtime_source
-        and "_replace_quote_window(listing_previous, batch.rows, None)" in weekly_runtime_source
+        "None if job[2] else _latest_date(job[1])" in weekly_runtime_source
+        and "_replace_quote_window(listing_previous, batch.rows, last_business_date)"
+        in weekly_runtime_source
         and 'details["publication_mode"] = "semantic_delta"' in weekly_runtime_source
     )
 
@@ -160,10 +161,16 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
     )
     checks = {
         "cron_vienna_sunday_0900": timezone == "Europe/Vienna" and expression == "0 9 * * 0",
-        "cron_runs_guarded_direct_full_sync": (
-            "bash scripts/run_full_refresh.sh" in cron_line
+        "cron_runs_restart_safe_delta_sync": (
+            "bash scripts/run_weekly_sync.sh" in cron_line
             and "artifacts/cron" not in cron_line
-            and "full-refresh-cron-*.log" in Path("scripts/run_full_refresh.sh").read_text(
+            and "weekly-cron-*.log" in Path("scripts/run_weekly_sync.sh").read_text(
+                encoding="utf-8"
+            )
+            and 'if "$repo_root/.venv/bin/xdl-weekly"; then' in Path(
+                "scripts/run_weekly_sync.sh"
+            ).read_text(encoding="utf-8")
+            and "--execute-full-sync" not in Path("scripts/run_weekly_sync.sh").read_text(
                 encoding="utf-8"
             )
             and "xdl-enqueue-weekly" not in cron_line
@@ -179,7 +186,9 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
         ),
         "gold_failure_blocks_publication": gold_gate,
         "restart_checkpoint_rehydrates": completed_before_failure and restart_resumed,
-        "weekly_full_history_with_delta_publication": weekly_full_history and overlap_ingestion_api,
+        "corporate_action_conditioned_full_history_with_delta_publication": (
+            weekly_full_history and overlap_ingestion_api
+        ),
         "feature_refresh_after_quote_mutation": feature_refresh_order,
         "operational_logs_sanitized": logs_sanitized,
     }
@@ -189,7 +198,9 @@ def test_cron_restart_and_delta_contract_report(tmp_path: Path) -> None:
         "checks": checks,
         "cron": {"timezone": timezone, "expression": expression},
         "stage_order": list(STAGES),
-        "request_mode": "full-history-check; semantic-delta-publication",
+        "request_mode": (
+            "full-history-for-new-listing-or-action-change; otherwise-overlap-delta"
+        ),
         "feature_refresh": "after-raw-quote-mutation-in-transaction",
         "secrets_included": False,
     }

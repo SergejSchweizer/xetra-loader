@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from datetime import UTC, date
+from decimal import Decimal
 
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.ingestion.quotes import JSONValue, ingest_quotes
@@ -113,7 +114,33 @@ def test_all_zero_ohlc_with_valid_close_is_a_missing_provider_sentinel() -> None
     assert str(quote.close) == "20.15"
 
 
-def test_invalid_provider_ohlc_is_retained_in_bronze_and_quarantined_from_silver() -> None:
+def test_zero_high_low_and_zero_volume_keep_valid_close_without_invalid_ohlc() -> None:
+    payload = _payload()
+    row = payload[0]
+    assert isinstance(row, dict)
+    row.update(
+        {
+            "open": 20.15,
+            "high": 0,
+            "low": 0,
+            "close": 20.15,
+            "adjusted_close": 20.15,
+            "volume": 0,
+        }
+    )
+
+    result = ingest_quotes(FixtureTransport(payload), _listing(), quarantine_invalid_ohlc=True)
+
+    quote = result.silver_records[0]
+    assert quote.open is None
+    assert quote.high is None
+    assert quote.low is None
+    assert str(quote.close) == "20.15"
+    assert quote.volume == 0
+    assert '"high":0' in result.bronze_payload
+
+
+def test_invalid_open_is_nulled_while_valid_quote_fields_are_retained() -> None:
     payload = _payload(extra=True)
     invalid = payload[0]
     assert isinstance(invalid, dict)
@@ -121,6 +148,37 @@ def test_invalid_provider_ohlc_is_retained_in_bronze_and_quarantined_from_silver
 
     result = ingest_quotes(FixtureTransport(payload), _listing(), quarantine_invalid_ohlc=True)
 
-    assert len(result.silver_records) == 1
-    assert result.silver_records[0].trade_date == date(2026, 8, 22)
+    assert len(result.silver_records) == 2
+    invalid = result.silver_records[0]
+    assert invalid.trade_date == date(2026, 8, 21)
+    assert invalid.open is None
+    assert invalid.high == 10
+    assert invalid.low == 9
+    assert invalid.close == 10
+    assert result.silver_records[1].trade_date == date(2026, 8, 22)
     assert '"date":"2026-08-21"' in result.bronze_payload
+
+
+def test_adjusted_close_outside_raw_range_nuls_only_close() -> None:
+    payload = _payload()
+    row = payload[0]
+    assert isinstance(row, dict)
+    row.update(
+        {
+            "open": 95.62,
+            "high": 95.62,
+            "low": 95.62,
+            "close": 95.2765,
+            "adjusted_close": 95.2765,
+            "volume": 0,
+        }
+    )
+
+    result = ingest_quotes(FixtureTransport(payload), _listing(), quarantine_invalid_ohlc=True)
+
+    quote = result.silver_records[0]
+    assert quote.close is None
+    assert quote.adjusted_close == Decimal("95.2765")
+    assert quote.open == quote.high == quote.low == Decimal("95.62")
+    assert quote.volume == 0
+    assert '"close":95.2765' in result.bronze_payload

@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS xetra_loader.eod_quotes (
     open NUMERIC,
     high NUMERIC,
     low NUMERIC,
-    close NUMERIC NOT NULL,
+    close NUMERIC,
     adjusted_close NUMERIC,
     volume BIGINT,
     fetched_at_utc TIMESTAMPTZ(6) NOT NULL,
@@ -116,6 +116,8 @@ ALTER TABLE xetra_loader.eod_quotes
     ADD COLUMN IF NOT EXISTS available_at_utc TIMESTAMPTZ(6) GENERATED ALWAYS AS (
         xetra_loader.next_business_day_utc(trade_date)
     ) STORED;
+ALTER TABLE xetra_loader.eod_quotes
+    ALTER COLUMN close DROP NOT NULL;
 ALTER TABLE xetra_loader.dividends
     ADD COLUMN IF NOT EXISTS available_at_utc TIMESTAMPTZ(6) GENERATED ALWAYS AS (
         xetra_loader.next_business_day_utc(event_date)

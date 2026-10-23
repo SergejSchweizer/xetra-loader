@@ -116,8 +116,9 @@ restart-safe orchestration, and acceptance verification.
 The core pipeline downloads XETRA listings, EOD quotes, dividend events, and
 split events from EODHD; builds their Bronze, Silver, and Gold datasets; and
 publishes complete retained histories to PostgreSQL raw tables. Its
-restart-safe weekly worker reconciles provider corrections as well as new
-observations and refreshes the downstream feature materialization.
+restart-safe weekly worker refreshes quote deltas and the complete corporate-
+action event snapshots, replaying a listing's full quote history when its
+dividend or split events change, then refreshes the downstream feature view.
 
 The feature contract is `xetra_loader.xetra_features`, a materialized view
 with only `adjusted_close_level` and `volume_level` as base levels. OHLC
@@ -154,15 +155,15 @@ five workers; a failed build rolls back and preserves the previously served view
 ## API and durable weekly worker
 
 `xdl-api` hosts both the REST application and its one durable sync worker in
-the same process. The API remains available for explicit job submission, but
-the scheduled Sunday job is the guarded direct full-refresh wrapper below; the
-cron does not also enqueue an API job.
+the same process. The API remains available for explicit job submission. The
+scheduled Sunday job uses the restart-safe weekly delta runner; cron does not
+also enqueue an API job.
 
 ```text
-Sunday cron ──> scripts/run_full_refresh.sh
-                       │ guarded destructive reset + full history refresh
+Sunday cron ──> scripts/run_weekly_sync.sh
+                       │ restart-safe quote delta; full history on action change
                        ▼
-             restart-safe EODHD → lake → PostgreSQL pipeline
+             EODHD → lake → PostgreSQL pipeline
 
 Optional API submissions ──> xdl-api REST routes
                                   │ committed INSERT + NOTIFY
@@ -182,9 +183,9 @@ queue queries. Install `deploy/systemd/xetra-loader-api.service` to keep the
 API and worker resident. The service file is a deployment artifact; it must be
 installed and enabled separately by the host administrator.
 
-The direct `.venv/bin/xdl-weekly --cores 6` command remains available for a
-controlled one-off local run; `deploy/cron/xetra-loader.cron` invokes the
-guarded direct full-refresh wrapper at Sunday 09:00 Europe/Vienna.
+The scheduled runner behind `scripts/run_weekly_sync.sh` is `.venv/bin/xdl-weekly`
+with no extra command-line flags; it uses `weekly.cores` or the default of six.
+It is invoked Sunday at 09:00 Europe/Vienna by `deploy/cron/xetra-loader.cron`.
 
 ## Feature catalog
 
@@ -343,20 +344,27 @@ Stochastic, and Donchian features.
 
 ## Schedule and resource limits
 
-The repository cron artifact schedules the guarded direct full-refresh wrapper
+The repository cron artifact schedules the restart-safe weekly delta runner
 for Sunday `09:00` in `Europe/Vienna` and the Gold lake copy at `22:00`. Both
 wrappers write per-run stdout/stderr logs below `.logs/`; their cron output is
 not redirected to `artifacts/`. These operational logs older than 90 days are
 pruned by the wrappers. The `22:00` job copies the Gold lake to
-`/volume1/Temp/Quotes`. Keep the
-REST enqueue out of the Sunday schedule while this direct full sync is active;
-running both at the same time could race. The full refresh is a guarded,
-destructive rewrite, not semantic-delta publication. It keeps
-timestamped recovery backups under `/home/dev_xetra/.xdl-full-backups`. After a
-verified `PASS` report is written, it keeps the four newest full-sync backup
-directories and the four newest archived weekly checkpoints, pruning older
-matching artifacts; failed runs never trigger pruning. Unrelated files in that
-directory are left untouched. `weekly.cores` defaults to **6** and can be
+`/volume1/Temp/Quotes`. Keep the REST enqueue out of the Sunday schedule while
+the direct weekly runner is active; running both at the same time could race.
+Weekly quote downloads are deltas from the latest stored date (with overlap),
+unless a full dividend or split snapshot differs from the previous Silver
+snapshot for that listing, in which case the complete quote history is fetched
+to capture adjusted-price revisions. New listings without quote history get
+an initial full snapshot, so newly listed ISINs are not skipped. Full refresh
+is a separate operational recovery that must be explicitly requested, not the
+scheduled mode. A provider edit to an old quote
+unrelated to a corporate-action change and outside the overlap is not
+automatically detected by the weekly delta policy. The full-refresh wrapper
+keeps timestamped recovery backups under `/home/dev_xetra/.xdl-full-backups`.
+After a verified `PASS` report is written, the wrapper retains the four newest
+full-sync backup directories and the four newest archived weekly checkpoints,
+pruning older matching artifacts; failed runs never trigger pruning. Unrelated
+files in that directory are left untouched. `weekly.cores` defaults to **6** and can be
 overridden with
 `xdl-weekly --cores N`, `xdl-api --cores N`,
 `xdl-bootstrap --cores N`, `xdl-migrate --cores N`,

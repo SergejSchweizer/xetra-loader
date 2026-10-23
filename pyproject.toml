@@ -23,6 +23,7 @@ xdl-enqueue-weekly = "xetra_loader.api.enqueue:main"
 xdl-bootstrap = "xetra_loader.ops.bootstrap_cli:main"
 xdl-migrate = "xetra_loader.ops.migrate:main"
 xdl-verify-production-sync = "xetra_loader.ops.verify_cli:main"
+xdl-repair-quote-quarantines = "xetra_loader.ops.repair_quote_quarantines:main"
 
 [project.optional-dependencies]
 dev = [

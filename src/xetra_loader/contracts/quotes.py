@@ -26,7 +26,7 @@ class QuoteRecord:
     open: Decimal | None
     high: Decimal | None
     low: Decimal | None
-    close: Decimal
+    close: Decimal | None
     adjusted_close: Decimal | None
     volume: int | None
 
@@ -73,7 +73,7 @@ class QuoteRecord:
             "open": _decimal_text(self.open),
             "high": _decimal_text(self.high),
             "low": _decimal_text(self.low),
-            "close": canonical_decimal(self.close),
+            "close": _decimal_text(self.close),
             "adjusted_close": _decimal_text(self.adjusted_close),
             "volume": self.volume,
         }
