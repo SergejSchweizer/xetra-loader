@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import UTC, date, datetime
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from psycopg import Connection, Cursor
 
@@ -19,13 +18,23 @@ from xetra_loader.sync.core import (
 )
 
 
+class QuoteFetchTimestampLookup(Protocol):
+    """Minimal per-row fetch-time lookup accepted by quote publication."""
+
+    def get(
+        self,
+        key: tuple[str, str, str, date],
+        default: datetime,
+    ) -> datetime: ...
+
+
 def sync_quotes(  # noqa: PLR0913 -- explicit timestamps and row provenance are publication inputs.
     connection: Connection[Any],
     gold: QuoteGoldResult,
     *,
     run_id: str | None = None,
     published_at_utc: datetime | None = None,
-    fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None = None,
+    fetched_at_by_key: QuoteFetchTimestampLookup | None = None,
     authoritative_snapshot: GoldValidationSummary | None = None,
     serving_schema: str = "xetra_loader",
     sync_schema: str = "xetra_loader_sync",
@@ -75,7 +84,7 @@ def _require_utc(value: datetime) -> None:
 
 def _fetched_at(
     key: tuple[str, str, str, date],
-    values: Mapping[tuple[str, str, str, date], datetime] | None,
+    values: QuoteFetchTimestampLookup | None,
     published_at: datetime,
 ) -> datetime:
     value = published_at if values is None else values.get(key, published_at)
@@ -88,7 +97,7 @@ def _fetched_at(
 def _copy_desired_quotes(
     cursor: Cursor[Any],
     gold: QuoteGoldResult,
-    fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None,
+    fetched_at_by_key: QuoteFetchTimestampLookup | None,
     published_at: datetime,
 ) -> None:
     """Stage the complete desired quote state once for set-based reconciliation."""

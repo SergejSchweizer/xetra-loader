@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import json
 import logging
+import os
+import sys
 import time
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import TextIO
 
+import polars as pl
+
+from xetra_loader.medallion.core import atomic_write_parquet, migrate_json_manifests
 from xetra_loader.pipeline.orchestrator import (
     PipelineStageError,
     PipelineStages,
@@ -92,10 +99,31 @@ def run_restartable_pipeline(
     *,
     lock_path: Path,
     checkpoint_path: Path,
+    authoritative_lock_held: bool = False,
 ) -> PipelineSummary:
-    """Run once, resume after the last completed stage, and clear checkpoints on success."""
+    """Run once with rewrite and weekly locks, then clear checkpoint on success.
 
-    with LoaderLock(lock_path):
+    The authoritative lock is always acquired before the weekly lock. A caller
+    performing a larger rewrite may pass ``authoritative_lock_held=True`` and
+    retain that outer lock while this function acquires the weekly lock.
+    """
+
+    with ExitStack() as locks:
+        if not authoritative_lock_held:
+            locks.enter_context(LoaderLock(lock_path.parent / "authoritative-rewrite.lock"))
+        locks.enter_context(LoaderLock(lock_path))
+        migrated_manifests = migrate_json_manifests(checkpoint_path.parent)
+        if migrated_manifests:
+            _LOGGER.info(
+                "lake_control_metadata_migrated manifests=%d format=parquet",
+                migrated_manifests,
+            )
+        migrated_archives = _migrate_aborted_checkpoint_archives(checkpoint_path.parent)
+        if migrated_archives:
+            _LOGGER.info(
+                "lake_control_metadata_migrated archived_checkpoints=%d format=parquet",
+                migrated_archives,
+            )
         checkpoint = _read_checkpoint(checkpoint_path)
         if checkpoint.completed:
             if stages.rehydrate is None:
@@ -144,9 +172,17 @@ def _wrap_stages(
             _LOGGER.debug("stage_start name=%s", name)
             try:
                 details = stage()
-            except Exception:
-                _LOGGER.exception("stage_failed name=%s", name)
+            except Exception as exc:
+                _LOGGER.error(
+                    "stage_failed name=%s error_type=%s",
+                    name,
+                    type(exc).__name__,
+                )
                 raise
+            if name in {"listings", "dividends", "splits", "quotes"}:
+                # Bronze partitions are replayable until the stage checkpoint.
+                # Flush them once per stage rather than fsyncing every small file.
+                _sync_lake_filesystem(checkpoint_path.parent)
             completed.add(name)
             stage_details = {} if details is None else dict(details)
             details_by_stage[name] = stage_details
@@ -180,12 +216,46 @@ def _wrap_stages(
 
 
 def _read_checkpoint(path: Path) -> RestartCheckpoint:
-    if not path.exists():
+    legacy_path = path.with_suffix(".json")
+    if path.exists():
+        return _checkpoint_from_payload(_read_checkpoint_parquet(path))
+    if not legacy_path.exists():
         return RestartCheckpoint((), {})
-    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    checkpoint = _checkpoint_from_payload(json.loads(legacy_path.read_text(encoding="utf-8")))
+    _write_checkpoint(path, checkpoint)
+    if _checkpoint_from_payload(_read_checkpoint_parquet(path)) != checkpoint:
+        raise ValueError("loader checkpoint Parquet verification failed")
+    legacy_path.unlink()
+    _LOGGER.info("checkpoint_migrated format=parquet")
+    return checkpoint
+
+
+def _read_checkpoint_parquet(path: Path) -> dict[str, object]:
+    rows = pl.read_parquet(path, low_memory=True).to_dicts()
+    if len(rows) != 1:
+        raise ValueError("invalid loader checkpoint Parquet row count")
+    return rows[0]
+
+
+def _checkpoint_from_payload(payload: object) -> RestartCheckpoint:
     if not isinstance(payload, dict) or payload.get("version") != 1:
         raise ValueError("invalid loader checkpoint")
-    raw_completed = payload.get("completed")
+    completed = _validated_completed_stages(payload.get("completed"))
+    raw_details = payload.get("details")
+    if not isinstance(raw_details, dict) or set(raw_details) != completed:
+        raise ValueError("loader checkpoint details must match completed stages")
+    details: dict[str, Mapping[str, JSONValue]] = {}
+    for name, value in raw_details.items():
+        if not isinstance(value, dict):
+            raise ValueError("invalid loader checkpoint stage detail")
+        details[name] = value
+    return RestartCheckpoint(
+        tuple(name for name in _STAGE_NAMES if name in completed), details
+    )
+
+
+def _validated_completed_stages(raw_completed: object) -> set[str]:
     if not isinstance(raw_completed, list) or not all(
         isinstance(item, str) for item in raw_completed
     ):
@@ -196,17 +266,29 @@ def _read_checkpoint(path: Path) -> RestartCheckpoint:
     expected_prefix = set(_STAGE_NAMES[: len(completed)])
     if completed != expected_prefix:
         raise ValueError("loader checkpoint stages must form an ordered prefix")
-    raw_details = payload.get("details")
-    if not isinstance(raw_details, dict):
-        raise ValueError("invalid loader checkpoint stage details")
-    if set(raw_details) != completed:
-        raise ValueError("loader checkpoint details must match completed stages")
-    details: dict[str, Mapping[str, JSONValue]] = {}
-    for name, value in raw_details.items():
-        if not isinstance(value, dict):
-            raise ValueError("invalid loader checkpoint stage detail")
-        details[name] = value
-    return RestartCheckpoint(tuple(name for name in _STAGE_NAMES if name in completed), details)
+    return completed
+
+
+def _migrate_aborted_checkpoint_archives(root: Path) -> int:
+    """Convert preserved historical checkpoint JSON files to Parquet rows."""
+
+    migrated = 0
+    for source in sorted(root.glob("weekly.checkpoint.aborted*.json")):
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"invalid archived checkpoint metadata: {source}")
+        target = source.with_suffix(".parquet")
+        if not target.exists():
+            atomic_write_parquet(
+                target,
+                pl.DataFrame([payload], infer_schema_length=None, strict=False),
+            )
+        rows = pl.read_parquet(target, low_memory=True).to_dicts()
+        if len(rows) != 1 or rows[0] != payload:
+            raise ValueError(f"archived checkpoint Parquet verification failed: {target}")
+        source.unlink()
+        migrated += 1
+    return migrated
 
 
 def _write_checkpoint(path: Path, checkpoint: RestartCheckpoint) -> None:
@@ -216,9 +298,28 @@ def _write_checkpoint(path: Path, checkpoint: RestartCheckpoint) -> None:
         "completed": list(checkpoint.completed),
         "details": {name: dict(checkpoint.details[name]) for name in checkpoint.completed},
     }
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-        encoding="utf-8",
+    atomic_write_parquet(
+        path,
+        pl.DataFrame([payload], infer_schema_length=None, strict=False),
     )
-    temporary.replace(path)
+
+
+def _sync_lake_filesystem(path: Path) -> None:
+    """Durably flush replayable lake writes once before advancing a checkpoint."""
+
+    if sys.platform.startswith("linux"):
+        library = ctypes.CDLL(None, use_errno=True)
+        syncfs = getattr(library, "syncfs", None)
+        if syncfs is None:
+            raise OSError(errno.ENOSYS, "syncfs is unavailable")
+        syncfs.argtypes = [ctypes.c_int]
+        syncfs.restype = ctypes.c_int
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            if syncfs(descriptor) != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(error_number, os.strerror(error_number), str(path))
+        finally:
+            os.close(descriptor)
+    else:
+        os.sync()

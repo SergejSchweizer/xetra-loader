@@ -43,15 +43,26 @@ def test_postgres_session_uses_bounded_parallel_query_and_maintenance_workers(
     parallel_workers: str,
 ) -> None:
     class RecordingConnection:
-        def __init__(self) -> None:
+        def __init__(self, *, server_version: int = 160000) -> None:
+            self.server_version = server_version
             self.calls: list[tuple[str, tuple[object, ...]]] = []
             self.commits = 0
 
-        def execute(self, query: str, params: tuple[object, ...] = ()) -> None:
+        def execute(self, query: str, params: tuple[object, ...] = ()) -> object:
             self.calls.append((query, params))
+            if query == "SHOW server_version_num":
+                return _Result((self.server_version,))
+            return _Result(None)
 
         def commit(self) -> None:
             self.commits += 1
+
+    class _Result:
+        def __init__(self, row: tuple[object, ...] | None) -> None:
+            self.row = row
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            return self.row
 
     connection = RecordingConnection()
     monkeypatch.setattr(sync_core, "resolve_postgres_writer_dsn", lambda _dsn: "dsn")
@@ -74,3 +85,45 @@ def test_postgres_session_uses_bounded_parallel_query_and_maintenance_workers(
         ("max_parallel_maintenance_workers", parallel_workers),
     ) in connection.calls
     assert connection.commits == 1
+
+
+def test_postgres_14_writer_uses_migrated_login_role_temp_file_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Result:
+        def __init__(self, row: tuple[object, ...] | None) -> None:
+            self.row = row
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            return self.row
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+            self.closed = False
+
+        def execute(self, query: str, params: tuple[object, ...] = ()) -> _Result:
+            self.calls.append((query, params))
+            if query == "SHOW server_version_num":
+                return _Result((140000,))
+            if "current_setting('temp_file_limit')" in query:
+                return _Result((True,))
+            return _Result(None)
+
+        def commit(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = _Connection()
+    monkeypatch.setattr(sync_core, "resolve_postgres_writer_dsn", lambda _dsn: "dsn")
+    monkeypatch.setattr(sync_core, "resolve_feature_temp_file_limit", lambda: "32GB")
+    monkeypatch.setattr(sync_core.psycopg, "connect", lambda *_args, **_kwargs: connection)
+
+    assert sync_core.connect_postgres(cores=6) is connection
+    assert not any(
+        "feature_temp_file_limit" in query
+        for query, _params in connection.calls
+    )
+    assert not connection.closed

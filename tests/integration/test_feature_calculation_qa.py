@@ -115,7 +115,7 @@ def test_feature_calculations_match_independent_reference(tmp_path: Path) -> Non
     _apply_sql("sql/schema/004_xetra_features.sql")
     fixture = make_fixture(days=220)
     expected = reference_features(fixture)
-    connection = connect_postgres(DSN)
+    connection = connect_postgres(DSN, cores=6)
     try:
         high_gain_rsi = connection.execute(
             "SELECT xetra_loader.wilder_rsi(%s::double precision[], "

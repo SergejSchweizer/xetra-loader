@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
 from uuid import UUID
+from wsgiref.simple_server import WSGIRequestHandler
 from wsgiref.util import setup_testing_defaults
 
 from xetra_loader.api.application import LoaderApiApplication
 from xetra_loader.api.jobs import JobAlreadyActive, JobRecord
+from xetra_loader.api.runner import MonitoringWSGIServer
 
 
 class _Store:
@@ -154,3 +156,18 @@ def test_api_rejects_invalid_length_and_unknown_routes() -> None:
     assert too_large_payload == {"error": "request_too_large"}
     assert unknown.startswith("404")
     assert unknown_payload == {"error": "not_found"}
+
+
+def test_api_server_blocks_idle_requests_when_worker_is_unhealthy() -> None:
+    server = MonitoringWSGIServer(("127.0.0.1", 0), WSGIRequestHandler)
+    server.worker = _Worker()
+    server.worker.is_alive = False
+    try:
+        try:
+            server.service_actions()
+        except RuntimeError as exc:
+            assert str(exc) == "durable job worker is unavailable"
+        else:
+            raise AssertionError("unhealthy worker must stop the API server")
+    finally:
+        server.server_close()

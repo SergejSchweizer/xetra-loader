@@ -69,11 +69,16 @@ compression. Canonical paths are:
 - Silver annual rows: `silver/dataset_type={dataset_type}/exchange={exchange}/symbol={symbol}/timeframe={timeframe}/year={YYYY}/{symbol}-{YYYY}.parquet`.
 - Gold symbol snapshots: `gold/dataset_id={dataset_id}/dataset_type=gold_symbol_dataset/exchange={exchange}/symbol={symbol}/{symbol}_GOLD_{feature_hash}_{source_hash}.parquet`.
 
-Small JSON manifests live under each layer's `_metadata/` directory and identify
-the current canonical artifacts. Bronze provider objects are retained as
-canonical JSON strings inside Parquet rows. Gold corporate-action retractions
-are Parquet sidecars; checkpoints, manifests, and restart metadata remain JSON
-control files.
+Typed Parquet manifests live under each layer's `_metadata/` directory and
+identify the current canonical artifacts. Bronze provider objects are nested
+typed Polars/Parquet values, not JSON-text payload columns. Gold
+corporate-action retractions and restart checkpoints are also written as
+Parquet. Legacy JSON control files are converted under the weekly lock and
+removed after the Parquet copy is verified.
+
+For complete Silver/Gold snapshots, new artifacts and the manifest are
+published before unreferenced row files for that dataset are removed. This
+keeps the manifest authoritative and makes interrupted orphan cleanup replayable.
 
 The one-time migration reads the previous `versions/<storage_version>/`
 snapshots and old row JSON, writes and validates canonical Parquet artifacts,
@@ -81,9 +86,11 @@ then moves legacy row files and obsolete layouts into a timestamped recovery
 backup outside the lake. Versioned Parquet snapshots are converted one source
 partition at a time and staged outside the lake; the writer buffers only one
 canonical symbol/year partition instead of materializing the complete snapshot
-as Python row objects. Manifests and restart metadata remain JSON control files.
-The normal runtime reader refuses to fall back to retired layouts and requires
-the migration to have published a canonical manifest first.
+as Python row objects. Manifests, retractions, and restart metadata are Parquet.
+Legacy JSON is read only by the explicit migration path, which verifies the
+Parquet replacement before removing the source. The normal runtime reader
+refuses to fall back to retired layouts and requires the migration to have
+published a canonical manifest first.
 
 To migrate an existing JSON lake, first let any active writer finish, then run:
 
@@ -313,6 +320,13 @@ the replacement and identity index were ready. After commit, no staging view or
 temporary files remained. This is one observed production rebuild, not a
 runtime guarantee.
 
+An authorized repeat schema migration on **2026-10-23** confirmed the current
+database has **4,597 listing rows but zero quote, dividend, or split rows**;
+the materialized feature view therefore has **105 columns and zero rows**.
+The schema migration does not ingest provider data, and no synchronization was
+started as part of that migration. Do not treat the earlier full-view rebuild
+measurement as evidence that the current database is populated.
+
 ## PostgreSQL schema inventory
 
 The raw quote table `xetra_loader.eod_quotes` has **14 columns**: four identity
@@ -368,10 +382,14 @@ files in that directory are left untouched. `weekly.cores` defaults to **6** and
 overridden with
 `xdl-weekly --cores N`, `xdl-api --cores N`,
 `xdl-bootstrap --cores N`, `xdl-migrate --cores N`,
-`xdl-verify-production-sync --cores N`, or `XDL_CORES`.
-The API sets `POLARS_MAX_THREADS` before importing Polars, and the same budget bounds
-concurrent provider fetches. Provider fetch pools are closed before the next
-Polars-heavy stage; PostgreSQL publication stays serialized except for the
+`xdl-verify-production-sync --cores N`,
+`xdl-repair-quote-quarantines --cores N`, or `XDL_CORES`.
+The weekly, API, bootstrap, verification, migration, and repair entry points set
+`POLARS_MAX_THREADS` before importing Polars-backed modules. The weekly startup
+log records the actual native Polars pool size. The same budget bounds
+concurrent provider fetches and bounded independent Silver/Gold Parquet
+partition writes. Provider fetch pools are closed before the next Polars-heavy stage;
+PostgreSQL publication stays serialized except for the
 independent dividend/split writers, whose per-query PostgreSQL worker budgets
 are divided so their combined leader-plus-worker budget does not exceed
 `weekly.cores`. Feature-view refresh is one atomic PostgreSQL operation. API
@@ -382,12 +400,28 @@ removed at startup and rollover. `XDL_LOG_DIR` can override the default log
 directory. Log records include module names, and credentials/tokens must never
 be written to logs.
 
+Full refresh builds in `xetra_loader_build` and
+`xetra_loader_sync_build`, then promotes both schemas in one PostgreSQL
+transaction only after Gold, feature-view, and serving-state verification pass.
+The old schemas remain available until the independent acceptance report is
+written. Cleanup first checks PostgreSQL dependencies from outside each old
+schema; any external dependency blocks cleanup and preserves both old schemas.
+Only after that preflight passes is the old schema object graph removed.
+Weekly runs, full refreshes, lake migration, and recovery tools coordinate via
+`authoritative-rewrite.lock`; writers that also need the weekly checkpoint take
+`weekly.lock` second. The full-refresh wrapper archives any existing checkpoint
+only after acquiring the authoritative lock, so a concurrent weekly run cannot
+lose or race its restart state.
+
 PostgreSQL `work_mem` for feature refresh is separately configurable through
 `XDL_FEATURE_WORK_MEM` or `postgres.feature_work_mem`; the default is `256MB`
 within the validated `16MB`–`4GB` range. It is a per-operation/per-worker
 budget, not a transaction-wide cap. Feature-view build/refresh sessions also
-set the configured `temp_file_limit` (default **32GB per PostgreSQL process**)
-to bound disk spill.
+use the configured `temp_file_limit` (default **32GB per PostgreSQL process**)
+to bound disk spill. PostgreSQL 15+ grants this parameter-level setting to the
+loader role. PostgreSQL 14 cannot delegate it, so `xdl-migrate` sets the value
+as a session default on the dedicated writer login role; the writer refuses to
+start if that role default does not match configuration.
 
 Every data/runtime session opened through `connect_postgres` applies
 `max_parallel_workers_per_gather` and `max_parallel_maintenance_workers` as

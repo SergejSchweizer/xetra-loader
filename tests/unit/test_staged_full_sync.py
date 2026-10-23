@@ -38,6 +38,9 @@ class _Cursor:
             return (False,)
         return (False,) if "xetra_loader_previous" in self.last_statement else (0,)
 
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return []
+
 
 class _Connection:
     def __init__(self) -> None:
@@ -105,6 +108,6 @@ def test_promotion_builds_and_verifies_before_old_schema_cleanup() -> None:
 
     drop_previous_serving_schemas(connection)  # called only after PASS verification
     assert connection.statements[-2:] == [
-        'DROP SCHEMA IF EXISTS "xetra_loader_sync_previous"',
-        'DROP SCHEMA IF EXISTS "xetra_loader_previous"',
+        'DROP SCHEMA IF EXISTS "xetra_loader_sync_previous" CASCADE',
+        'DROP SCHEMA IF EXISTS "xetra_loader_previous" CASCADE',
     ]

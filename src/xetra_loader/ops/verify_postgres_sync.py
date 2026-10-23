@@ -37,6 +37,7 @@ from xetra_loader.medallion.core import (
     MedallionLayout,
     canonical_json,
     read_dataset_rows,
+    read_manifest_payload,
     read_snapshot_retractions,
 )
 from xetra_loader.ops.bootstrap import (
@@ -56,7 +57,7 @@ EXPECTED_PORT = 54321
 DATASETS = ("listings", "eod_quotes", "dividends", "splits")
 _FULL_SYNC_BACKUP_NAME = re.compile(r"xetra-loader-(\d{8}T\d{6}Z)")
 _WEEKLY_CHECKPOINT_BACKUP_NAME = re.compile(
-    r"weekly-checkpoint-(\d{8}T\d{6}Z)-\d+\.json"
+    r"weekly-checkpoint-(\d{8}T\d{6}Z)-\d+\.(?:parquet|json)"
 )
 _FULL_SYNC_BACKUP_RETENTION = 4
 
@@ -345,7 +346,10 @@ class _AdminResetWriterPublishRuntime:
         self,
         dataset: str,
         semantic_rows: Sequence[Mapping[str, JSONValue]],
+        *,
+        durable_sync: bool = True,
     ) -> None:
+        del durable_sync
         self._admin.persist_silver(dataset, semantic_rows)
 
     def persist_gold(self, *args: Any, **kwargs: Any) -> None:
@@ -408,6 +412,7 @@ def execute_production_full_sync_and_verify(  # noqa: PLR0915 -- ordered safety 
             preflight.close()
 
         _backup_owned_state(root, backup_root)
+        _archive_weekly_checkpoints(root, backup_root)
         runtime = _AdminResetWriterPublishRuntime(
             PostgresEodhdBootstrapRuntime.from_admin_environment(
                 quarantine_invalid_ohlc=True,
@@ -438,7 +443,8 @@ def execute_production_full_sync_and_verify(  # noqa: PLR0915 -- ordered safety 
             replay = run_restartable_pipeline(
                 build_weekly_stages(worker_count),
                 lock_path=root / "weekly.lock",
-                checkpoint_path=root / "weekly.checkpoint.json",
+                checkpoint_path=root / "weekly.checkpoint.parquet",
+                authoritative_lock_held=True,
             )
             replay_mutations = _weekly_replay_mutations(replay.as_dict())
         else:
@@ -555,7 +561,7 @@ def load_gold_snapshots(root: Path) -> dict[str, GoldDatasetSnapshot]:
         source_rows = read_dataset_rows(layout, Layer.SILVER, dataset)
         gold_rows = read_dataset_rows(layout, Layer.GOLD, dataset)
         manifest_path = layout.manifest_path(Layer.GOLD, dataset)
-        manifest = cast(dict[str, JSONValue], json.loads(manifest_path.read_text(encoding="utf-8")))
+        manifest = read_manifest_payload(manifest_path)
         semantic_metadata = manifest.get("semantic_metadata")
         if not isinstance(semantic_metadata, dict):
             raise ValueError(f"Gold manifest for {dataset} has no semantic_metadata")
@@ -605,7 +611,7 @@ def validate_gold_fingerprints_streaming(root: Path) -> int:  # noqa: C901, PLR0
     root_path = layout.root.resolve()
     for dataset in DATASETS:
         manifest_path = layout.manifest_path(Layer.GOLD, dataset)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = read_manifest_payload(manifest_path)
         if not isinstance(manifest, dict) or manifest.get("layer") != Layer.GOLD.value:
             raise ValueError(f"invalid Gold manifest for {dataset}")
         if manifest.get("dataset") != dataset:
@@ -864,7 +870,7 @@ def _backup_owned_state(medallion_root: Path, backup_root: Path) -> None:
     for dataset in DATASETS:
         source = layout.manifest_path(Layer.GOLD, dataset)
         if source.exists():
-            target = manifests / f"{dataset}.json"
+            target = manifests / f"{dataset}.parquet"
             target.write_bytes(source.read_bytes())
     checksums = {
         str(path.relative_to(destination)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -874,6 +880,23 @@ def _backup_owned_state(medallion_root: Path, backup_root: Path) -> None:
     (destination / "checksums.json").write_text(
         canonical_json(cast(JSONValue, checksums)) + "\n", encoding="utf-8"
     )
+
+
+def _archive_weekly_checkpoints(medallion_root: Path, backup_root: Path) -> tuple[Path, ...]:
+    """Archive restart state only while the authoritative rewrite lock is held."""
+
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    archived: list[Path] = []
+    for suffix in ("parquet", "json"):
+        source = medallion_root / f"weekly.checkpoint.{suffix}"
+        if not source.exists():
+            continue
+        target = backup_root / f"weekly-checkpoint-{stamp}-{os.getpid()}.{suffix}"
+        if target.exists():
+            raise FileExistsError(f"weekly checkpoint archive already exists: {target.name}")
+        os.replace(source, target)
+        archived.append(target)
+    return tuple(archived)
 
 
 def _prune_full_sync_backups(backup_root: Path) -> tuple[str, ...]:

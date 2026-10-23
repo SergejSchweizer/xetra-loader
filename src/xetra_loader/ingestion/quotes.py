@@ -31,7 +31,7 @@ class JsonTransport(Protocol):
 class QuoteIngestionResult:
     """Raw Bronze state, normalized Silver rows, and semantic delta classification."""
 
-    bronze_payload: str
+    bronze_rows: tuple[dict[str, JSONValue], ...]
     silver_records: tuple[QuoteRecord, ...]
     inserted_keys: tuple[tuple[str, str, str, date], ...]
     corrected_keys: tuple[tuple[str, str, str, date], ...]
@@ -91,13 +91,7 @@ def ingest_quotes(
 
     bronze_rows.sort(key=_canonical_row)
     return QuoteIngestionResult(
-        bronze_payload=json.dumps(
-            bronze_rows,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ),
+        bronze_rows=tuple(bronze_rows),
         silver_records=silver_records,
         inserted_keys=tuple(inserted),
         corrected_keys=tuple(corrected),

@@ -38,10 +38,18 @@ class StageReport:
     details: Mapping[str, JSONValue]
 
     def semantic_row(self) -> dict[str, JSONValue]:
+        public_details = dict(self.details)
+        provenance_entries = 0
+        for field in ("fetched_at_by_key", "fetched_at_by_window"):
+            fetch_provenance = public_details.pop(field, None)
+            if isinstance(fetch_provenance, list):
+                provenance_entries += len(fetch_provenance)
+        if provenance_entries:
+            public_details["fetch_provenance_entries"] = provenance_entries
         return {
             "name": self.name,
             "status": self.status,
-            "details": dict(self.details),
+            "details": public_details,
         }
 
 
@@ -66,7 +74,7 @@ class PipelineStageError(RuntimeError):
     """Raised immediately when one stage fails; downstream stages are never called."""
 
     def __init__(self, stage: str, summary: PipelineSummary, cause: Exception) -> None:
-        super().__init__(f"weekly pipeline failed at stage {stage}: {cause}")
+        super().__init__(f"weekly pipeline failed at stage {stage} ({type(cause).__name__})")
         self.stage = stage
         self.summary = summary
         self.__cause__ = cause
@@ -80,7 +88,13 @@ def run_weekly_pipeline(stages: PipelineStages) -> PipelineSummary:
         try:
             details = stage()
         except Exception as exc:
-            reports.append(StageReport(name=name, status="failed", details={"error": str(exc)}))
+            reports.append(
+                StageReport(
+                    name=name,
+                    status="failed",
+                    details={"error_type": type(exc).__name__},
+                )
+            )
             raise PipelineStageError(name, PipelineSummary(tuple(reports)), exc) from exc
         reports.append(
             StageReport(

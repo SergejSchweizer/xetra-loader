@@ -28,9 +28,9 @@ class JsonTransport(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ListingIngestionResult:
-    """Deterministic Bronze payload plus normalized Silver listing rows."""
+    """Deterministic raw Bronze rows plus normalized Silver listing rows."""
 
-    bronze_payload: str
+    bronze_rows: tuple[dict[str, JSONValue], ...]
     silver_records: tuple[ListingRecord, ...]
 
 
@@ -61,14 +61,8 @@ def ingest_xetra_listings(
         delisted_rows.append(cast(dict[str, object], item))
 
     bronze_rows.sort(key=_canonical_row)
-    bronze_payload = json.dumps(
-        bronze_rows,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     return ListingIngestionResult(
-        bronze_payload=bronze_payload,
+        bronze_rows=tuple(bronze_rows),
         silver_records=merge_listing_lifecycle(
             normalize_listings(active_rows, is_active=True),
             normalize_listings(delisted_rows, is_active=False),

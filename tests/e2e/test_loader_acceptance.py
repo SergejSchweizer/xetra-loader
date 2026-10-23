@@ -94,7 +94,7 @@ class FixtureRuntime:
         row = self.split_events[listing.code]
         return FetchBatch((row,), FetchMetrics(logical_requests=1, attempts=1, rows=1))
 
-    def persist_gold(
+    def persist_gold(  # noqa: PLR0913 - mirror production runtime protocol
         self,
         dataset: str,
         semantic_rows: object,
@@ -102,8 +102,18 @@ class FixtureRuntime:
         row_count: int,
         semantic_fingerprint: str,
         retracted_keys: object = (),
+        durable_sync: bool = True,
     ) -> None:
-        del dataset, semantic_rows, row_count, semantic_fingerprint, retracted_keys
+        del dataset, semantic_rows, row_count, semantic_fingerprint, retracted_keys, durable_sync
+
+    def persist_silver(
+        self,
+        dataset: str,
+        semantic_rows: object,
+        *,
+        durable_sync: bool = True,
+    ) -> None:
+        del dataset, semantic_rows, durable_sync
 
     def publish_listings(self, gold: object) -> SyncOutcome:
         pairs = [(tuple(row.key), row.semantic_dict()) for row in gold.rows]

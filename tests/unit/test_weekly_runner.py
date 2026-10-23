@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -58,7 +59,7 @@ def test_weekly_runner_uses_medallion_root_and_core_budget(
         "verification",
     ]
     assert (tmp_path / "weekly.lock").exists()
-    assert not (tmp_path / "weekly.checkpoint.json").exists()
+    assert not (tmp_path / "weekly.checkpoint.parquet").exists()
 
 
 def test_weekly_runner_writes_debug_log(tmp_path: Path, monkeypatch) -> None:
@@ -92,3 +93,32 @@ def test_polars_thread_limit_is_set_before_runtime_import(
 
     assert main(["--cores", "3"], medallion_root=tmp_path) == 0
     assert observed == [(3, "3")]
+
+
+def test_polars_native_thread_pool_uses_cli_core_budget(
+    tmp_path: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment.pop("POLARS_MAX_THREADS", None)
+    environment["XDL_LOG_DIR"] = str(tmp_path / "logs")
+    script = """
+import sys
+from pathlib import Path
+from xetra_loader.pipeline.runner import main
+from xetra_loader.pipeline.orchestrator import PipelineStages
+
+stages = PipelineStages(*([lambda: {"ok": True}] * 10))
+assert main(["--cores", "2"], stages_factory=lambda cores: stages,
+            medallion_root=Path(sys.argv[1])) == 0
+import polars as pl
+print(f"polars_threads={pl.thread_pool_size()}")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "lake")],
+        check=True,
+        capture_output=True,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        text=True,
+    )
+    assert "polars_threads=2" in result.stdout

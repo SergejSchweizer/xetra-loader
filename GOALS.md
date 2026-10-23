@@ -52,8 +52,13 @@ Non-negotiable invariants:
   Only semantic changes are published; a zero-change run is an idempotent no-op.
 - Delisted listings and their retained histories remain available. Absence
   from the active listing response is not permission to erase historical data.
-- All row-bearing lake files are Parquet written/read with Polars. JSON is for
-  manifests, checkpoints, API payloads, and other small control metadata only.
+- Every persisted artifact under the lake root—including row data, manifests,
+  retractions, and restart checkpoints—is Parquet written/read with Polars.
+  Bronze source objects use native nested Parquet values. Do not create JSON
+  files, JSON-text payload columns, or JSON-encoded metadata sidecars in the
+  lake. JSON may be used in memory and at API boundaries. Legacy JSON lake
+  metadata/payloads are read only for migration, replaced atomically by
+  Parquet, and then removed.
 - PostgreSQL owns durable serving state and the API job queue. PostgreSQL
   publication and its synchronization state advance in the same transaction.
 - Feature values are causal: no observation may use future data. The feature
@@ -173,16 +178,24 @@ duplicate/orphan row-bearing content.
 Dataset-specific partition metadata and field names are defined in the
 contracts and medallion writer. `dataset_id` is the stable identity stored on
 the parent Gold partition; it is not an additional directory below a Parquet
-file. Manifests identify canonical artifacts. Retractions and restart state
-must also be deterministic and recoverable. The legacy JSON/versioned lake is
-read only by the explicit migration tool; the runtime reader must not silently
-fall back to retired storage layouts.
+file. Manifests and restart checkpoints are typed single-row Parquet files;
+retractions are Parquet rows. They identify canonical artifacts and must be
+deterministic and recoverable. Legacy JSON lake metadata is read only for
+migration, replaced atomically by Parquet, and removed after verification; the
+runtime reader must not silently fall back to retired row-data layouts.
 
 For a lake migration, hold the authoritative rewrite and weekly locks; stage
 one source partition at a time outside the live lake; validate Parquet schemas,
 manifest ownership, row counts, and Gold fingerprints; atomically publish
 canonical manifests; then move retired artifacts to a timestamped recovery
 backup. Never bulk-materialize the complete lake into Python row objects.
+
+For normal complete Silver/Gold snapshots, write all new partitions first,
+atomically publish the new Parquet manifest, and then remove unreferenced
+row-bearing Parquet files scoped to that dataset. A failed cleanup is safe to
+retry: the manifest remains authoritative and the next replay removes any
+remaining orphans. Do not remove old artifacts before the replacement manifest
+is published.
 
 ## PostgreSQL serving plane
 
@@ -226,6 +239,12 @@ worker notifications are managed by PostgreSQL functions/triggers.
 
 ### Transactional publication
 
+Before any provider download, the weekly runner verifies that the active
+serving schema matches the write contract, including nullable raw OHLC fields
+needed for quarantined invalid provider values. A mismatch fails before the
+expensive fetch stage and directs the operator to the explicit schema
+migration command; the weekly runner must not mutate DDL.
+
 For each dataset, calculate canonical fingerprint and row digests before
 mutation. In one transaction: lock/read current state; reject incomplete
 authoritative snapshots; insert/update/delete/retract rows; refresh the feature
@@ -249,9 +268,11 @@ view calculation finishes:
    schemas to their canonical names. If promotion fails, transaction rollback
    keeps the old names intact. Initial installation with no active schemas is
    supported.
-5. Independently verify the promoted target. On `PASS`, remove previous schemas
-   without `CASCADE`; a dependent external object must block cleanup, not be
-   silently deleted. On failure, preserve previous schemas for recovery.
+5. Independently verify the promoted target. On `PASS`, inspect PostgreSQL's
+   dependency catalog for references from outside each previous schema. Any
+   external dependency blocks cleanup and preserves both previous schemas.
+   Only after that preflight passes may cleanup drop the old schema's internal
+   object graph. On failed acceptance, preserve previous schemas for recovery.
 6. Only after a verified report is written may backup retention prune older
    matching full-sync backups/checkpoints. Preserve the newest four of each;
    leave unrelated/malformed paths untouched.
@@ -319,6 +340,10 @@ limits, and role grants.
 - Use a cross-process lock under the lake root to prevent a second weekly or
   authoritative rewrite. Lock conflict is a clear blocked result, not silent
   concurrent execution.
+- All lake writers acquire `authoritative-rewrite.lock` before `weekly.lock`.
+  The full-refresh-owned weekly replay reuses the already-held authoritative
+  lock and acquires the weekly lock; checkpoint archival also happens only
+  after the authoritative lock is held.
 - Weekly quotes are delta downloads by default, with a full-history quote
   replay only for a newly listed instrument or when its dividend/split event
   snapshot has changed. The full event snapshots are checked each run so
@@ -396,7 +421,8 @@ run under `.logs/` and prune only their own run logs after 90 days. Log
 structured stage/dataset/row/count,
 request/retry/timing, mutation, and failure-type information. Never log API
 tokens, passwords, DSNs, authorization headers, request URLs containing
-secrets, or raw credentials from exceptions.
+secrets, or raw credentials from exceptions. Keep per-row fetch provenance in
+the Parquet restart checkpoint, but aggregate it in CLI summaries and logs.
 
 ## Performance requirements
 
@@ -404,8 +430,11 @@ secrets, or raw credentials from exceptions.
   psycopg 3, and PyYAML; development gates are in `pyproject.toml`.
 - A single bounded `--cores`/`XDL_CORES` CPU budget defaults to six (valid
   range 1–64). Set Polars' thread count before importing Polars. Parallelize
-  independent provider fetches and eligible PostgreSQL plans without nested
-  oversubscription.
+  independent provider fetches, Polars-backed deterministic Silver/Gold
+  snapshot ordering, Silver/Gold Parquet partition writes, and
+  eligible PostgreSQL plans under that same bound. Keep pending partition work
+  bounded by `--cores`; do not queue an unbounded lake-wide write fan-out or
+  oversubscribe nested engines.
 - If parallel dividend/split publication is enabled, partition the database
   worker budget so combined query workers do not exceed the configured budget.
 - Configure feature `work_mem` within 16MB–4GB (default 256MB), and per-process
@@ -472,8 +501,9 @@ A rebuild or material change is complete only when applicable items pass:
   delisted provider data; deterministic ordering/fingerprints are stable.
 - [ ] Unit tests cover numeric precision, lifecycle/retraction, exact windows,
   null/minimum-count behavior, no-lookahead, restart and failure paths.
-- [ ] Lake tests prove canonical Parquet layout, one manifest owner per current
-  partition, no duplicate/orphan row data, and recoverable migration behavior.
+- [ ] Lake tests prove canonical Parquet layout, Parquet manifests/checkpoints,
+  one manifest owner per current partition, no JSON sidecars, no
+  duplicate/orphan row data, and recoverable legacy migration behavior.
 - [ ] PostgreSQL integration tests prove DDL, FKs, constraints, generated
   `available_at_utc` (including Friday/Saturday-to-Monday), privileges,
   idempotent delta, historical correction, rollback, and exact view schema.
@@ -485,8 +515,8 @@ A rebuild or material change is complete only when applicable items pass:
   transaction.
 - [ ] Full-refresh failure before promotion leaves canonical schemas intact;
   failed promotion rolls back; successful promotion exposes complete new
-  schemas; failed external acceptance retains previous schemas; cleanup does
-  not cascade into dependent objects.
+  schemas; failed external acceptance retains previous schemas; external
+  dependencies block cleanup before any old-schema objects are removed.
 - [ ] API tests cover authentication, validation, duplicate active job,
   notifications, interrupted-job recovery, singleton lock, idle blocking, and
   graceful shutdown.

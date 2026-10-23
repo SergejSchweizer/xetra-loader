@@ -82,7 +82,7 @@ def test_unchanged_replay_is_stable() -> None:
     assert replay.correction_count == 0
     assert replay.retraction_count == 0
     assert replay.silver_records == first.silver_records
-    assert replay.bronze_payload == first.bronze_payload
+    assert replay.bronze_rows == first.bronze_rows
 
 
 def test_correction_is_reconciled_once() -> None:

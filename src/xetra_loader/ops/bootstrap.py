@@ -5,18 +5,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from itertools import chain, groupby
 from pathlib import Path
 from typing import Any, Protocol, cast
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+import polars as pl
 from psycopg import Connection
 
 from xetra_loader.config import resolve_cores, resolve_eodhd_token, resolve_medallion_root
@@ -46,8 +50,11 @@ from xetra_loader.medallion.core import (
     Manifest,
     MedallionLayout,
     SilverPartition,
-    atomic_write_text,
+    bronze_provider_payload,
     canonical_json,
+    read_parquet_rows,
+    write_manifest_parquet,
+    write_native_parquet_rows,
     write_parquet_rows,
     write_raw_listing_partitions,
 )
@@ -57,8 +64,75 @@ from xetra_loader.sync import connect_postgres
 from xetra_loader.sync.core import SyncOutcome
 from xetra_loader.sync.dividends import sync_dividends
 from xetra_loader.sync.listings import prune_stale_listings, sync_listings
-from xetra_loader.sync.quotes import sync_quotes
+from xetra_loader.sync.quotes import QuoteFetchTimestampLookup, sync_quotes
 from xetra_loader.sync.splits import sync_splits
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _run_partition_writes(tasks: Iterable[Callable[[], str]], *, workers: int) -> list[str]:
+    """Write independent Parquet partitions concurrently with bounded memory/work."""
+
+    if workers < 1:
+        raise ValueError("partition writer workers must be positive")
+    if workers == 1:
+        return sorted(task() for task in tasks)
+
+    artifact_paths: list[str] = []
+    pending: set[Future[str]] = set()
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xdl-parquet") as executor:
+        for task in tasks:
+            pending.add(executor.submit(task))
+            if len(pending) >= workers:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                artifact_paths.extend(future.result() for future in completed)
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            artifact_paths.extend(future.result() for future in completed)
+    return sorted(artifact_paths)
+
+
+def _remove_unreferenced_snapshot_artifacts(
+    layout: MedallionLayout,
+    layer: Layer,
+    dataset: str,
+    artifact_paths: Sequence[str],
+) -> tuple[Path, ...]:
+    """Remove stale canonical row files only after the new manifest is published."""
+
+    layout.dataset_path(layer, dataset)  # validates the caller-provided path component
+    encoded_dataset = quote(dataset, safe="-._~")
+    if layer is Layer.SILVER:
+        artifact_root = layout.root / Layer.SILVER.value / f"dataset_type={encoded_dataset}"
+    elif layer is Layer.GOLD:
+        encoded_dataset_id = quote(_gold_dataset_id(dataset), safe="-._~")
+        artifact_root = (
+            layout.root
+            / Layer.GOLD.value
+            / f"dataset_id={encoded_dataset_id}"
+            / "dataset_type=gold_symbol_dataset"
+        )
+    else:
+        return ()
+    if not artifact_root.exists():
+        return ()
+
+    root = layout.root.resolve()
+    current = {
+        (layout.root / relative_path).resolve()
+        for relative_path in artifact_paths
+    }
+    removed: list[Path] = []
+    for candidate in sorted(artifact_root.rglob("*.parquet")):
+        if candidate.is_symlink():
+            continue
+        resolved = candidate.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError("snapshot artifact path escapes the configured lake root")
+        if resolved not in current:
+            candidate.unlink()
+            removed.append(candidate)
+    return tuple(removed)
 
 
 def _rewrite_staging_schema_names(statement: str) -> str:
@@ -219,9 +293,11 @@ class BootstrapRuntime(Protocol):
         self,
         dataset: str,
         semantic_rows: Sequence[Mapping[str, JSONValue]],
+        *,
+        durable_sync: bool = True,
     ) -> None: ...
 
-    def persist_gold(
+    def persist_gold(  # noqa: PLR0913 - explicit data and durability contract
         self,
         dataset: str,
         semantic_rows: Sequence[Mapping[str, JSONValue]],
@@ -229,6 +305,7 @@ class BootstrapRuntime(Protocol):
         row_count: int,
         semantic_fingerprint: str,
         retracted_keys: Sequence[tuple[str, str, str, str]] = (),
+        durable_sync: bool = True,
     ) -> None: ...
 
     def publish_listings(
@@ -241,7 +318,7 @@ class BootstrapRuntime(Protocol):
         self,
         gold: QuoteGoldResult,
         *,
-        fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None = None,
+        fetched_at_by_key: QuoteFetchTimestampLookup | None = None,
         authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome: ...
     def publish_dividends(
@@ -434,7 +511,7 @@ def _publish_listings(
 def _publish_quotes(
     runtime: BootstrapRuntime,
     gold: QuoteGoldResult,
-    fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime],
+    fetched_at_by_key: QuoteFetchTimestampLookup,
     authoritative_snapshot: GoldValidationSummary,
 ) -> SyncOutcome:
     return (
@@ -585,6 +662,26 @@ class PostgresEodhdBootstrapRuntime:
         self._sync_schema = "xetra_loader_sync_build" if staging else "xetra_loader_sync"
         self._owns_connection = True
 
+    def validate_weekly_schema_contract(self) -> None:
+        """Fail before provider work if serving DDL rejects valid null OHLC."""
+
+        row = self._connection.execute(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'eod_quotes' "
+            "AND column_name = 'close'",
+            (self._serving_schema,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"{self._serving_schema}.eod_quotes.close is missing; "
+                "apply schema migrations before weekly sync"
+            )
+        if str(row[0]) != "YES":
+            raise RuntimeError(
+                f"{self._serving_schema}.eod_quotes.close must be nullable; "
+                "run xdl-migrate before weekly sync"
+            )
+
     @classmethod
     def from_environment(
         cls,
@@ -680,19 +777,13 @@ class PostgresEodhdBootstrapRuntime:
                     "WHERE status IN ('succeeded', 'failed')"
                 )
             if has_previous_serving:
-                cursor.execute(
-                    'ALTER SCHEMA "xetra_loader" RENAME TO "xetra_loader_previous"'
-                )
+                cursor.execute('ALTER SCHEMA "xetra_loader" RENAME TO "xetra_loader_previous"')
             if has_previous_sync:
                 cursor.execute(
                     'ALTER SCHEMA "xetra_loader_sync" RENAME TO "xetra_loader_sync_previous"'
                 )
-            cursor.execute(
-                'ALTER SCHEMA "xetra_loader_build" RENAME TO "xetra_loader"'
-            )
-            cursor.execute(
-                'ALTER SCHEMA "xetra_loader_sync_build" RENAME TO "xetra_loader_sync"'
-            )
+            cursor.execute('ALTER SCHEMA "xetra_loader_build" RENAME TO "xetra_loader"')
+            cursor.execute('ALTER SCHEMA "xetra_loader_sync_build" RENAME TO "xetra_loader_sync"')
             for signature in (
                 "xetra_loader.refresh_xetra_features()",
                 "xetra_loader.resolve_feature_work_mem()",
@@ -705,6 +796,7 @@ class PostgresEodhdBootstrapRuntime:
                 self._repository_root / "sql/roles/005_xetra_loader_feature_view_reader.sql"
             ).read_text(encoding="utf-8")
             cursor.execute(reader_sql.replace("BEGIN;", "").replace("COMMIT;", ""))
+
     def fetch_worker(self) -> PostgresEodhdBootstrapRuntime:
         """Return a fetch-only worker with independent HTTP state.
 
@@ -747,7 +839,7 @@ class PostgresEodhdBootstrapRuntime:
         before = self._measurement_start()
         result = ingest_xetra_listings(self._transport)
         metrics = self._measurement_finish(before, len(result.silver_records))
-        raw = cast(JSONValue, json.loads(result.bronze_payload))
+        raw = cast(JSONValue, list(result.bronze_rows))
         self._write_layer(Layer.BRONZE, "listings", raw)
         silver = [record.semantic_dict() for record in result.silver_records]
         self._persist_partitioned_snapshot(
@@ -774,7 +866,7 @@ class PostgresEodhdBootstrapRuntime:
             quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
         )
         metrics = self._measurement_finish(before, len(result.silver_records))
-        self._record_partition_bronze("eod_quotes", listing, result.bronze_payload)
+        self._record_partition_bronze("eod_quotes", listing, result.bronze_rows)
         return FetchBatch(result.silver_records, metrics, datetime.now(UTC))
 
     def fetch_dividends(
@@ -792,7 +884,7 @@ class PostgresEodhdBootstrapRuntime:
             previous_records=previous_records,
         )
         metrics = self._measurement_finish(before, len(result.silver_records))
-        self._record_partition_bronze("dividends", listing, result.bronze_payload)
+        self._record_partition_bronze("dividends", listing, result.bronze_rows)
         return FetchBatch(result.silver_records, metrics, datetime.now(UTC))
 
     def fetch_splits(
@@ -810,10 +902,10 @@ class PostgresEodhdBootstrapRuntime:
             previous_records=previous_records,
         )
         metrics = self._measurement_finish(before, len(result.silver_records))
-        self._record_partition_bronze("splits", listing, result.bronze_payload)
+        self._record_partition_bronze("splits", listing, result.bronze_rows)
         return FetchBatch(result.silver_records, metrics, datetime.now(UTC))
 
-    def persist_gold(
+    def persist_gold(  # noqa: PLR0913 - explicit data and durability contract
         self,
         dataset: str,
         semantic_rows: Sequence[Mapping[str, JSONValue]],
@@ -821,6 +913,7 @@ class PostgresEodhdBootstrapRuntime:
         row_count: int,
         semantic_fingerprint: str,
         retracted_keys: Sequence[tuple[str, str, str, str]] = (),
+        durable_sync: bool = True,
     ) -> None:
         rows = [dict(row) for row in semantic_rows]
         retractions = [list(key) for key in sorted(retracted_keys)]
@@ -831,6 +924,7 @@ class PostgresEodhdBootstrapRuntime:
             Layer.GOLD,
             dataset,
             rows,
+            durable_sync=durable_sync,
             snapshot=SnapshotWrite(
                 semantic_metadata={
                     "row_count": row_count,
@@ -857,6 +951,8 @@ class PostgresEodhdBootstrapRuntime:
         self,
         dataset: str,
         semantic_rows: Sequence[Mapping[str, JSONValue]],
+        *,
+        durable_sync: bool = True,
     ) -> None:
         """Atomically publish the complete normalized Silver Parquet snapshot."""
 
@@ -864,6 +960,7 @@ class PostgresEodhdBootstrapRuntime:
             Layer.SILVER,
             dataset,
             [dict(row) for row in semantic_rows],
+            durable_sync=durable_sync,
             snapshot=SnapshotWrite({"row_count": len(semantic_rows)}),
         )
 
@@ -884,15 +981,13 @@ class PostgresEodhdBootstrapRuntime:
     def prune_stale_listings(self, gold: ListingGoldResult) -> int:
         """Prune listing identities only after dependent datasets are published."""
 
-        return prune_stale_listings(
-            self._connection, gold, serving_schema=self._serving_schema
-        )
+        return prune_stale_listings(self._connection, gold, serving_schema=self._serving_schema)
 
     def publish_quotes(
         self,
         gold: QuoteGoldResult,
         *,
-        fetched_at_by_key: Mapping[tuple[str, str, str, date], datetime] | None = None,
+        fetched_at_by_key: QuoteFetchTimestampLookup | None = None,
         authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome:
         return sync_quotes(
@@ -1019,19 +1114,16 @@ class PostgresEodhdBootstrapRuntime:
             rows=row_count,
         )
 
-    def _record_partition_bronze(
+    def _record_partition_bronze(  # noqa: C901 - one partition operation has distinct merge policies
         self,
         dataset: str,
         listing: ListingRecord,
-        bronze_payload: str,
+        bronze_rows: Iterable[Mapping[str, JSONValue]],
     ) -> None:
-        payload = cast(JSONValue, json.loads(bronze_payload))
-        if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
-            raise ValueError(f"raw {dataset} response must contain JSON objects")
         timeframe = "1d" if dataset == "eod_quotes" else "event"
         fallback_date = datetime.now(UTC).date()
         grouped: dict[Path, list[dict[str, JSONValue]]] = {}
-        for raw_row in cast(list[dict[str, JSONValue]], payload):
+        for raw_row in bronze_rows:
             raw_date = raw_row.get("date")
             partition_date = (
                 date.fromisoformat(raw_date) if isinstance(raw_date, str) else fallback_date
@@ -1051,14 +1143,63 @@ class PostgresEodhdBootstrapRuntime:
                     "isin": listing.isin,
                     "exchange": listing.exchange,
                     "code": listing.code,
-                    "payload_json": canonical_json(raw_row),
+                    "provider_payload": dict(raw_row),
                 }
             )
+        symbol_root = (
+            next(iter(grouped)).parents[3]
+            if grouped
+            else self._layout.bronze_path(
+                BronzePartition(
+                    dataset_type=dataset,
+                    exchange=listing.exchange,
+                    instrument_type=listing.instrument_type or "unknown",
+                    symbol=listing.code,
+                    timeframe=timeframe,
+                    partition_date=fallback_date,
+                )
+            ).parents[3]
+        )
         for path, rows in grouped.items():
-            write_parquet_rows(
+            if dataset == "eod_quotes" and path.exists():
+                by_date: dict[str, dict[str, JSONValue]] = {}
+                for existing in read_parquet_rows(path):
+                    existing_payload = bronze_provider_payload(existing, path)
+                    existing_date = existing_payload.get("date")
+                    if isinstance(existing_date, str):
+                        by_date[existing_date] = {
+                            "isin": listing.isin,
+                            "exchange": listing.exchange,
+                            "code": listing.code,
+                            "provider_payload": existing_payload,
+                        }
+                for incoming in rows:
+                    incoming_payload = incoming["provider_payload"]
+                    if isinstance(incoming_payload, dict):
+                        incoming_date = incoming_payload.get("date")
+                        if isinstance(incoming_date, str):
+                            by_date[incoming_date] = incoming
+                rows = [by_date[key] for key in sorted(by_date)]
+            write_native_parquet_rows(
                 path,
-                sorted(rows, key=lambda row: canonical_json(cast(JSONValue, dict(row)))),
+                sorted(
+                    rows,
+                    key=lambda row: json.dumps(
+                        cast(JSONValue, dict(row)),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                ),
+                sync_file=False,
+                sync_directory=False,
             )
+        if dataset in {"dividends", "splits"}:
+            retained_paths = set(grouped)
+            stale_paths = set(symbol_root.glob("year=*/month=*/data.parquet")) - retained_paths
+            for stale_path in sorted(stale_paths):
+                stale_path.unlink()
 
     def _persist_partitioned_snapshot(  # noqa: PLR0913 - explicit persistence policy inputs
         self,
@@ -1105,12 +1246,22 @@ class PostgresEodhdBootstrapRuntime:
                 "retractions_path": retractions_path,
             },
         )
-        atomic_write_text(
-            self._layout.manifest_path(layer, dataset),
-            manifest.to_json() + "\n",
+        write_manifest_parquet(self._layout.manifest_path(layer, dataset), manifest)
+        removed = _remove_unreferenced_snapshot_artifacts(
+            self._layout,
+            layer,
+            dataset,
+            artifact_paths,
         )
+        if removed:
+            _LOGGER.info(
+                "lake_snapshot_orphans_removed layer=%s dataset=%s files=%d",
+                layer.value,
+                dataset,
+                len(removed),
+            )
 
-    def _write_canonical_snapshot(
+    def _write_canonical_snapshot(  # noqa: C901 - dispatches two distinct partitioning layouts
         self,
         layer: Layer,
         dataset: str,
@@ -1121,31 +1272,45 @@ class PostgresEodhdBootstrapRuntime:
     ) -> list[str]:
         """Publish canonical partitions, buffering at most one partition at a time."""
 
-        artifact_paths: list[str] = []
+        workers = getattr(self, "_cores", 1)
         ordered = (
             iter(rows)
             if presorted
-            else iter(sorted(rows, key=lambda row: _snapshot_sort_key(dataset, row)))
+            else iter(_polars_sorted_snapshot_rows(dataset, rows))
         )
         if layer is Layer.SILVER:
             groups = groupby(ordered, key=lambda row: _silver_partition_key(dataset, row))
-            for (exchange, symbol, year), group in groups:
-                path = self._layout.silver_path(
-                    SilverPartition(
-                        dataset_type=dataset,
-                        exchange=exchange,
-                        symbol=symbol,
-                        timeframe=_timeframe(dataset),
-                        year=year,
-                    )
-                )
-                write_parquet_rows(
-                    path,
-                    (dict(row) for row in group),
-                    sync_file=durable_sync,
-                    sync_directory=durable_sync,
-                )
-                artifact_paths.append(path.relative_to(self._layout.root).as_posix())
+
+            def tasks() -> Iterable[Callable[[], str]]:
+                for (exchange, symbol, year), group in groups:
+                    partition_rows = [dict(row) for row in group]
+
+                    def write_partition(
+                        exchange: str = exchange,
+                        symbol: str = symbol,
+                        year: int = year,
+                        partition_rows: list[dict[str, JSONValue]] = partition_rows,
+                    ) -> str:
+                        path = self._layout.silver_path(
+                            SilverPartition(
+                                dataset_type=dataset,
+                                exchange=exchange,
+                                symbol=symbol,
+                                timeframe=_timeframe(dataset),
+                                year=year,
+                            )
+                        )
+                        write_parquet_rows(
+                            path,
+                            partition_rows,
+                            sync_file=durable_sync,
+                            sync_directory=durable_sync,
+                        )
+                        return path.relative_to(self._layout.root).as_posix()
+
+                    yield write_partition
+
+            return _run_partition_writes(tasks(), workers=workers)
         elif layer is Layer.GOLD:
             feature_set_version = "v1.0.0"
             first_row = next(ordered, None)
@@ -1166,34 +1331,47 @@ class PostgresEodhdBootstrapRuntime:
                 chain((first_row,), ordered),
                 key=lambda row: (str(row.get("exchange", "")), str(row.get("code", ""))),
             )
-            for (exchange, symbol), group in gold_groups:
-                if not exchange or not symbol:
-                    raise ValueError(f"Gold {dataset} row has an incomplete symbol identity")
-                symbol_rows = [dict(row) for row in group]
-                if any(sorted(row) != schema for row in symbol_rows):
-                    raise ValueError(f"Gold {dataset} rows do not share a stable schema")
-                source_hash = hashlib.sha256(
-                    canonical_json(cast(JSONValue, symbol_rows)).encode("utf-8")
-                ).hexdigest()
-                path = self._layout.gold_path(
-                    GoldArtifact(
-                        dataset_id=dataset_id,
-                        exchange=exchange,
-                        symbol=symbol,
-                        feature_hash=feature_hash,
-                        source_hash=source_hash,
-                    )
-                )
-                write_parquet_rows(
-                    path,
-                    symbol_rows,
-                    sync_file=durable_sync,
-                    sync_directory=durable_sync,
-                )
-                artifact_paths.append(path.relative_to(self._layout.root).as_posix())
+
+            def tasks() -> Iterable[Callable[[], str]]:
+                for (exchange, symbol), group in gold_groups:
+                    symbol_rows = [dict(row) for row in group]
+
+                    def write_partition(
+                        exchange: str = exchange,
+                        symbol: str = symbol,
+                        symbol_rows: list[dict[str, JSONValue]] = symbol_rows,
+                    ) -> str:
+                        if not exchange or not symbol:
+                            raise ValueError(
+                                f"Gold {dataset} row has an incomplete symbol identity"
+                            )
+                        if any(sorted(row) != schema for row in symbol_rows):
+                            raise ValueError(f"Gold {dataset} rows do not share a stable schema")
+                        source_hash = hashlib.sha256(
+                            canonical_json(cast(JSONValue, symbol_rows)).encode("utf-8")
+                        ).hexdigest()
+                        path = self._layout.gold_path(
+                            GoldArtifact(
+                                dataset_id=dataset_id,
+                                exchange=exchange,
+                                symbol=symbol,
+                                feature_hash=feature_hash,
+                                source_hash=source_hash,
+                            )
+                        )
+                        write_parquet_rows(
+                            path,
+                            symbol_rows,
+                            sync_file=durable_sync,
+                            sync_directory=durable_sync,
+                        )
+                        return path.relative_to(self._layout.root).as_posix()
+
+                    yield write_partition
+
+            return _run_partition_writes(tasks(), workers=workers)
         else:
             raise ValueError("canonical snapshots support only Silver and Gold")
-        return sorted(artifact_paths)
 
     def _write_layer(self, layer: Layer, dataset: str, payload: JSONValue) -> None:
         if layer is not Layer.BRONZE or dataset != "listings" or not isinstance(payload, list):
@@ -1205,6 +1383,7 @@ class PostgresEodhdBootstrapRuntime:
             dataset,
             cast(list[Mapping[str, JSONValue]], payload),
             snapshot_date=datetime.now(UTC).date(),
+            durable_sync=False,
         )
 
     def _count(self, table: str) -> int:
@@ -1223,8 +1402,7 @@ class PostgresEodhdBootstrapRuntime:
 
     def _date_bounds(self, table: str, column: str) -> tuple[date | None, date | None]:
         row = self._connection.execute(
-            f'SELECT min("{column}"), max("{column}") '
-            f'FROM {self._serving_schema}."{table}"'
+            f'SELECT min("{column}"), max("{column}") FROM {self._serving_schema}."{table}"'
         ).fetchone()
         if row is None:
             raise RuntimeError(f"missing date-bound result for {table}")
@@ -1242,12 +1420,40 @@ class PostgresEodhdBootstrapRuntime:
 
 
 def drop_previous_serving_schemas(connection: Connection[Any]) -> None:
-    """Remove previous schemas after verification, without cascading into dependents."""
+    """Remove verified old schemas only after rejecting external dependencies.
+
+    PostgreSQL cannot drop a non-empty schema without CASCADE. The catalog
+    preflight therefore rejects any dependency from outside each old schema;
+    CASCADE can then remove only the old schema's internal object graph.
+    """
 
     with connection.transaction(), connection.cursor() as cursor:
         cursor.execute("SET LOCAL lock_timeout = '5s'")
-        cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_sync_previous"')
-        cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_previous"')
+        for schema in ("xetra_loader_sync_previous", "xetra_loader_previous"):
+            cursor.execute(
+                "SELECT DISTINCT pg_describe_object("
+                "dependency.classid, dependency.objid, dependency.objsubid) "
+                "FROM pg_depend AS dependency "
+                "CROSS JOIN LATERAL pg_identify_object("
+                "dependency.refclassid, dependency.refobjid, dependency.refobjsubid) "
+                "AS referenced_object "
+                "CROSS JOIN LATERAL pg_identify_object("
+                "dependency.classid, dependency.objid, dependency.objsubid) "
+                "AS dependent_object "
+                "WHERE referenced_object.schema = %s "
+                "AND dependent_object.schema IS DISTINCT FROM %s "
+                "AND dependency.deptype NOT IN ('i', 'a') "
+                "ORDER BY 1",
+                (schema, schema),
+            )
+            dependents = cursor.fetchall()
+            if dependents:
+                descriptions = ", ".join(str(row[0]) for row in dependents)
+                raise RuntimeError(
+                    f"cannot remove {schema}; external objects depend on it: {descriptions}"
+                )
+        cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_sync_previous" CASCADE')
+        cursor.execute('DROP SCHEMA IF EXISTS "xetra_loader_previous" CASCADE')
 
 
 def _dividend_silver(event: DividendEvent) -> dict[str, JSONValue]:
@@ -1304,17 +1510,61 @@ def _silver_partition_key(
 def _snapshot_sort_key(
     dataset: str,
     row: Mapping[str, JSONValue],
-) -> tuple[str, str, int, int, str, str, str]:
-    partition_date = _partition_date(dataset, row)
+) -> tuple[str, str, date, str, str]:
+    identity = _snapshot_identity_sort_key(dataset, row)
+    return (*identity, canonical_json(cast(JSONValue, dict(row))))
+
+
+def _snapshot_identity_sort_key(
+    dataset: str,
+    row: Mapping[str, JSONValue],
+) -> tuple[str, str, date, str]:
     return (
         str(row.get("exchange", "")),
         str(row.get("code", "")),
-        partition_date.year,
-        partition_date.month,
-        partition_date.isoformat(),
+        _partition_date(dataset, row),
         str(row.get("isin", "")),
-        canonical_json(cast(JSONValue, dict(row))),
     )
+
+
+def _polars_sorted_snapshot_rows(
+    dataset: str,
+    rows: Iterable[Mapping[str, JSONValue]],
+) -> list[Mapping[str, JSONValue]]:
+    """Order snapshot rows with Polars' configured native thread pool.
+
+    Keep original row dictionaries intact: only primitive sort keys and a row
+    ordinal enter the Polars frame, so nested payloads and Decimal semantics
+    are not coerced while sorting.
+    """
+
+    materialized = list(rows)
+    if len(materialized) < 2:
+        return materialized
+    identity_keys = [_snapshot_identity_sort_key(dataset, row) for row in materialized]
+    duplicate_counts = Counter(identity_keys)
+    keys = [
+        (
+            *identity,
+            canonical_json(cast(JSONValue, dict(row))) if duplicate_counts[identity] > 1 else "",
+        )
+        for identity, row in zip(identity_keys, materialized, strict=True)
+    ]
+    frame = pl.DataFrame(
+        {
+            "exchange": [key[0] for key in keys],
+            "code": [key[1] for key in keys],
+            "partition_date": [key[2] for key in keys],
+            "isin": [key[3] for key in keys],
+            "duplicate_tie_breaker": [key[4] for key in keys],
+            "ordinal": range(len(materialized)),
+        }
+    )
+    ordinals = frame.sort(
+        ["exchange", "code", "partition_date", "isin", "duplicate_tie_breaker"],
+        maintain_order=True,
+    ).get_column("ordinal").to_list()
+    return [materialized[int(ordinal)] for ordinal in ordinals]
 
 
 def _bounds(values: Iterable[date]) -> tuple[date | None, date | None]:
