@@ -1,11 +1,11 @@
 # xetra-loader — Project Goals and Rebuild Specification
 
-This document describes the complete intended system in implementation-ready
-terms for maintainers and coding agents. It complements `lake/GOALS.md`; it
-does not replace that product-goals file. Treat source code, SQL, tests, and
-focused runbooks as evidence of the current implementation. When this document
-and executable contracts disagree, identify the discrepancy and update the
-appropriate source and tests rather than silently choosing one.
+This is the repository's single product and engineering source of truth,
+written in implementation-ready terms for maintainers and coding agents.
+There must be no second `GOALS.md` in a subdirectory. Treat source code, SQL,
+tests, and focused runbooks as evidence of the current implementation. When
+this document and executable contracts disagree, identify the discrepancy and
+update the appropriate source and tests rather than silently choosing one.
 
 ## Contents
 
@@ -212,9 +212,10 @@ Target database is the dedicated `xetra_loader` database. The loader owns the
   `adjusted_close`, `volume`; UTC `timestamp_eod`, fetch/publication audit
   timestamps, and generated `available_at_utc`.
 - `xetra_loader.dividends`: primary key `(isin, exchange, code, event_key)`;
-  event value/currency/period and declaration/record/payment dates, lifecycle
-  status in the publication contract, audit timestamps, and generated
-  `available_at_utc`.
+  current active events with value/currency/period and declaration/record/payment
+  dates, audit timestamps, and generated `available_at_utc`. Retractions are
+  explicit in the publication/audit contract and remove the event from this
+  current-state table; they are not retained as inactive rows.
 - `xetra_loader.splits`: primary key `(isin, exchange, code, event_key)`;
   split ratio/factor, audit timestamps, and generated `available_at_utc`.
 - `xetra_loader.xetra_features`: persistent materialized feature view with
@@ -337,9 +338,11 @@ limits, and role grants.
 - `xdl-weekly` runs the restart-safe staged orchestrator. Persist a checkpoint
   after each successfully completed stage. Rehydration must read canonical
   manifests and continue only at the first incomplete stage.
-- Use a cross-process lock under the lake root to prevent a second weekly or
-  authoritative rewrite. Lock conflict is a clear blocked result, not silent
-  concurrent execution.
+- Use cross-process locks outside the lake root to prevent a second weekly or
+  authoritative rewrite. Store them in `.logs/lake-locks/<lake-root-hash>/`,
+  next to the root, so systemd-writable local entry points coordinate without
+  adding non-Parquet files to the lake. Lock conflict is a clear blocked
+  result, not silent concurrent execution.
 - All lake writers acquire `authoritative-rewrite.lock` before `weekly.lock`.
   The full-refresh-owned weekly replay reuses the already-held authoritative
   lock and acquires the weekly lock; checkpoint archival also happens only
@@ -353,7 +356,8 @@ limits, and role grants.
 - When a PostgreSQL transaction fails, its market rows, feature refresh,
   digests, state, and run log must roll back together. Restart replays safely.
 - Gold manifests and recovery backups must be verifiable using SHA-256 before
-  restore. Never choose or perform a restore implicitly.
+  restore via `xdl-verify-backup`. Backups and their contents must have private
+  filesystem permissions. Never choose or perform a restore implicitly.
 
 ## API and durable jobs
 
@@ -374,6 +378,8 @@ interrupted `running` work; claim with `FOR UPDATE SKIP LOCKED`; process
 exactly one active job; mark terminal success/failure. Establish `LISTEN`
 before scanning the queue, then block on `NOTIFY` while idle—never poll.
 Shutdown notification wakes the listener and waits for an active run to finish.
+The systemd `SIGTERM` path must invoke graceful server/worker shutdown, with a
+stop timeout that permits a long in-flight weekly job to finish.
 
 The direct Sunday restart-safe delta runner is the active canonical schedule.
 Do not also enqueue a REST weekly job at the same time. API job submission
@@ -430,11 +436,20 @@ the Parquet restart checkpoint, but aggregate it in CLI summaries and logs.
   psycopg 3, and PyYAML; development gates are in `pyproject.toml`.
 - A single bounded `--cores`/`XDL_CORES` CPU budget defaults to six (valid
   range 1–64). Set Polars' thread count before importing Polars. Parallelize
-  independent provider fetches, Polars-backed deterministic Silver/Gold
-  snapshot ordering, Silver/Gold Parquet partition writes, and
-  eligible PostgreSQL plans under that same bound. Keep pending partition work
-  bounded by `--cores`; do not queue an unbounded lake-wide write fan-out or
-  oversubscribe nested engines.
+  independent provider fetches, Polars-backed deterministic Gold record and
+  Silver/Gold snapshot ordering, large Gold semantic-row serialization/fingerprinting,
+  Silver/Gold Parquet partition writes, and eligible PostgreSQL plans under
+  that same bound. Gold fingerprint workers activate for snapshots of at least
+  400,000 rows and preserve canonical row order
+  and exact fingerprint bytes, stream the digest, and bound in-flight chunks
+  by `--cores`; small inputs may stay serial to avoid process startup cost.
+  Reuse existing Silver partitions only when the manifest fingerprint, Parquet
+  schema, and row-count metadata still match the expected partition. Reuse
+  content-addressed Gold partitions only when their Parquet schema and row
+  count still match; regenerate missing or mismatched artifacts before
+  publishing the replacement manifest.
+  Keep pending partition work bounded by `--cores`; do not queue an unbounded
+  lake-wide write fan-out or oversubscribe nested engines.
 - If parallel dividend/split publication is enabled, partition the database
   worker budget so combined query workers do not exceed the configured budget.
 - Configure feature `work_mem` within 16MB–4GB (default 256MB), and per-process
@@ -475,8 +490,8 @@ the Parquet restart checkpoint, but aggregate it in CLI summaries and logs.
 
 ## Agent implementation workflow
 
-1. Read this file, `lake/GOALS.md`, `README.md`, the relevant code, and focused
-   runbooks before changing behavior. Inspect `git status` and preserve all
+1. Read this file, `README.md`, the relevant code, and focused runbooks before
+   changing behavior. Inspect `git status` and preserve all
    pre-existing user work.
 2. Treat `BACKLOG.md` as historical unless it explicitly contains an active
    work item. Keep unrelated changes out of scope.
@@ -486,10 +501,14 @@ the Parquet restart checkpoint, but aggregate it in CLI summaries and logs.
 4. Never inspect or print `config.yaml` values. Never use production credentials
    for tests. Do not run destructive sync/reset/restore or change host schedules
    without explicit user authorization.
-5. Run the gates defined by `pyproject.toml` and focused tests after the
-   implementation is complete. PostgreSQL tests require a disposable
-   `XDL_TEST_POSTGRES_DSN`; report skips rather than claiming those tests ran.
-6. Update focused documentation and acceptance evidence. Do not create,
+5. Run the gates defined by `pyproject.toml` and focused tests only after the
+   complete PR/work item implementation is finished. PostgreSQL tests require a disposable
+   `XDL_TEST_POSTGRES_DSN` targeting a local socket/loopback database explicitly
+   named as a test database; the test harness must reject unsafe targets. Report
+   skips rather than claiming those tests ran.
+6. Keep the README's feature inventory and transformation descriptions in sync
+   with the implemented feature catalog. Update focused documentation and
+   acceptance evidence. Do not create,
    invoke, or depend on GitHub Actions. Do not commit, push, rebase, merge, or
    delete branches unless the user explicitly requests that exact operation.
 

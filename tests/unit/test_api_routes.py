@@ -8,6 +8,9 @@ from uuid import UUID
 from wsgiref.simple_server import WSGIRequestHandler
 from wsgiref.util import setup_testing_defaults
 
+import psycopg
+import pytest
+
 from xetra_loader.api.application import LoaderApiApplication
 from xetra_loader.api.jobs import JobAlreadyActive, JobRecord
 from xetra_loader.api.runner import MonitoringWSGIServer
@@ -28,6 +31,7 @@ class _Store:
         )
         self.enqueued = 0
         self.already_active = False
+        self.ready = True
 
     def enqueue_weekly_sync(self) -> JobRecord:
         self.enqueued += 1
@@ -37,6 +41,9 @@ class _Store:
 
     def get(self, job_id: UUID) -> JobRecord | None:
         return self.record if str(job_id) == self.record.job_id else None
+
+    def database_ready(self) -> bool:
+        return self.ready
 
 
 class _Worker:
@@ -77,7 +84,36 @@ def test_health_route_is_local_and_reports_worker_state() -> None:
     status, payload = _request(app, method="GET", path="/healthz")
 
     assert status.startswith("200")
-    assert payload == {"status": "ok", "worker": "running"}
+    assert payload == {"status": "ok", "worker": "running", "database": "ready"}
+
+
+def test_health_route_returns_unavailable_when_database_is_not_ready() -> None:
+    store = _Store()
+    store.ready = False
+    app = LoaderApiApplication(store, _Worker(), "test-secret")
+
+    status, payload = _request(app, method="GET", path="/healthz")
+
+    assert status.startswith("503")
+    assert payload == {
+        "status": "unavailable",
+        "worker": "running",
+        "database": "unavailable",
+    }
+
+
+def test_health_route_sanitizes_database_probe_errors() -> None:
+    class _DisconnectedStore(_Store):
+        def database_ready(self) -> bool:
+            raise psycopg.OperationalError("test database is unavailable")
+
+    app = LoaderApiApplication(_DisconnectedStore(), _Worker(), "test-secret")
+
+    status, payload = _request(app, method="GET", path="/healthz")
+
+    assert status.startswith("503")
+    assert payload["database"] == "unavailable"
+    assert "test database is unavailable" not in str(payload)
 
 
 def test_job_routes_require_bearer_token_and_validate_request() -> None:
@@ -116,6 +152,51 @@ def test_job_routes_require_bearer_token_and_validate_request() -> None:
     assert inspected.startswith("200")
     assert status["status"] == "queued"
     assert store.enqueued == 1
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b'{"type":"weekly_sync","type":"unsupported"}', b"invalid_json"),
+        (b'{"type":"unsupported","type":"weekly_sync"}', b"invalid_json"),
+        (b'{"type":"weekly_sync","extra":true}', b"unsupported_job_request"),
+    ],
+)
+def test_enqueue_rejects_duplicate_json_keys_and_extra_fields(
+    body: bytes,
+    expected: bytes,
+) -> None:
+    store = _Store()
+    app = LoaderApiApplication(store, _Worker(), "test-secret")
+
+    status, payload = _request(
+        app,
+        method="POST",
+        path="/v1/jobs",
+        body=body,
+        token="test-secret",
+    )
+
+    assert status.startswith("400")
+    assert payload["error"].encode() == expected
+    assert store.enqueued == 0
+
+
+def test_enqueue_rejects_wrong_bearer_token() -> None:
+    store = _Store()
+    app = LoaderApiApplication(store, _Worker(), "test-secret")
+
+    status, payload = _request(
+        app,
+        method="POST",
+        path="/v1/jobs",
+        body=b'{"type":"weekly_sync"}',
+        token="wrong-secret",
+    )
+
+    assert status.startswith("401")
+    assert payload["error"] == "unauthorized"
+    assert store.enqueued == 0
 
 
 def test_active_job_conflict_is_reported_without_creating_another_job() -> None:

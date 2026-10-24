@@ -15,6 +15,10 @@ find "$repo_root/.logs" -maxdepth 1 -type f \
 exec >>"$log_path" 2>&1
 
 printf 'gold_lake_copy_start_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-/usr/bin/flock -s -n lake/authoritative-rewrite.lock \
+lake_root="$(realpath -- "$repo_root/lake")"
+lake_key="$(printf '%s' "$lake_root" | sha256sum | cut -c1-24)"
+lock_dir="$repo_root/.logs/lake-locks/$lake_key"
+mkdir -p -- "$lock_dir"
+/usr/bin/flock -s -n "$lock_dir/authoritative-rewrite.lock" \
   /usr/bin/rsync -a -- lake/gold/ /volume1/Temp/Quotes/xetra-loader-gold/
 printf 'gold_lake_copy_end_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

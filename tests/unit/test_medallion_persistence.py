@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 
 import xetra_loader.medallion.core as medallion_core
+import xetra_loader.ops.bootstrap as bootstrap_module
 from xetra_loader.contracts.listings import ListingRecord
 from xetra_loader.medallion.core import (
     BronzePartition,
@@ -154,7 +155,9 @@ def test_atomic_parquet_can_defer_file_and_directory_sync_for_replayable_migrati
     assert pl.read_parquet(target).to_dicts() == [{"value": "replayable"}]
 
 
-def test_silver_snapshot_uses_canonical_annual_partitions(tmp_path: Path) -> None:
+def test_silver_snapshot_uses_canonical_annual_partitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = MedallionLayout(tmp_path)
     rows = [
@@ -194,11 +197,23 @@ def test_silver_snapshot_uses_canonical_annual_partitions(tmp_path: Path) -> Non
     assert pl.read_parquet(tmp_path / aaa_path).height == 2
     assert all((tmp_path / path).is_file() for path in artifact_paths)
     assert not list(tmp_path.rglob("versions"))
+    assert len(manifest["run_metadata"]["partition_fingerprints"]) == 2
     assert read_dataset_rows(runtime._layout, Layer.SILVER, "eod_quotes") == [
         {"isin": "DE0000000001", "exchange": "XETRA", "code": "AAA", "trade_date": "2026-08-21"},
         {"isin": "DE0000000001", "exchange": "XETRA", "code": "AAA", "trade_date": "2026-09-01"},
         {"isin": "DE0000000002", "exchange": "XETRA", "code": "BBB", "trade_date": "2026-08-22"},
     ]
+
+    actual_write = bootstrap_module.write_parquet_rows
+    writes: list[Path] = []
+
+    def track_write(path: Path, *args, **kwargs) -> None:
+        writes.append(path)
+        actual_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(bootstrap_module, "write_parquet_rows", track_write)
+    runtime.persist_silver("eod_quotes", list(reversed(rows)))
+    assert writes == []
 
     runtime.persist_silver(
         "eod_quotes",
@@ -227,7 +242,9 @@ def test_silver_snapshot_uses_canonical_annual_partitions(tmp_path: Path) -> Non
     assert not list(tmp_path.rglob("*.json"))
 
 
-def test_gold_snapshot_uses_content_addressed_symbol_layout(tmp_path: Path) -> None:
+def test_gold_snapshot_uses_content_addressed_symbol_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
     runtime._layout = MedallionLayout(tmp_path)
     runtime._cores = 2
@@ -273,6 +290,22 @@ def test_gold_snapshot_uses_content_addressed_symbol_layout(tmp_path: Path) -> N
     assert pl.read_parquet(tmp_path / artifact).height == 2
     assert not list(tmp_path.rglob("versions"))
     assert not list(tmp_path.rglob("*.json"))
+
+    actual_write = bootstrap_module.write_parquet_rows
+    writes: list[Path] = []
+
+    def track_write(path: Path, *args, **kwargs) -> None:
+        writes.append(path)
+        actual_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(bootstrap_module, "write_parquet_rows", track_write)
+    runtime.persist_gold(
+        "eod_quotes",
+        rows,
+        row_count=len(rows),
+        semantic_fingerprint="a" * 64,
+    )
+    assert writes == []
 
     revised_rows = [dict(row) for row in rows]
     revised_rows[-1]["close"] = "12.00"

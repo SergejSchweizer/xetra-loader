@@ -74,7 +74,9 @@ identify the current canonical artifacts. Bronze provider objects are nested
 typed Polars/Parquet values, not JSON-text payload columns. Gold
 corporate-action retractions and restart checkpoints are also written as
 Parquet. Legacy JSON control files are converted under the weekly lock and
-removed after the Parquet copy is verified.
+removed after the Parquet copy is verified. Advisory process locks are kept
+outside the lake in a hash-keyed `.logs/lake-locks/` directory next to the
+lake root; they are coordination files, not lake data.
 
 For complete Silver/Gold snapshots, new artifacts and the manifest are
 published before unreferenced row files for that dataset are removed. This
@@ -100,7 +102,7 @@ PYTHONPATH=src .venv/bin/python scripts/migrate_lake_to_parquet.py --cores 6
 
 The migration uses the configured six-core default; override it with
 `--cores N` to bound Polars threads and independent Bronze migration workers.
-It holds both `lake/authoritative-rewrite.lock` and `lake/weekly.lock`, so it
+It holds the `.logs/lake-locks/` `authoritative-rewrite.lock` and `weekly.lock`, so it
 cannot overlap either the destructive full refresh or the normal weekly writer.
 
 The migration validates all Gold fingerprints in sorted Polars batches before
@@ -181,7 +183,8 @@ Optional API submissions ──> xdl-api REST routes
                      in-process weekly job worker
 ```
 
-The API exposes `GET /healthz`, authenticated `POST /v1/jobs` with
+The API exposes `GET /healthz` (bounded database readiness plus worker state),
+authenticated `POST /v1/jobs` with
 `{"type":"weekly_sync"}`, and authenticated `GET /v1/jobs/{job_id}`. The
 database enforces one active weekly sync at a time. The worker acquires a
 PostgreSQL advisory lock, requeues any interrupted `running` job on startup,
@@ -282,6 +285,20 @@ the measured result and environment are recorded in
 global plan was 14.26× faster than per-instrument plans. This synthetic
 microbenchmark does not measure total weekly-sync or PostgreSQL-refresh time.
 
+To measure an actual PostgreSQL scan plan with the configured worker limit, use
+the dedicated test database only:
+
+```bash
+XDL_TEST_POSTGRES_DSN='postgresql://…' \
+  .venv/bin/python scripts/quality/benchmark_postgres_features.py --cores 6 --rounds 3
+```
+
+This read-only benchmark runs `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` against
+the populated test materialized view and reports both planned and launched
+workers. It refuses the production database named `xetra_loader`; it measures
+the view scan, not the materialized-view refresh or leader-bound `WindowAgg`
+calculation.
+
 For PostgreSQL feature materialization, the per-instrument indicator arrays are
 now expanded together with `unnest(... ) WITH ORDINALITY`, rather than reading
 each element separately with `generate_subscripts` and array subscripting. A
@@ -320,12 +337,13 @@ the replacement and identity index were ready. After commit, no staging view or
 temporary files remained. This is one observed production rebuild, not a
 runtime guarantee.
 
-An authorized repeat schema migration on **2026-10-23** confirmed the current
-database has **4,597 listing rows but zero quote, dividend, or split rows**;
-the materialized feature view therefore has **105 columns and zero rows**.
-The schema migration does not ingest provider data, and no synchronization was
-started as part of that migration. Do not treat the earlier full-view rebuild
-measurement as evidence that the current database is populated.
+A read-only production check on **2026-10-24** confirmed the database has
+**4,597 listing rows but zero quote, dividend, or split rows**; the materialized
+view is marked populated, has **105 columns, and contains zero rows**. Its four
+raw tables all expose `available_at_utc`. The schema migration does not ingest
+provider data, and no synchronization was started as part of that migration. Do not
+treat the earlier full-view rebuild measurement as evidence that the current
+database is populated.
 
 ## PostgreSQL schema inventory
 
@@ -407,10 +425,21 @@ The old schemas remain available until the independent acceptance report is
 written. Cleanup first checks PostgreSQL dependencies from outside each old
 schema; any external dependency blocks cleanup and preserves both old schemas.
 Only after that preflight passes is the old schema object graph removed.
+Every full-sync backup is created with private directory/file permissions and
+a SHA-256 inventory. Before any manually authorized restore, verify the
+complete backup without opening PostgreSQL:
+
+```bash
+xdl-verify-backup /path/to/xetra-loader-YYYYMMDDTHHMMSSZ
+```
+
+The verifier fails if any file is missing, added, changed, or linked outside
+the backup. It does not perform a restore.
 Weekly runs, full refreshes, lake migration, and recovery tools coordinate via
-`authoritative-rewrite.lock`; writers that also need the weekly checkpoint take
-`weekly.lock` second. The full-refresh wrapper archives any existing checkpoint
-only after acquiring the authoritative lock, so a concurrent weekly run cannot
+`authoritative-rewrite.lock` in the hash-keyed `.logs/lake-locks/` directory;
+writers that also need the weekly checkpoint take `weekly.lock` second. The
+full-refresh wrapper archives any existing checkpoint only after acquiring the
+authoritative lock, so a concurrent weekly run cannot
 lose or race its restart state.
 
 PostgreSQL `work_mem` for feature refresh is separately configurable through
@@ -449,11 +478,30 @@ implementation is complete for every PR in the delivery batch:
 .venv/bin/python -m pytest -p no:cacheprovider --import-mode=importlib
 .venv/bin/python scripts/quality/benchmark_features.py \
   --rows 100000 --instruments 100 --rounds 5 --cores 6
+.venv/bin/python scripts/quality/benchmark_gold_transform.py \
+  --rows 600000 --rounds 3 --cores 6
 ```
 
-PostgreSQL integration tests require `XDL_TEST_POSTGRES_DSN`; they should use a
-disposable test database, never the production DSN. No GitHub Actions workflow
-is used to run these checks. `origin/main` still requires a `merge-gate` status
-check, while the workflow was retired to satisfy the no-Actions goal. The
-maintainer chose to keep the no-Actions policy and defer remote merging; do not
-weaken branch protection or restore an Actions dependency implicitly.
+Large Gold snapshots use Polars' configured native thread pool to sort domain
+records deterministically, then build canonical semantic fingerprints with a
+bounded process pool using the same `--cores` budget. Both paths keep original
+record objects intact and preserve the established SHA-256 payload exactly;
+the process pool streams ordered chunks with bounded in-flight work. The Gold
+benchmark compares serial and configured-core fingerprints, reports whether
+the configured Polars pool enabled parallel sorting, and fails on divergence.
+By default it reverses its deterministic synthetic inputs to exercise the
+actual sort path; `--input-order sorted` measures the already-ordered fast path.
+Silver partitions store a semantic fingerprint in their Parquet manifest and
+are reused on replay only when the fingerprint, Parquet schema, and row count
+match. Gold symbol partitions are content-addressed and likewise reused when
+their schema and stored row count match; missing or mismatched artifacts are
+rewritten before the replacement manifest is published.
+
+PostgreSQL integration tests require `XDL_TEST_POSTGRES_DSN` and fail closed
+unless it names an explicit test database on loopback or a Unix socket; use a
+disposable database such as `xetra_loader_test`, never the production DSN. No
+GitHub Actions workflow is used to run these checks. `origin/main` still
+requires a `merge-gate` status check, while the workflow was retired to satisfy
+the no-Actions goal. The maintainer chose to keep the no-Actions policy and
+defer remote merging; do not weaken branch protection or restore an Actions
+dependency implicitly.

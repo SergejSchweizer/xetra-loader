@@ -105,6 +105,36 @@ CREATE TABLE IF NOT EXISTS xetra_loader.splits (
     CHECK (btrim(split_ratio) <> '')
 );
 
+-- Repair a legacy ordinary availability column before adding the generated
+-- contract. Rebuilding the materialized view later in schema/004 restores its
+-- definition and grants; dropping it here releases its table-column dependency.
+DO $$
+DECLARE
+    needs_repair BOOLEAN;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1
+        FROM (VALUES
+            ('listings'), ('eod_quotes'), ('dividends'), ('splits')
+        ) AS owned(table_name)
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = format('xetra_loader.%I', owned.table_name)::regclass
+         AND attribute.attname = 'available_at_utc'
+         AND attribute.attnum > 0
+         AND NOT attribute.attisdropped
+        WHERE attribute.attgenerated <> 's'
+    ) INTO needs_repair;
+
+    IF needs_repair THEN
+        DROP MATERIALIZED VIEW IF EXISTS xetra_loader.xetra_features;
+        ALTER TABLE xetra_loader.listings DROP COLUMN IF EXISTS available_at_utc;
+        ALTER TABLE xetra_loader.eod_quotes DROP COLUMN IF EXISTS available_at_utc;
+        ALTER TABLE xetra_loader.dividends DROP COLUMN IF EXISTS available_at_utc;
+        ALTER TABLE xetra_loader.splits DROP COLUMN IF EXISTS available_at_utc;
+    END IF;
+END
+$$;
+
 -- Upgrade tables created by earlier schema versions as well as keeping fresh
 -- installations on the same generated-column contract. Adding a stored
 -- generated column computes the value for every existing row.

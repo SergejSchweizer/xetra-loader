@@ -237,6 +237,56 @@ def test_migration_writes_canonical_parquet_and_archives_legacy_artifacts(
     ]
 
 
+@pytest.mark.parametrize("interruption", ["late_snapshot", "final_archive"])
+def test_full_migration_retry_resumes_after_late_stage_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    root = tmp_path / "lake"
+    backup_parent = tmp_path / "backups"
+    _legacy_lake(root)
+
+    if interruption == "late_snapshot":
+        real_convert_snapshot = lake_migration._convert_snapshot
+        failed = False
+
+        def interrupt_late_snapshot(*args: object, **kwargs: object) -> bool:
+            nonlocal failed
+            layer, dataset = args[2:4]
+            if not failed and layer is Layer.GOLD and dataset == "splits":
+                failed = True
+                raise OSError("simulated interruption during late Gold snapshot conversion")
+            return real_convert_snapshot(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(lake_migration, "_convert_snapshot", interrupt_late_snapshot)
+        expected_error = "late Gold snapshot conversion"
+    else:
+        real_archive = lake_migration._archive_legacy_artifacts
+        failed = False
+
+        def interrupt_final_archive(*args: object, **kwargs: object) -> int:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("simulated interruption during final legacy archival")
+            return real_archive(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(lake_migration, "_archive_legacy_artifacts", interrupt_final_archive)
+        expected_error = "final legacy archival"
+
+    with pytest.raises(OSError, match=expected_error):
+        migrate_lake(root, backup_parent, cores=2)
+
+    monkeypatch.setattr(lake_migration, "_convert_snapshot", _convert_snapshot)
+    monkeypatch.setattr(lake_migration, "_archive_legacy_artifacts", _archive_legacy_artifacts)
+    report = migrate_lake(root, backup_parent, cores=2)
+
+    assert report["status"] == "PASS"
+    assert not list(root.rglob("*.json"))
+    assert _validate_canonical_lake(root) >= 0
+
+
 def test_migration_repartitions_existing_versioned_parquet(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -651,14 +701,24 @@ def test_validator_still_rejects_unrecognized_root_level_parquet(tmp_path: Path)
         _validate_canonical_lake(root)
 
 
+def test_validator_rejects_non_parquet_operational_files(tmp_path: Path) -> None:
+    root = tmp_path / "lake"
+    root.mkdir()
+    (root / "weekly.lock").touch()
+
+    with pytest.raises(ValueError, match="non-Parquet files remain in the lake: weekly.lock"):
+        _validate_canonical_lake(root)
+
+
 def _canonical_bronze_fixture(
     root: Path,
     dataset: str,
     payload_text: str = '{"close":10.0,"provider_tag":"fixture"}',
+    symbol: str = "AAA",
 ) -> Path:
     layout = MedallionLayout(root)
     path = layout.bronze_path(
-        BronzePartition(dataset, "XETRA", "ETF", "AAA", "1d", date(2026, 10, 1))
+        BronzePartition(dataset, "XETRA", "ETF", symbol, "1d", date(2026, 10, 1))
     )
     write_parquet_rows(
         path,
@@ -715,17 +775,22 @@ def test_bronze_payload_conversion_preserves_decimal_precision_and_struct_key_un
         root,
         "splits",
         '{"precise":0.12345678901234567890123456789,"large":'
-        '12345678901234567890123456789,"nested":{"a":1}}',
+        '12345678901234567890123456789,"nested":{"a":1},"splitRatio":0}',
     )
     source_rows = read_parquet_rows(source)
-    source_rows[1]["payload_json"] = '{"nested":{"b":2}}'
+    source_rows[1]["payload_json"] = '{"nested":{"b":2},"splitRatio":"0"}'
     write_parquet_rows(source, source_rows)
 
     assert _convert_canonical_bronze_payloads(root, backup, cores=1) == 1
 
     payloads = [row["provider_payload"] for row in read_parquet_rows(source)]
+    assert Decimal(str(payloads[0]["precise"])) == Decimal(
+        "0.12345678901234567890123456789"
+    )
+    assert int(payloads[0]["large"]) == 12345678901234567890123456789
     assert payloads[0]["nested"] == {"a": 1, "b": None}
     assert payloads[1]["nested"] == {"a": None, "b": 2}
+    assert _semantically_equal({"splitRatio": 0}, {"splitRatio": "0"})
     decoded = _decode_bronze_payload_json(
         '{"precise":0.12345678901234567890123456789,"large":'
         '12345678901234567890123456789}',
@@ -735,6 +800,24 @@ def test_bronze_payload_conversion_preserves_decimal_precision_and_struct_key_un
     assert decoded["precise"] == Decimal("0.12345678901234567890123456789")
     assert decoded["large"] == 12345678901234567890123456789
     assert _semantically_equal({"a": 1}, {"a": 1, "b": None})
+    assert not _semantically_equal({"instrumentCode": 0}, {"instrumentCode": "0"})
+    assert not _semantically_equal({"splitRatio": 0}, {"splitRatio": "0.01"})
+
+
+def test_canonical_bronze_payload_backups_are_safe_with_parallel_directory_creation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lake"
+    backup = tmp_path / "private-backup" / "20261023T120000000000Z"
+    sources = [
+        _canonical_bronze_fixture(root, "splits", symbol=f"SYM{index:02d}")
+        for index in range(12)
+    ]
+
+    assert _convert_canonical_bronze_payloads(root, backup, cores=6) == len(sources)
+
+    assert all("provider_payload" in pl.read_parquet_schema(source) for source in sources)
+    assert sum(1 for _ in backup.rglob("data.parquet")) == len(sources)
 
 
 def test_empty_canonical_bronze_payload_file_is_backed_up_then_removed(
@@ -1135,7 +1218,9 @@ def test_lake_migration_holds_both_writer_and_authoritative_rewrite_locks(
     report = migrate_lake(root, tmp_path / "backup", cores=1)
 
     assert report["status"] == "PASS"
+    from xetra_loader.pipeline.restart import lake_lock_path
+
     assert lock_paths == [
-        root.resolve() / "authoritative-rewrite.lock",
-        root.resolve() / "weekly.lock",
+        lake_lock_path(root, "authoritative-rewrite.lock"),
+        lake_lock_path(root, "weekly.lock"),
     ]

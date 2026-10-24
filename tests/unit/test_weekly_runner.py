@@ -5,6 +5,7 @@ from pathlib import Path
 from types import ModuleType
 
 from xetra_loader.pipeline.orchestrator import PipelineStages
+from xetra_loader.pipeline.restart import lake_lock_path
 from xetra_loader.pipeline.runner import main
 
 
@@ -58,7 +59,8 @@ def test_weekly_runner_uses_medallion_root_and_core_budget(
         "postgres_splits_sync",
         "verification",
     ]
-    assert (tmp_path / "weekly.lock").exists()
+    assert lake_lock_path(tmp_path, "weekly.lock").exists()
+    assert not list(tmp_path.rglob("*.lock"))
     assert not (tmp_path / "weekly.checkpoint.parquet").exists()
 
 

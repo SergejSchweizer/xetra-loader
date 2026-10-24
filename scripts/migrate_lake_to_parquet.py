@@ -20,7 +20,6 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from itertools import groupby
 from pathlib import Path, PurePosixPath
-from threading import Lock
 from typing import cast
 
 from xetra_loader.config import resolve_cores, resolve_medallion_root
@@ -65,6 +64,7 @@ from xetra_loader.pipeline.restart import (  # noqa: E402
     LoaderLock,
     _checkpoint_from_payload,
     _read_checkpoint_parquet,
+    lake_lock_path,
 )
 
 
@@ -195,18 +195,63 @@ def _decode_bronze_payload_json(value: object, path: Path, row_number: int) -> d
     return payload
 
 
-def _semantically_equal(left: object, right: object) -> bool:
+_NUMERIC_PROVIDER_FIELDS = frozenset(
+    {
+        "adjusted_close",
+        "adjustedClose",
+        "close",
+        "denominator",
+        "factor",
+        "high",
+        "low",
+        "numerator",
+        "open",
+        "split",
+        "splitFactor",
+        "splitRatio",
+        "split_ratio",
+        "unadjustedValue",
+        "value",
+        "volume",
+    }
+)
+
+
+def _numeric_semantic_equality(
+    left: object,
+    right: object,
+    *,
+    field_name: str | None = None,
+) -> bool | None:
+    numeric = (int, float, Decimal)
+    both_numeric = isinstance(left, numeric) and isinstance(right, numeric)
+    numeric_text_field = field_name in _NUMERIC_PROVIDER_FIELDS and (
+        isinstance(left, numeric) and isinstance(right, str)
+        or isinstance(right, numeric) and isinstance(left, str)
+    )
+    if not (both_numeric or numeric_text_field):
+        return None
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except Exception:
+        return False
+
+
+def _semantically_equal(
+    left: object,
+    right: object,
+    *,
+    field_name: str | None = None,
+) -> bool:
     if isinstance(left, bool) or isinstance(right, bool):
         return left is right
-    if isinstance(left, (int, float, Decimal)) and isinstance(right, (int, float, Decimal)):
-        try:
-            return Decimal(str(left)) == Decimal(str(right))
-        except Exception:
-            return False
+    numeric_equality = _numeric_semantic_equality(left, right, field_name=field_name)
+    if numeric_equality is not None:
+        return numeric_equality
     if isinstance(left, Mapping) and isinstance(right, Mapping):
         # Polars structs union keys across rows; a missing key becomes null.
         return all(
-            _semantically_equal(left.get(key), right.get(key))
+            _semantically_equal(left.get(key), right.get(key), field_name=key)
             for key in left.keys() | right.keys()
         )
     if isinstance(left, list) and isinstance(right, list):
@@ -270,14 +315,12 @@ def _convert_canonical_bronze_payload_file(
     root: Path,
     backup_root: Path,
     staging_root: Path,
-    backup_lock: Lock,
 ) -> None:
     original_frame = pl.read_parquet(source, low_memory=True)
     if "provider_payload" in original_frame.columns:
         raise ValueError(f"ambiguous Bronze payload columns: {source}")
     if original_frame.height == 0:
-        with backup_lock:
-            _copy_recovery_original(source, root, backup_root)
+        _copy_recovery_original(source, root, backup_root)
         source.unlink()
         _fsync_directory(source.parent)
         return
@@ -310,8 +353,7 @@ def _convert_canonical_bronze_payload_file(
             for expected, actual in zip(rows, staged_rows, strict=True)
         ):
             raise ValueError(f"staged Bronze payload verification failed: {source}")
-        with backup_lock:
-            _copy_recovery_original(source, root, backup_root)
+        _copy_recovery_original(source, root, backup_root)
         os.replace(temporary, source)
         _fsync_directory(source.parent)
     except BaseException:
@@ -336,7 +378,6 @@ def _convert_canonical_bronze_payloads(root: Path, backup_root: Path, *, cores: 
     backup_root.mkdir(mode=0o700, exist_ok=False)
     os.chmod(backup_root, 0o700)
     _fsync_directory(backup_root.parent)
-    backup_lock = Lock()
     converted = 0
     try:
         with ThreadPoolExecutor(max_workers=cores, thread_name_prefix="xdl-bronze-native") as pool:
@@ -346,7 +387,6 @@ def _convert_canonical_bronze_payloads(root: Path, backup_root: Path, *, cores: 
                     root,
                     backup_root,
                     staging_root,
-                    backup_lock,
                 ),
                 sources,
                 buffersize=max(cores * 2, 1),
@@ -880,7 +920,7 @@ def _validate_restart_checkpoint(path: Path) -> None:
     _checkpoint_from_payload(_read_checkpoint_parquet(path))
 
 
-def _validate_canonical_lake(root: Path) -> int:  # noqa: C901
+def _validate_canonical_lake(root: Path) -> int:  # noqa: C901, PLR0912
     """Reject any row artifact left outside the goal's canonical lake layout."""
 
     row_artifact_count = 0
@@ -942,19 +982,27 @@ def _validate_canonical_lake(root: Path) -> int:  # noqa: C901
             + ", ".join(path.relative_to(root).as_posix() for path in orphaned_sidecars[:10])
         )
 
-    legacy_rows = [
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if path.is_file()
-        and (
-            (path.suffix == ".json" and _legacy_artifact(path, root))
-            or (path.name.startswith(".data.parquet.") and path.name.endswith(".tmp"))
-        )
-    ]
+    legacy_rows: list[str] = []
+    non_parquet_files: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative_path = path.relative_to(root).as_posix()
+        if path.suffix.lower() != ".parquet":
+            non_parquet_files.append(relative_path)
+        if (path.suffix == ".json" and _legacy_artifact(path, root)) or (
+            path.name.startswith(".data.parquet.") and path.name.endswith(".tmp")
+        ):
+            legacy_rows.append(relative_path)
     if legacy_rows:
         raise ValueError(
             "legacy row or temporary artifacts remain in the lake: "
             + ", ".join(legacy_rows[:10])
+        )
+    if non_parquet_files:
+        raise ValueError(
+            "non-Parquet files remain in the lake: "
+            + ", ".join(non_parquet_files[:10])
         )
     return row_artifact_count
 
@@ -1314,8 +1362,8 @@ def migrate_lake(
     # The canonical weekly pipeline and the destructive full-refresh verifier
     # use different locks. Hold both while rewriting lake artifacts so neither
     # scheduler path can publish into the same tree concurrently.
-    with LoaderLock(resolved_root / "authoritative-rewrite.lock"), LoaderLock(
-        resolved_root / "weekly.lock"
+    with LoaderLock(lake_lock_path(resolved_root, "authoritative-rewrite.lock")), LoaderLock(
+        lake_lock_path(resolved_root, "weekly.lock")
     ):
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         actual_backup = resolved_backup_root / stamp

@@ -22,6 +22,12 @@ class JobRepository(Protocol):
 
     def get(self, job_id: UUID) -> JobRecord | None: ...
 
+    def database_ready(self) -> bool: ...
+
+
+class _DuplicateJsonKey(ValueError):
+    """Raised when a JSON object repeats a key instead of having one value."""
+
 
 def handle_jobs(
     request: ApiRequest,
@@ -58,12 +64,21 @@ def _validate_enqueue_request(request: ApiRequest, token: str) -> ApiResponse | 
     if request.content_type.split(";", maxsplit=1)[0].strip().lower() != "application/json":
         return _error(415, "application_json_required")
     try:
-        payload = json.loads(request.body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = json.loads(request.body, object_pairs_hook=_unique_object_pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKey):
         return _error(400, "invalid_json")
     if not isinstance(payload, dict) or payload != {"type": "weekly_sync"}:
         return _error(400, "unsupported_job_request")
     return None
+
+
+def _unique_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKey("duplicate JSON object key")
+        result[key] = value
+    return result
 
 
 def _handle_job_status(

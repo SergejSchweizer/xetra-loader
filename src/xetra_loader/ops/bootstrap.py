@@ -52,6 +52,7 @@ from xetra_loader.medallion.core import (
     SilverPartition,
     bronze_provider_payload,
     canonical_json,
+    read_manifest_payload,
     read_parquet_rows,
     write_manifest_parquet,
     write_native_parquet_rows,
@@ -370,7 +371,7 @@ def run_full_bootstrap(
     metrics = FetchMetrics()
     listing_batch = runtime.fetch_listings()
     metrics += listing_batch.metrics
-    listing_gold = build_listing_gold(listing_batch.rows)
+    listing_gold = build_listing_gold(listing_batch.rows, cores=max_workers)
     listing_fetch_times = _batch_fetch_times(listing_batch)
 
     quotes: list[QuoteRecord] = []
@@ -393,9 +394,9 @@ def run_full_bootstrap(
         split_fetch_times.update(_batch_fetch_times(split_batch))
         metrics += quote_batch.metrics + dividend_batch.metrics + split_batch.metrics
 
-    quote_gold = build_quote_gold(quotes)
-    dividend_gold = build_dividend_gold(dividends)
-    split_gold = build_split_gold(splits)
+    quote_gold = build_quote_gold(quotes, cores=max_workers)
+    dividend_gold = build_dividend_gold(dividends, cores=max_workers)
+    split_gold = build_split_gold(splits, cores=max_workers)
     authoritative_snapshot = validate_complete_gold(
         listing_gold, quote_gold, dividend_gold, split_gold
     )
@@ -1213,12 +1214,18 @@ class PostgresEodhdBootstrapRuntime:
     ) -> None:
         """Write canonical Parquet artifacts and atomically publish their manifest."""
 
-        artifact_paths = self._write_canonical_snapshot(
+        previous_fingerprints = (
+            _manifest_partition_fingerprints(self._layout, layer, dataset)
+            if layer is Layer.SILVER
+            else {}
+        )
+        artifact_paths, partition_fingerprints = self._write_canonical_snapshot(
             layer,
             dataset,
             rows,
             durable_sync=durable_sync,
             presorted=presorted,
+            previous_fingerprints=previous_fingerprints,
         )
         semantic_metadata = dict(snapshot.semantic_metadata)
         if layer is Layer.GOLD:
@@ -1237,14 +1244,29 @@ class PostgresEodhdBootstrapRuntime:
                 sync_directory=durable_sync,
             )
             retractions_path = path.relative_to(self._layout.root).as_posix()
+        run_metadata: dict[str, JSONValue] = {
+            "artifact_paths": cast(JSONValue, artifact_paths),
+            "retractions_path": retractions_path,
+        }
+        if layer is Layer.SILVER:
+            run_metadata["partition_fingerprints"] = cast(
+                JSONValue,
+                [
+                    {
+                        "path": path,
+                        "semantic_fingerprint": fingerprint,
+                        "row_count": row_count,
+                    }
+                    for path, (fingerprint, row_count) in sorted(
+                        partition_fingerprints.items()
+                    )
+                ],
+            )
         manifest = Manifest(
             dataset=dataset,
             layer=layer,
             semantic_metadata=semantic_metadata,
-            run_metadata={
-                "artifact_paths": cast(JSONValue, artifact_paths),
-                "retractions_path": retractions_path,
-            },
+            run_metadata=run_metadata,
         )
         write_manifest_parquet(self._layout.manifest_path(layer, dataset), manifest)
         removed = _remove_unreferenced_snapshot_artifacts(
@@ -1261,7 +1283,7 @@ class PostgresEodhdBootstrapRuntime:
                 len(removed),
             )
 
-    def _write_canonical_snapshot(  # noqa: C901 - dispatches two distinct partitioning layouts
+    def _write_canonical_snapshot(  # noqa: C901, PLR0913 - partition layouts and cache policy
         self,
         layer: Layer,
         dataset: str,
@@ -1269,7 +1291,8 @@ class PostgresEodhdBootstrapRuntime:
         *,
         durable_sync: bool = True,
         presorted: bool = False,
-    ) -> list[str]:
+        previous_fingerprints: Mapping[str, tuple[str, int]] | None = None,
+    ) -> tuple[list[str], dict[str, tuple[str, int]]]:
         """Publish canonical partitions, buffering at most one partition at a time."""
 
         workers = getattr(self, "_cores", 1)
@@ -1280,42 +1303,75 @@ class PostgresEodhdBootstrapRuntime:
         )
         if layer is Layer.SILVER:
             groups = groupby(ordered, key=lambda row: _silver_partition_key(dataset, row))
+            partition_fingerprints: dict[str, tuple[str, int]] = {}
 
             def tasks() -> Iterable[Callable[[], str]]:
                 for (exchange, symbol, year), group in groups:
                     partition_rows = [dict(row) for row in group]
+                    schema = sorted(partition_rows[0])
+                    if any(sorted(row) != schema for row in partition_rows):
+                        raise ValueError(
+                            f"Silver {dataset} rows do not share a stable schema"
+                        )
+                    fingerprint = hashlib.sha256(
+                        canonical_json(cast(JSONValue, partition_rows)).encode("utf-8")
+                    ).hexdigest()
+                    path = self._layout.silver_path(
+                        SilverPartition(
+                            dataset_type=dataset,
+                            exchange=exchange,
+                            symbol=symbol,
+                            timeframe=_timeframe(dataset),
+                            year=year,
+                        )
+                    )
+                    relative_path = path.relative_to(self._layout.root).as_posix()
+                    partition_fingerprints[relative_path] = (
+                        fingerprint,
+                        len(partition_rows),
+                    )
 
                     def write_partition(
-                        exchange: str = exchange,
-                        symbol: str = symbol,
-                        year: int = year,
+                        path: Path = path,
+                        relative_path: str = relative_path,
+                        fingerprint: str = fingerprint,
+                        schema: list[str] = schema,
                         partition_rows: list[dict[str, JSONValue]] = partition_rows,
                     ) -> str:
-                        path = self._layout.silver_path(
-                            SilverPartition(
-                                dataset_type=dataset,
-                                exchange=exchange,
-                                symbol=symbol,
-                                timeframe=_timeframe(dataset),
-                                year=year,
+                        previous = (previous_fingerprints or {}).get(relative_path)
+                        if (
+                            previous == (fingerprint, len(partition_rows))
+                            and _parquet_artifact_matches(
+                                path,
+                                expected_columns=schema,
+                                expected_rows=len(partition_rows),
                             )
-                        )
+                        ):
+                            _LOGGER.debug(
+                                "silver_partition_reused dataset=%s path=%s",
+                                dataset,
+                                relative_path,
+                            )
+                            return relative_path
                         write_parquet_rows(
                             path,
                             partition_rows,
                             sync_file=durable_sync,
                             sync_directory=durable_sync,
                         )
-                        return path.relative_to(self._layout.root).as_posix()
+                        return relative_path
 
                     yield write_partition
 
-            return _run_partition_writes(tasks(), workers=workers)
+            return (
+                _run_partition_writes(tasks(), workers=workers),
+                partition_fingerprints,
+            )
         elif layer is Layer.GOLD:
             feature_set_version = "v1.0.0"
             first_row = next(ordered, None)
             if first_row is None:
-                return []
+                return [], {}
             schema = sorted(first_row)
             feature_hash = hashlib.sha256(
                 canonical_json(
@@ -1359,6 +1415,18 @@ class PostgresEodhdBootstrapRuntime:
                                 source_hash=source_hash,
                             )
                         )
+                        if _parquet_artifact_matches(
+                            path,
+                            expected_columns=schema,
+                            expected_rows=len(symbol_rows),
+                        ):
+                            _LOGGER.debug(
+                                "gold_partition_reused dataset=%s exchange=%s symbol=%s",
+                                dataset,
+                                exchange,
+                                symbol,
+                            )
+                            return path.relative_to(self._layout.root).as_posix()
                         write_parquet_rows(
                             path,
                             symbol_rows,
@@ -1369,7 +1437,7 @@ class PostgresEodhdBootstrapRuntime:
 
                     yield write_partition
 
-            return _run_partition_writes(tasks(), workers=workers)
+            return _run_partition_writes(tasks(), workers=workers), {}
         else:
             raise ValueError("canonical snapshots support only Silver and Gold")
 
@@ -1480,6 +1548,65 @@ def _timeframe(dataset: str) -> str:
 
 def _gold_dataset_id(dataset: str) -> str:
     return f"xetra-{dataset}-gold-v1"
+
+
+def _manifest_partition_fingerprints(
+    layout: MedallionLayout,
+    layer: Layer,
+    dataset: str,
+) -> dict[str, tuple[str, int]]:
+    """Load a prior Silver manifest's partition cache, if this is a legacy one."""
+
+    manifest_path = layout.manifest_path(layer, dataset)
+    if not manifest_path.is_file():
+        return {}
+    payload = read_manifest_payload(manifest_path)
+    run_metadata = payload.get("run_metadata")
+    if not isinstance(run_metadata, dict):
+        return {}
+    entries = run_metadata.get("partition_fingerprints")
+    if not isinstance(entries, list):
+        return {}
+    fingerprints: dict[str, tuple[str, int]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        fingerprint = entry.get("semantic_fingerprint")
+        row_count = entry.get("row_count")
+        if (
+            isinstance(path, str)
+            and isinstance(fingerprint, str)
+            and len(fingerprint) == 64
+            and isinstance(row_count, int)
+            and not isinstance(row_count, bool)
+            and row_count >= 0
+        ):
+            fingerprints[path] = (fingerprint, row_count)
+    return fingerprints
+
+
+def _parquet_artifact_matches(
+    path: Path,
+    *,
+    expected_columns: Sequence[str],
+    expected_rows: int,
+) -> bool:
+    """Reuse an immutable Gold partition only when Parquet metadata matches."""
+
+    if not path.is_file():
+        return False
+    try:
+        schema = pl.read_parquet_schema(path)
+        if set(schema) != set(expected_columns):
+            return False
+        row_count = cast(
+            int,
+            pl.scan_parquet(path).select(pl.len()).collect().item(),
+        )
+    except (OSError, pl.exceptions.PolarsError):
+        return False
+    return row_count == expected_rows
 
 
 def _partition_date(dataset: str, row: Mapping[str, JSONValue]) -> date:

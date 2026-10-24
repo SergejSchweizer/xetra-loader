@@ -6,6 +6,8 @@ import os
 
 import pytest
 
+from xetra_loader.testing import validate_local_test_postgres_dsn
+
 _SKIPPED: list[str] = []
 
 
@@ -14,10 +16,19 @@ def _required() -> bool:
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
-    """Reset collection state for every pytest invocation."""
+    """Reset state and fail closed on a non-local/non-test PostgreSQL DSN."""
 
     del session
     _SKIPPED.clear()
+    dsn = os.getenv("XDL_TEST_POSTGRES_DSN")
+    if dsn:
+        try:
+            validate_local_test_postgres_dsn(dsn)
+        except ValueError:
+            raise pytest.UsageError(
+                "refusing PostgreSQL integration tests unless the DSN explicitly names "
+                "a local test database"
+            ) from None
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:

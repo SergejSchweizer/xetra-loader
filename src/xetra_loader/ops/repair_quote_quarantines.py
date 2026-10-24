@@ -41,7 +41,7 @@ from xetra_loader.ops.verify_postgres_sync import (
     verify_postgres_sync,
     write_production_report,
 )
-from xetra_loader.pipeline.restart import LoaderLock
+from xetra_loader.pipeline.restart import LoaderLock, lake_lock_path
 from xetra_loader.pipeline.runtime import _quotes_from_rows
 from xetra_loader.sync import connect_postgres
 from xetra_loader.sync.core import SyncCounters, SyncOutcome
@@ -245,7 +245,7 @@ def repair_full_sync_quarantines(
 
     root = Path(resolve_medallion_root()).resolve()
     worker_count = resolve_cores(cores)
-    with LoaderLock(root / "authoritative-rewrite.lock"):
+    with LoaderLock(lake_lock_path(root, "authoritative-rewrite.lock")):
         snapshots = _validated_snapshots(root)
         layout = MedallionLayout(root)
         listings = _gold_listings(layout)

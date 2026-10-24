@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -47,7 +48,7 @@ from xetra_loader.ops.bootstrap import (
     drop_previous_serving_schemas,
     run_full_bootstrap,
 )
-from xetra_loader.pipeline.restart import LoaderLock, run_restartable_pipeline
+from xetra_loader.pipeline.restart import LoaderLock, lake_lock_path, run_restartable_pipeline
 from xetra_loader.pipeline.runtime import build_weekly_stages
 from xetra_loader.sync import connect_postgres
 from xetra_loader.sync.core import SyncOutcome
@@ -398,7 +399,7 @@ def execute_production_full_sync_and_verify(  # noqa: PLR0915 -- ordered safety 
     worker_count = resolve_cores(cores)
     _require_scheduler_disabled()
     _require_private_backup_root(backup_root)
-    with LoaderLock(root / "authoritative-rewrite.lock"):
+    with LoaderLock(lake_lock_path(root, "authoritative-rewrite.lock")):
         preflight = connect_postgres(admin=True, cores=worker_count)
         try:
             preflight.autocommit = True
@@ -442,7 +443,7 @@ def execute_production_full_sync_and_verify(  # noqa: PLR0915 -- ordered safety 
         if weekly_replay:
             replay = run_restartable_pipeline(
                 build_weekly_stages(worker_count),
-                lock_path=root / "weekly.lock",
+                lock_path=lake_lock_path(root, "weekly.lock"),
                 checkpoint_path=root / "weekly.checkpoint.parquet",
                 authoritative_lock_held=True,
             )
@@ -843,11 +844,13 @@ def _require_scheduler_disabled() -> None:
 
 def _require_private_backup_root(path: Path) -> None:
     repository = Path.cwd().resolve()
-    resolved = path.resolve()
     if path.is_symlink():
         raise ProductionVerificationError("backup root must not be a symbolic link")
+    resolved = path.resolve()
     if resolved == repository or repository in resolved.parents:
         raise ProductionVerificationError("backup root must be outside the repository")
+    resolved.mkdir(parents=True, exist_ok=True, mode=0o700)
+    resolved.chmod(0o700)
 
 
 def _backup_owned_state(medallion_root: Path, backup_root: Path) -> None:
@@ -855,31 +858,126 @@ def _backup_owned_state(medallion_root: Path, backup_root: Path) -> None:
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     destination = backup_root.resolve() / f"xetra-loader-{stamp}"
-    destination.mkdir(parents=True, exist_ok=False)
+    destination.mkdir(parents=True, exist_ok=False, mode=0o700)
+    destination.chmod(0o700)
     schemas = _existing_owned_schemas()
     if schemas:
         _dump_owned_schemas(destination / "postgres.sql", schemas)
     else:
-        (destination / "empty-postgres-state.json").write_text(
+        empty_state = destination / "empty-postgres-state.json"
+        empty_state.write_text(
             canonical_json({"schemas": []}) + "\n",
             encoding="utf-8",
         )
+        empty_state.chmod(0o600)
     manifests = destination / "gold-manifests"
-    manifests.mkdir()
+    manifests.mkdir(mode=0o700)
+    manifests.chmod(0o700)
     layout = MedallionLayout(medallion_root)
     for dataset in DATASETS:
         source = layout.manifest_path(Layer.GOLD, dataset)
         if source.exists():
             target = manifests / f"{dataset}.parquet"
             target.write_bytes(source.read_bytes())
+            target.chmod(0o600)
+    postgres_dump = destination / "postgres.sql"
+    if postgres_dump.exists():
+        postgres_dump.chmod(0o600)
     checksums = {
         str(path.relative_to(destination)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(destination.rglob("*"))
         if path.is_file()
     }
-    (destination / "checksums.json").write_text(
+    checksums_path = destination / "checksums.json"
+    checksums_path.write_text(
         canonical_json(cast(JSONValue, checksums)) + "\n", encoding="utf-8"
     )
+    checksums_path.chmod(0o600)
+    verify_backup_checksums(destination)
+
+
+def verify_backup_checksums(backup_directory: Path) -> int:
+    """Verify a backup manifest and every contained file before recovery use."""
+
+    root = _backup_directory_root(backup_directory)
+    manifest_path = root / "checksums.json"
+    expected = _load_backup_checksums(manifest_path)
+    for relative_name, digest in expected.items():
+        _verify_backup_file(root, relative_name, digest)
+    if _backup_file_inventory(root, manifest_path) != set(expected):
+        raise ProductionVerificationError("backup contents differ from the checksum manifest")
+    return len(expected)
+
+
+def _backup_directory_root(backup_directory: Path) -> Path:
+    if backup_directory.is_symlink():
+        raise ProductionVerificationError("backup directory must not be a symbolic link")
+    root = backup_directory.resolve(strict=True)
+    if not root.is_dir():
+        raise ProductionVerificationError("backup directory must be a directory")
+    _require_private_permissions(root, directory=True)
+    return root
+
+
+def _load_backup_checksums(manifest_path: Path) -> dict[str, str]:
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ProductionVerificationError("backup checksum manifest is missing or unsafe")
+    _require_private_permissions(manifest_path, directory=False)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProductionVerificationError("backup checksum manifest is invalid") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise ProductionVerificationError("backup checksum manifest must be a non-empty object")
+
+    expected: dict[str, str] = {}
+    for relative_name, digest in payload.items():
+        relative_path = Path(relative_name) if isinstance(relative_name, str) else Path("..")
+        if (
+            not isinstance(relative_name, str)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path == Path("checksums.json")
+        ):
+            raise ProductionVerificationError("backup checksum manifest contains invalid entries")
+        expected[relative_path.as_posix()] = digest
+    return expected
+
+
+def _verify_backup_file(root: Path, relative_name: str, expected_digest: str) -> None:
+    unresolved_target = root / relative_name
+    if unresolved_target.is_symlink():
+        raise ProductionVerificationError("backup checksum target is missing or unsafe")
+    target = unresolved_target.resolve()
+    if root not in target.parents or not target.is_file():
+        raise ProductionVerificationError("backup checksum target is missing or unsafe")
+    _require_private_permissions(target, directory=False)
+    with target.open("rb") as source:
+        actual_digest = hashlib.file_digest(source, "sha256").hexdigest()
+    if actual_digest != expected_digest:
+        raise ProductionVerificationError("backup checksum verification failed")
+
+
+def _backup_file_inventory(root: Path, manifest_path: Path) -> set[str]:
+    actual_files: set[str] = set()
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            raise ProductionVerificationError("backup contains a symbolic link")
+        if candidate.is_dir():
+            _require_private_permissions(candidate, directory=True)
+        if candidate.is_file() and candidate != manifest_path:
+            _require_private_permissions(candidate, directory=False)
+            actual_files.add(candidate.relative_to(root).as_posix())
+    return actual_files
+
+
+def _require_private_permissions(path: Path, *, directory: bool) -> None:
+    mode = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+    if mode & 0o077:
+        kind = "directory" if directory else "file"
+        raise ProductionVerificationError(f"backup {kind} permissions are not private")
 
 
 def _archive_weekly_checkpoints(medallion_root: Path, backup_root: Path) -> tuple[Path, ...]:

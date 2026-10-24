@@ -55,6 +55,7 @@ def main(
         stages_factory = build_weekly_stages
     from xetra_loader.pipeline.restart import (
         ConcurrentLoaderRunError,
+        lake_lock_path,
         run_restartable_pipeline,
     )
 
@@ -70,7 +71,7 @@ def main(
     try:
         summary = run_restartable_pipeline(
             stages_factory(cores),
-            lock_path=root / "weekly.lock",
+            lock_path=lake_lock_path(root, "weekly.lock"),
             checkpoint_path=root / "weekly.checkpoint.parquet",
         )
     except ConcurrentLoaderRunError:
