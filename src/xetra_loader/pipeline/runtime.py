@@ -441,7 +441,7 @@ class _WeeklyState:
         outcome = self._publication_futures["splits"].result()
         self.outcomes["splits"] = outcome
         details = _sync_details(outcome)
-        details["stale_listings_deleted"] = self.runtime.prune_stale_listings(
+        details["stale_listings_deactivated"] = self.runtime.prune_stale_listings(
             self._require_listings()
         )
         executor = self._publication_executor
@@ -729,7 +729,6 @@ def build_weekly_stages(cores: int | None = None) -> PipelineStages:
     worker_count = resolve_cores(cores)
     state = _WeeklyState(
         PostgresEodhdBootstrapRuntime.from_environment(
-            quarantine_invalid_ohlc=True,
             cores=worker_count,
         ),
         cores=worker_count,

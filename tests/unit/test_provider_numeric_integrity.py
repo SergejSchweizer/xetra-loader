@@ -82,7 +82,7 @@ def test_non_finite_provider_numbers_fail(value: Decimal) -> None:
         ingest_quotes(FixtureTransport(payload), _listing())
 
 
-def test_fractional_volume_and_inconsistent_ohlc_fail() -> None:
+def test_fractional_volume_fails_but_inconsistent_ohlc_is_preserved() -> None:
     fractional_volume = [
         {"date": "2026-08-21", "open": 9, "high": 11, "low": 8, "close": 10, "volume": 1.5}
     ]
@@ -92,13 +92,12 @@ def test_fractional_volume_and_inconsistent_ohlc_fail() -> None:
 
     with pytest.raises(ValueError, match="exact integer"):
         ingest_quotes(FixtureTransport(fractional_volume), _listing())
-    with pytest.raises(ValueError, match="between low and high"):
-        ingest_quotes(FixtureTransport(inconsistent), _listing())
+    quote = ingest_quotes(FixtureTransport(inconsistent), _listing()).silver_records[0]
+    assert quote.close == Decimal("12")
 
 
-def test_negative_prices_and_non_positive_split_factors_fail() -> None:
-    with pytest.raises(ValueError, match="non-negative"):
-        _quote(close=Decimal("-1"))
+def test_negative_prices_are_preserved_but_non_positive_split_factors_fail() -> None:
+    assert _quote(close=Decimal("-1")).close == Decimal("-1")
     with pytest.raises(ValueError, match="positive"):
         SplitEvent(
             isin="DE0000000001",

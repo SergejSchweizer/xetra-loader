@@ -46,12 +46,6 @@ class QuoteRecord:
         ):
             if price is not None:
                 require_finite(price, field=name)
-                if price < 0:
-                    raise ValueError(f"{name} must be non-negative")
-        if self.low is not None and self.high is not None:
-            for name, price in (("open", self.open), ("close", self.close)):
-                if price is not None and not self.low <= price <= self.high:
-                    raise ValueError(f"{name} must be between low and high")
 
     @property
     def key(self) -> tuple[str, str, str, date]:

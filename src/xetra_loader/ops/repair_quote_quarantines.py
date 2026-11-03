@@ -203,7 +203,6 @@ def _recover_bronze_partition(
             record = _normalize_quote(
                 listing,
                 cast(Mapping[str, JSONValue], payload),
-                sanitize_invalid_ohlc=True,
             )
             recovered[issue].add(record)
     return recovered

@@ -431,7 +431,7 @@ def test_weekly_listings_publish_silver_before_gold(tmp_path: Path) -> None:
     assert runtime.persistence_events == [("silver", "listings"), ("gold", "listings")]
 
 
-def test_weekly_stages_quarantine_invalid_provider_ohlc(
+def test_weekly_stages_do_not_enable_price_quarantine(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -442,12 +442,7 @@ def test_weekly_stages_quarantine_invalid_provider_ohlc(
         def validate_weekly_schema_contract(self) -> None:
             captured["schema_preflight"] = True
 
-    def from_environment(
-        *,
-        quarantine_invalid_ohlc: bool = False,
-        cores: int | None = None,
-    ) -> object:
-        captured["quarantine_invalid_ohlc"] = quarantine_invalid_ohlc
+    def from_environment(*, cores: int | None = None) -> object:
         captured["cores"] = cores or 0
         return Runtime()
 
@@ -459,7 +454,6 @@ def test_weekly_stages_quarantine_invalid_provider_ohlc(
     build_weekly_stages(cores=4)
 
     assert captured == {
-        "quarantine_invalid_ohlc": True,
         "cores": 4,
         "schema_preflight": True,
     }

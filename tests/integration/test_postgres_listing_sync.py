@@ -122,11 +122,14 @@ def test_listing_sync_removes_rows_outside_authoritative_gold_snapshot() -> None
             )
 
         repaired = sync_listings(connection, initial_gold, published_at_utc=published)
-        deleted = prune_stale_listings(connection, initial_gold)
+        deactivated = prune_stale_listings(connection, initial_gold)
 
         assert repaired.status == "applied"
-        assert deleted == 1
-        assert connection.execute("SELECT count(*) FROM xetra_loader.listings").fetchone() == (1,)
+        assert deactivated == 1
+        assert connection.execute(
+            "SELECT is_active FROM xetra_loader.listings WHERE isin = 'DE0000000002'"
+        ).fetchone() == (False,)
+        assert connection.execute("SELECT count(*) FROM xetra_loader.listings").fetchone() == (2,)
     finally:
         connection.close()
 

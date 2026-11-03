@@ -25,7 +25,7 @@ from psycopg import Connection
 
 from xetra_loader.config import resolve_cores, resolve_eodhd_token, resolve_medallion_root
 from xetra_loader.contracts.corporate_actions import DividendEvent, SplitEvent
-from xetra_loader.contracts.listings import ListingRecord
+from xetra_loader.contracts.listings import ListingRecord, deserialize_listings
 from xetra_loader.contracts.quotes import QuoteRecord
 from xetra_loader.eodhd.transport import (
     BinaryResponse,
@@ -52,6 +52,7 @@ from xetra_loader.medallion.core import (
     SilverPartition,
     bronze_provider_payload,
     canonical_json,
+    read_dataset_rows,
     read_manifest_payload,
     read_parquet_rows,
     write_manifest_parquet,
@@ -648,7 +649,6 @@ class PostgresEodhdBootstrapRuntime:
         transport: _MeasuredTransport,
         medallion_root: Path,
         repository_root: Path,
-        quarantine_invalid_ohlc: bool = False,
         cores: int | None = None,
         staging: bool = False,
     ) -> None:
@@ -656,7 +656,6 @@ class PostgresEodhdBootstrapRuntime:
         self._transport = transport
         self._layout = MedallionLayout(medallion_root.resolve())
         self._repository_root = repository_root.resolve()
-        self._quarantine_invalid_ohlc = quarantine_invalid_ohlc
         self._cores = resolve_cores(cores)
         self._staging = staging
         self._serving_schema = "xetra_loader_build" if staging else "xetra_loader"
@@ -682,12 +681,15 @@ class PostgresEodhdBootstrapRuntime:
                 f"{self._serving_schema}.eod_quotes.close must be nullable; "
                 "run xdl-migrate before weekly sync"
             )
+        # Finish the implicit transaction opened by the preflight SELECT so
+        # each later run_sync(connection.transaction()) is a real transaction
+        # boundary rather than a savepoint that would be rolled back on close.
+        self._connection.commit()
 
     @classmethod
     def from_environment(
         cls,
         *,
-        quarantine_invalid_ohlc: bool = False,
         cores: int | None = None,
         staging: bool = False,
     ) -> PostgresEodhdBootstrapRuntime:
@@ -698,7 +700,6 @@ class PostgresEodhdBootstrapRuntime:
             transport=_MeasuredTransport(),
             medallion_root=Path(root),
             repository_root=Path.cwd(),
-            quarantine_invalid_ohlc=quarantine_invalid_ohlc,
             cores=worker_count,
             staging=staging,
         )
@@ -707,7 +708,6 @@ class PostgresEodhdBootstrapRuntime:
     def from_admin_environment(
         cls,
         *,
-        quarantine_invalid_ohlc: bool = False,
         cores: int | None = None,
         staging: bool = False,
     ) -> PostgresEodhdBootstrapRuntime:
@@ -718,7 +718,6 @@ class PostgresEodhdBootstrapRuntime:
             transport=_MeasuredTransport(),
             medallion_root=Path(root),
             repository_root=Path.cwd(),
-            quarantine_invalid_ohlc=quarantine_invalid_ohlc,
             cores=worker_count,
             staging=staging,
         )
@@ -811,7 +810,6 @@ class PostgresEodhdBootstrapRuntime:
             transport=self._transport.clone(),
             medallion_root=self._layout.root,
             repository_root=self._repository_root,
-            quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
             cores=self._cores,
             staging=getattr(self, "_staging", False),
         )
@@ -831,14 +829,15 @@ class PostgresEodhdBootstrapRuntime:
             transport=self._transport.clone(),
             medallion_root=self._layout.root,
             repository_root=self._repository_root,
-            quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
             cores=worker_count,
             staging=self._staging,
         )
 
     def fetch_listings(self) -> FetchBatch[ListingRecord]:
         before = self._measurement_start()
-        result = ingest_xetra_listings(self._transport)
+        previous_rows = read_dataset_rows(self._layout, Layer.SILVER, "listings")
+        previous_records = deserialize_listings(canonical_json(cast(JSONValue, previous_rows)))
+        result = ingest_xetra_listings(self._transport, previous_records=previous_records)
         metrics = self._measurement_finish(before, len(result.silver_records))
         raw = cast(JSONValue, list(result.bronze_rows))
         self._write_layer(Layer.BRONZE, "listings", raw)
@@ -864,7 +863,6 @@ class PostgresEodhdBootstrapRuntime:
             listing,
             last_business_date=last_business_date,
             previous_records=previous_records,
-            quarantine_invalid_ohlc=self._quarantine_invalid_ohlc,
         )
         metrics = self._measurement_finish(before, len(result.silver_records))
         self._record_partition_bronze("eod_quotes", listing, result.bronze_rows)
@@ -991,7 +989,7 @@ class PostgresEodhdBootstrapRuntime:
         fetched_at_by_key: QuoteFetchTimestampLookup | None = None,
         authoritative_snapshot: GoldValidationSummary,
     ) -> SyncOutcome:
-        return sync_quotes(
+        outcome = sync_quotes(
             self._connection,
             gold,
             fetched_at_by_key=fetched_at_by_key,
@@ -999,6 +997,12 @@ class PostgresEodhdBootstrapRuntime:
             serving_schema=self._serving_schema,
             sync_schema=self._sync_schema,
         )
+        # A weekly stage is its own durable publication boundary. This is
+        # intentionally explicit even though run_sync normally commits its
+        # transaction: it also protects the stage if the caller connection
+        # had an enclosing transaction opened by a preflight/read operation.
+        self._connection.commit()
+        return outcome
 
     def publish_dividends(
         self,

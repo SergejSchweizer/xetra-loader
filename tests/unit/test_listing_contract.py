@@ -1,5 +1,6 @@
 from xetra_loader.contracts.listings import (
     deserialize_listings,
+    merge_listing_lifecycle,
     normalize_listings,
     serialize_listings,
 )
@@ -74,3 +75,15 @@ def test_listing_lifecycle_round_trips_as_semantic_contract() -> None:
 
     assert records[0].semantic_dict()["is_active"] is False
     assert deserialize_listings(serialize_listings(records)) == records
+
+
+def test_listing_lifecycle_retains_previous_missing_listing_as_inactive() -> None:
+    previous = normalize_listings(
+        [{"ISIN": "DE0000000001", "Exchange": "XETRA", "Code": "OLD"}]
+    )
+    current = merge_listing_lifecycle(
+        normalize_listings([]), normalize_listings([]), previous_records=previous
+    )
+    assert len(current) == 1
+    assert current[0].key == previous[0].key
+    assert current[0].is_active is False

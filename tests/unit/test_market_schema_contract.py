@@ -52,15 +52,23 @@ def test_weekly_schema_preflight_rejects_missing_or_non_nullable_close(
             return None if nullable is None else (nullable,)
 
     class _Connection:
+        committed = False
+
         def execute(self, *_args: object) -> _Result:
             return _Result()
 
+        def commit(self) -> None:
+            self.committed = True
+
     runtime = object.__new__(PostgresEodhdBootstrapRuntime)
-    runtime._connection = _Connection()
+    connection = _Connection()
+    runtime._connection = connection
     runtime._serving_schema = "xetra_loader"
 
     if nullable == "YES":
         runtime.validate_weekly_schema_contract()
+        assert connection.committed
     else:
         with pytest.raises(RuntimeError, match="close"):
             runtime.validate_weekly_schema_contract()
+        assert not connection.committed

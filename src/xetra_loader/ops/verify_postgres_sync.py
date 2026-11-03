@@ -416,7 +416,6 @@ def execute_production_full_sync_and_verify(  # noqa: PLR0915 -- ordered safety 
         _archive_weekly_checkpoints(root, backup_root)
         runtime = _AdminResetWriterPublishRuntime(
             PostgresEodhdBootstrapRuntime.from_admin_environment(
-                quarantine_invalid_ohlc=True,
                 cores=worker_count,
                 staging=True,
             ),
@@ -424,7 +423,6 @@ def execute_production_full_sync_and_verify(  # noqa: PLR0915 -- ordered safety 
         )
         def worker_runtime() -> PostgresEodhdBootstrapRuntime:
             return PostgresEodhdBootstrapRuntime.from_admin_environment(
-                quarantine_invalid_ohlc=True,
                 cores=worker_count,
             )
 
