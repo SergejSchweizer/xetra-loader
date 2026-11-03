@@ -54,7 +54,7 @@ def test_quarantine_log_is_scoped_to_one_refresh_window_and_deduplicated(tmp_pat
     )
 
 
-def test_recovery_preserves_good_fields_and_nulls_only_invalid_close(tmp_path) -> None:
+def test_recovery_preserves_all_raw_price_fields(tmp_path) -> None:
     layout = MedallionLayout(tmp_path)
     listing = ListingRecord(
         isin="DE0000000001",
@@ -101,7 +101,7 @@ def test_recovery_preserves_good_fields_and_nulls_only_invalid_close(tmp_path) -
     )
 
     assert len(records) == 1
-    assert records[0].close is None
+    assert records[0].close == Decimal("95.2765")
     assert records[0].adjusted_close == Decimal("95.2765")
     assert records[0].open == records[0].high == records[0].low == Decimal("95.62")
     assert records[0].volume == 123

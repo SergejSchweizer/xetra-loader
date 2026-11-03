@@ -4,22 +4,25 @@
 
 - [Purpose and preconditions](#purpose-and-preconditions)
 - [Cutover sequence](#cutover-sequence)
-- [Restore the weekly schedule](#restore-the-weekly-schedule)
+- [Return to normal weekly operation](#return-to-normal-weekly-operation)
 
-This is the runbook for the guarded full rewrite used by the repository's
-Sunday `09:00 Europe/Vienna` schedule. The current host crontab also runs this
-full historical refresh every Sunday at `09:00` and copies Gold to
-`/volume1/Temp/Quotes` at `22:00`. The API service is not installed. Do not add
-the REST enqueue entry alongside the direct full-refresh schedule.
+This runbook covers an explicitly authorized, manually invoked maintenance
+rewrite. It is not the repository's weekly schedule and must not be installed
+as a cron job. The canonical weekly job is the restart-safe delta runner at
+Sunday `09:00 Europe/Vienna`; the separate Gold copy runs Sunday at `22:00`.
+The host crontab was verified on 2026-10-24 to match those two entries. Do not
+replace the weekly delta with this full-history rewrite or add a parallel REST
+enqueue entry.
 
 ## Purpose and preconditions
 
 `xdl-verify-production-sync --execute-full-sync --confirm-destructive-reset
 --cores 6` is the destructive full-rewrite command (`--cores` defaults to the
-configured budget or six). The host wrapper `scripts/run_full_refresh.sh`
-invokes it weekly. Before a separate manual invocation, disable the host's
-scheduled full-refresh entry and any `xdl-enqueue-weekly` entry, then verify no
-API worker or queued job can race the rewrite. The command also requires the
+configured budget or six). The host wrapper `scripts/run_full_refresh.sh` is
+for explicit maintenance only. Before a manual invocation, verify that the
+weekly delta runner is not active and that no API worker or queued job can
+race the rewrite. Do not alter or disable the recurring crontab entries unless
+the operator separately authorizes that change. The command also requires the
 configured administrative connection to resolve exactly to
 `10.10.1.3:54321`, an acquired lock, and a backup root outside this repository.
 
@@ -50,9 +53,11 @@ configured backup root; only a verified `PASS` prunes older backup/checkpoint
 artifacts, retaining the four newest matching full-sync directories and
 checkpoints. Unrelated files and malformed names are untouched.
 
-## Restore the weekly schedule
+## Return to normal weekly operation
 
-Keep the cron entry disabled until that report is `PASS`. Restore only the
-Sunday `09:00 Europe/Vienna` direct full-refresh entry and Sunday `22:00`
-Gold-copy entry that were disabled before the rewrite. Do not install a
-parallel `xdl-enqueue-weekly` entry as part of this procedure.
+After the independent acceptance report is `PASS`, confirm the maintenance
+process has exited and released its locks. The regular Sunday `09:00
+Europe/Vienna` restart-safe delta and Sunday `22:00` Gold-copy entries remain
+the canonical schedule. If an operator separately disabled either entry,
+restore the original entries exactly; never substitute the full-refresh
+wrapper or install a parallel `xdl-enqueue-weekly` entry.

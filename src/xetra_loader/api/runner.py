@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
+import threading
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 from wsgiref.simple_server import WSGIServer, make_server
 
 from xetra_loader.api.worker import DurableJobWorker
@@ -27,17 +30,31 @@ class MonitoringWSGIServer(WSGIServer):
             raise RuntimeError("durable job worker is unavailable")
 
 
+def _install_sigterm_shutdown(server: WSGIServer) -> object:
+    """Route systemd SIGTERM through WSGI shutdown so the worker can drain."""
+
+    def request_shutdown(_signum: int, _frame: object) -> None:
+        threading.Thread(
+            target=server.shutdown,
+            name="xdl-api-server-shutdown",
+            daemon=True,
+        ).start()
+
+    previous_handler = signal.signal(signal.SIGTERM, request_shutdown)
+    return previous_handler
+
+
 def _run_weekly_sync(job_id: str, cores: int) -> dict[str, JSONValue]:
     """Invoke the one canonical, restart-safe synchronization pipeline."""
 
-    from xetra_loader.pipeline.restart import run_restartable_pipeline
+    from xetra_loader.pipeline.restart import lake_lock_path, run_restartable_pipeline
     from xetra_loader.pipeline.runtime import build_weekly_stages
 
     root = Path(resolve_medallion_root()).resolve()
     _LOGGER.info("weekly_job_pipeline_start id=%s cores=%d", job_id, cores)
     summary = run_restartable_pipeline(
         build_weekly_stages(cores),
-        lock_path=root / "weekly.lock",
+        lock_path=lake_lock_path(root, "weekly.lock"),
         checkpoint_path=root / "weekly.checkpoint.parquet",
     )
     return {
@@ -70,6 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     store = JobStore()
     worker = DurableJobWorker(store, cores=cores, job_runner=_run_weekly_sync)
     server: MonitoringWSGIServer | None = None
+    previous_sigterm_handler: object | None = None
     try:
         worker.start()
         application = create_application(store=store, worker=worker, token=token)
@@ -80,6 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             server_class=MonitoringWSGIServer,
         )
         server.worker = worker
+        previous_sigterm_handler = _install_sigterm_shutdown(server)
         _LOGGER.info(
             "api_started host=%s port=%d cores=%d log=%s",
             arguments.host,
@@ -91,6 +110,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         _LOGGER.info("api_shutdown_requested")
     finally:
+        if previous_sigterm_handler is not None:
+            signal.signal(signal.SIGTERM, cast(signal.Handlers, previous_sigterm_handler))
         if server is not None:
             server.server_close()
         worker.stop()

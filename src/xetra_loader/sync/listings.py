@@ -96,7 +96,7 @@ def prune_stale_listings(
     *,
     serving_schema: str = "xetra_loader",
 ) -> int:
-    """Delete listings absent from Gold after dependent datasets were reconciled."""
+    """Mark listings absent from Gold inactive without deleting their history."""
 
     expected_keys = {row.key for row in gold.rows}
     with connection.transaction(), connection.cursor() as cursor:
@@ -112,8 +112,8 @@ def prune_stale_listings(
         for stale_key in sorted(existing_keys - expected_keys):
             cursor.execute(
                 qualify_serving_sql(
-                    "DELETE FROM xetra_loader.listings "
-                    "WHERE isin = %s AND exchange = %s AND code = %s",
+                    "UPDATE xetra_loader.listings SET is_active = FALSE "
+                    "WHERE isin = %s AND exchange = %s AND code = %s AND is_active",
                     serving_schema,
                 ),
                 stale_key,

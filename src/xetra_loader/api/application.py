@@ -9,6 +9,8 @@ from typing import Protocol, cast
 from urllib.parse import urlsplit
 from wsgiref.types import StartResponse, WSGIApplication, WSGIEnvironment
 
+import psycopg
+
 from xetra_loader.api.routes.health import handle_health
 from xetra_loader.api.routes.http import ApiRequest, ApiResponse
 from xetra_loader.api.routes.jobs import JobRepository, handle_jobs
@@ -24,7 +26,12 @@ class WorkerHealth(Protocol):
 class LoaderApiApplication:
     """Compose health and jobs routes without coupling them to ingestion code."""
 
-    def __init__(self, store: JobRepository, worker: WorkerHealth, token: str) -> None:
+    def __init__(
+        self,
+        store: JobRepository,
+        worker: WorkerHealth,
+        token: str,
+    ) -> None:
         if not token:
             raise ValueError("the API bearer token must not be empty")
         self._store = store
@@ -42,10 +49,18 @@ class LoaderApiApplication:
             response = ApiResponse(413, {"error": "request_too_large"})
         elif request.body == b"__invalid_length__":
             response = ApiResponse(400, {"error": "invalid_content_length"})
+        elif request.method == "GET" and request.path == "/healthz":
+            try:
+                database_ready = self._store.database_ready()
+            except psycopg.Error:
+                database_ready = False
+            response = handle_health(
+                request,
+                worker_alive=self._worker.is_alive,
+                database_ready=database_ready,
+            )
         else:
-            response = handle_health(request, worker_alive=self._worker.is_alive)
-            if response is None:
-                response = handle_jobs(request, store=self._store, token=self._token)
+            response = handle_jobs(request, store=self._store, token=self._token)
         if response is None:
             response = ApiResponse(404, {"error": "not_found"})
         return self._send(start_response, response)

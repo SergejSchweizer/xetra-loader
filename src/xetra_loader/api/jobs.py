@@ -98,6 +98,12 @@ class JobStore:
             ).fetchone()
         return None if row is None else _job_record(row)
 
+    def database_ready(self) -> bool:
+        """Check database readiness with a bounded, read-only probe."""
+
+        with psycopg.connect(self.dsn, connect_timeout=2) as connection:
+            return connection.execute("SELECT 1").fetchone() == (1,)
+
     def notify_worker_shutdown(self) -> None:
         """Wake the LISTEN connection so the API can stop without an idle poll."""
 

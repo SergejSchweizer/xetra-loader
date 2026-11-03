@@ -135,7 +135,7 @@ class _WeeklyState:
     def ingest_listings(self) -> dict[str, JSONValue]:
         batch = self.runtime.fetch_listings()
         self._record_fetch_times("listings", batch.rows, batch.fetched_at_utc)
-        self.listings = build_listing_gold(batch.rows)
+        self.listings = build_listing_gold(batch.rows, cores=self.cores)
         self.runtime.persist_silver(
             "listings",
             self.listings.semantic_rows(),
@@ -216,7 +216,7 @@ class _WeeklyState:
                     len(jobs),
                     self.provider_cores,
                 )
-        self.quotes = build_quote_gold(records)
+        self.quotes = build_quote_gold(records, cores=self.cores)
         self.runtime.persist_silver(
             "eod_quotes",
             [record.semantic_dict() for record in self.quotes.rows],
@@ -294,7 +294,7 @@ class _WeeklyState:
                     len(jobs),
                     self.provider_cores,
                 )
-        self.dividends = build_dividend_gold(records)
+        self.dividends = build_dividend_gold(records, cores=self.cores)
         self.runtime.persist_silver(
             "dividends",
             [_dividend_silver_row(record) for record in records],
@@ -374,7 +374,7 @@ class _WeeklyState:
                     len(jobs),
                     self.provider_cores,
                 )
-        self.splits = build_split_gold(records)
+        self.splits = build_split_gold(records, cores=self.cores)
         self.runtime.persist_silver(
             "splits",
             [_split_silver_row(record) for record in records],
@@ -441,7 +441,7 @@ class _WeeklyState:
         outcome = self._publication_futures["splits"].result()
         self.outcomes["splits"] = outcome
         details = _sync_details(outcome)
-        details["stale_listings_deleted"] = self.runtime.prune_stale_listings(
+        details["stale_listings_deactivated"] = self.runtime.prune_stale_listings(
             self._require_listings()
         )
         executor = self._publication_executor
@@ -548,7 +548,8 @@ class _WeeklyState:
         if "listings" in checkpoint:
             rows, fingerprint, _ = _load_gold_artifact(root, "listings")
             self.listings = build_listing_gold(
-                deserialize_listings(canonical_json(cast(JSONValue, rows)))
+                deserialize_listings(canonical_json(cast(JSONValue, rows))),
+                cores=self.cores,
             )
             _require_checkpoint_fingerprint(
                 "listings", checkpoint, fingerprint, self.listings.semantic_fingerprint
@@ -561,7 +562,7 @@ class _WeeklyState:
     ) -> None:
         if "quotes" in checkpoint:
             rows, fingerprint, _ = _load_gold_artifact(root, "eod_quotes")
-            self.quotes = build_quote_gold(_quotes_from_rows(rows))
+            self.quotes = build_quote_gold(_quotes_from_rows(rows), cores=self.cores)
             _require_checkpoint_fingerprint(
                 "quotes", checkpoint, fingerprint, self.quotes.semantic_fingerprint
             )
@@ -728,7 +729,6 @@ def build_weekly_stages(cores: int | None = None) -> PipelineStages:
     worker_count = resolve_cores(cores)
     state = _WeeklyState(
         PostgresEodhdBootstrapRuntime.from_environment(
-            quarantine_invalid_ohlc=True,
             cores=worker_count,
         ),
         cores=worker_count,

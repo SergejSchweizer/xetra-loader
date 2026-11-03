@@ -7,9 +7,11 @@ Wants=network-online.target
 Type=simple
 User=dev_xetra
 WorkingDirectory=/home/dev_xetra/xetra-loader
-ExecStart=/home/dev_xetra/xetra-loader/.venv/bin/xdl-api --host 127.0.0.1 --port 8765 --cores 6
+Environment=PYTHONPATH=/home/dev_xetra/xetra-loader/src
+ExecStart=/home/dev_xetra/xetra-loader/.venv/bin/python -m xetra_loader.api.runner --host 127.0.0.1 --port 8765 --cores 6
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=6h
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/home/dev_xetra/xetra-loader/lake /home/dev_xetra/xetra-loader/.logs

@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from xetra_loader.ops.acceptance import LoaderAcceptanceReport, read_scheduler_contract
+from xetra_loader.pipeline.restart import lake_lock_path
 
 CRON_PATH = Path("deploy/cron/xetra-loader.cron")
 
@@ -34,6 +35,20 @@ def test_cron_wrappers_log_and_prune_only_their_own_run_logs() -> None:
         assert 'log_path="$repo_root/.logs/' in source
         assert 'exec >>"$log_path" 2>&1' in source
         assert f"-name '{pattern}' -mtime +90 -delete" in source
+
+    assert 'lock_dir="$repo_root/.logs/lake-locks/$lake_key"' in gold_copy
+    assert '"$lock_dir/authoritative-rewrite.lock"' in gold_copy
+    assert "lake/authoritative-rewrite.lock" not in gold_copy
+
+    service = Path("deploy/systemd/xetra-loader-api.service").read_text(encoding="utf-8")
+    writable_paths = next(
+        line for line in service.splitlines() if line.startswith("ReadWritePaths=")
+    )
+    assert "/home/dev_xetra/xetra-loader/.logs" in writable_paths
+    assert "TimeoutStopSec=6h" in service
+    assert "-m xetra_loader.api.runner" in service
+    api_lock = lake_lock_path(Path("/home/dev_xetra/xetra-loader/lake"), "weekly.lock")
+    assert api_lock.is_relative_to(Path("/home/dev_xetra/xetra-loader/.logs"))
 
 
 def test_vienna_0900_remains_local_0900_across_dst() -> None:

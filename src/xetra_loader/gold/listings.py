@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from xetra_loader.config import resolve_cores
 from xetra_loader.contracts.listings import ListingRecord
+from xetra_loader.gold._fingerprint import semantic_fingerprint
+from xetra_loader.gold._ordering import order_records
 
 type JSONValue = str | int | float | bool | None | list[JSONValue] | dict[str, JSONValue]
 
@@ -24,10 +25,13 @@ class ListingGoldResult:
         return tuple(row.semantic_dict() for row in self.rows)
 
 
-def build_listing_gold(records: Iterable[ListingRecord]) -> ListingGoldResult:
+def build_listing_gold(
+    records: Iterable[ListingRecord], *, cores: int | None = None
+) -> ListingGoldResult:
     """Validate the serving key and produce deterministic Gold metadata."""
 
-    ordered = tuple(sorted(records, key=lambda record: record.key))
+    worker_count = resolve_cores(cores)
+    ordered = order_records(records, lambda record: record.key, cores=worker_count)
     seen: set[tuple[str, str, str]] = set()
     for record in ordered:
         if not record.isin.strip() or not record.exchange.strip() or not record.code.strip():
@@ -36,15 +40,14 @@ def build_listing_gold(records: Iterable[ListingRecord]) -> ListingGoldResult:
             raise ValueError(f"duplicate Gold listing key: {record.key}")
         seen.add(record.key)
 
-    semantic_rows = [record.semantic_dict() for record in ordered]
-    encoded = json.dumps(
-        semantic_rows,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
     return ListingGoldResult(
         rows=ordered,
         row_count=len(ordered),
-        semantic_fingerprint=hashlib.sha256(encoded).hexdigest(),
+        semantic_fingerprint=semantic_fingerprint(
+            ordered, _semantic_row, cores=worker_count
+        ),
     )
+
+
+def _semantic_row(record: ListingRecord) -> dict[str, JSONValue]:
+    return record.semantic_dict()

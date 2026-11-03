@@ -711,9 +711,19 @@ BEGIN
         RAISE EXCEPTION 'xetra_loader.compute_cores must be between 1 and 64';
     END IF;
     PERFORM set_config('work_mem', xetra_loader.resolve_feature_work_mem(), true);
-    PERFORM set_config(
-        'temp_file_limit', xetra_loader.resolve_feature_temp_file_limit(), true
-    );
+    IF current_setting('server_version_num')::integer >= 150000 THEN
+        -- PostgreSQL 15+ allows parameter-level SET grants to the definer role.
+        PERFORM set_config(
+            'temp_file_limit', xetra_loader.resolve_feature_temp_file_limit(), true
+        );
+    ELSIF pg_size_bytes(current_setting('temp_file_limit')) <
+          pg_size_bytes(xetra_loader.resolve_feature_temp_file_limit()) THEN
+        -- On PostgreSQL 14 temp_file_limit is superuser-only. The migration
+        -- applies the configured cap to the dedicated writer role at login;
+        -- verify that cap here instead of trying to SET it as the definer.
+        RAISE EXCEPTION
+            'PostgreSQL 14 writer temp_file_limit is below the configured feature cap';
+    END IF;
     -- PostgreSQL's parallel workers plus the participating leader stay within
     -- the configured process-wide CPU budget.
     PERFORM set_config(

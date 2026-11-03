@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import xetra_loader.ops.verify_postgres_sync as verifier
+from xetra_loader.ops.backup_cli import main as verify_backup_main
 
 
 def test_full_sync_backup_retention_keeps_four_newest_owned_directories(
@@ -70,6 +72,44 @@ def test_full_sync_backup_retention_rejects_a_symlink_root(tmp_path: Path) -> No
         assert "symbolic link" in str(exc)
     else:
         raise AssertionError("a symlink backup root must not be pruned")
+
+
+def test_backup_writer_enforces_private_modes_and_checksum_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backup_root = tmp_path / "backups"
+    backup_root.mkdir(mode=0o777)
+    backup_root.chmod(0o777)
+    lake = tmp_path / "lake"
+    lake.mkdir()
+    monkeypatch.setattr(verifier, "_existing_owned_schemas", lambda: ())
+
+    verifier._require_private_backup_root(backup_root)
+    verifier._backup_owned_state(lake, backup_root)
+
+    backup_directory = next(backup_root.glob("xetra-loader-*"))
+    assert stat.S_IMODE(backup_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup_directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE((backup_directory / "checksums.json").stat().st_mode) == 0o600
+    assert verifier.verify_backup_checksums(backup_directory) == 1
+    assert verify_backup_main([str(backup_directory)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"status": "PASS", "verified_files": 1}
+
+    backup_file = backup_directory / "empty-postgres-state.json"
+    backup_file.chmod(0o644)
+    with pytest.raises(verifier.ProductionVerificationError, match="permissions"):
+        verifier.verify_backup_checksums(backup_directory)
+    backup_file.chmod(0o600)
+    backup_file.write_text("tampered", encoding="utf-8")
+    with pytest.raises(verifier.ProductionVerificationError, match="checksum"):
+        verifier.verify_backup_checksums(backup_directory)
+    assert verify_backup_main([str(backup_directory)]) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "FAIL",
+        "error": "backup_verification_failed",
+    }
 
 
 def test_weekly_checkpoint_archives_are_moved_by_full_sync_helper(tmp_path: Path) -> None:

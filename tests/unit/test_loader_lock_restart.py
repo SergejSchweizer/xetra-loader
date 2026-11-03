@@ -13,6 +13,7 @@ from xetra_loader.pipeline.restart import (
     LoaderLock,
     _migrate_aborted_checkpoint_archives,
     _read_checkpoint,
+    lake_lock_path,
     run_restartable_pipeline,
 )
 from xetra_loader.sync.core import JSONValue
@@ -115,7 +116,7 @@ def test_second_concurrent_run_is_denied_and_lock_releases(tmp_path: Path) -> No
 
 
 def test_authoritative_rewrite_lock_blocks_weekly_pipeline(tmp_path: Path) -> None:
-    authoritative_lock = tmp_path / "authoritative-rewrite.lock"
+    authoritative_lock = lake_lock_path(tmp_path, "authoritative-rewrite.lock")
     with LoaderLock(authoritative_lock):
         with pytest.raises(ConcurrentLoaderRunError):
             run_restartable_pipeline(
@@ -126,7 +127,7 @@ def test_authoritative_rewrite_lock_blocks_weekly_pipeline(tmp_path: Path) -> No
 
 
 def test_nested_full_refresh_replay_reuses_authoritative_lock(tmp_path: Path) -> None:
-    authoritative_lock = tmp_path / "authoritative-rewrite.lock"
+    authoritative_lock = lake_lock_path(tmp_path, "authoritative-rewrite.lock")
     with LoaderLock(authoritative_lock):
         summary = run_restartable_pipeline(
             _stages(Counter(), set()),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -45,6 +46,16 @@ _STAGE_NAMES = (
     "postgres_splits_sync",
     "verification",
 )
+
+
+def lake_lock_path(lake_root: Path, name: str) -> Path:
+    """Return a stable coordination path outside the Parquet lake tree."""
+
+    if name not in {"weekly.lock", "authoritative-rewrite.lock"}:
+        raise ValueError(f"unsupported lake lock name: {name}")
+    root = lake_root.resolve()
+    root_key = hashlib.sha256(os.fsencode(root)).hexdigest()[:24]
+    return root.parent / ".logs" / "lake-locks" / root_key / name
 
 
 class ConcurrentLoaderRunError(RuntimeError):
@@ -108,9 +119,12 @@ def run_restartable_pipeline(
     retain that outer lock while this function acquires the weekly lock.
     """
 
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     with ExitStack() as locks:
         if not authoritative_lock_held:
-            locks.enter_context(LoaderLock(lock_path.parent / "authoritative-rewrite.lock"))
+            locks.enter_context(
+                LoaderLock(lake_lock_path(checkpoint_path.parent, "authoritative-rewrite.lock"))
+            )
         locks.enter_context(LoaderLock(lock_path))
         migrated_manifests = migrate_json_manifests(checkpoint_path.parent)
         if migrated_manifests:
