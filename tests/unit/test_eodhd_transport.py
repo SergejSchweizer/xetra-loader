@@ -83,6 +83,27 @@ def test_network_retries_are_bounded() -> None:
     assert sleeps == [0.1, 0.2]
 
 
+def test_default_policy_recovers_from_several_transient_network_failures() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def opener(request: Request, timeout: float) -> FakeResponse:
+        nonlocal attempts
+        del request, timeout
+        attempts += 1
+        if attempts < 6:
+            raise URLError("temporary connection failure")
+        return FakeResponse(b"[]")
+
+    transport = EodhdTransport(
+        TransportConfig(token="secret", opener=opener, sleeper=sleeps.append)
+    )
+
+    assert transport.get_json("div/AAA.XETRA") == []
+    assert attempts == 6
+    assert sleeps == [0.25, 0.5, 1.0, 2.0, 4.0]
+
+
 @pytest.mark.parametrize(
     ("failure", "expected"),
     (
