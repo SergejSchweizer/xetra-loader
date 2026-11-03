@@ -34,9 +34,9 @@ type Sleeper = Callable[[float], None]
 class RetryPolicy:
     """Bounded exponential retry policy."""
 
-    max_attempts: int = 6
+    max_attempts: int = 10
     base_delay_seconds: float = 0.25
-    max_delay_seconds: float = 4.0
+    max_delay_seconds: float = 8.0
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:

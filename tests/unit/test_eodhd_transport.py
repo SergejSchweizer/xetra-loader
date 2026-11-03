@@ -83,7 +83,7 @@ def test_network_retries_are_bounded() -> None:
     assert sleeps == [0.1, 0.2]
 
 
-def test_default_policy_recovers_from_several_transient_network_failures() -> None:
+def test_default_policy_recovers_from_repeated_transient_network_failures() -> None:
     attempts = 0
     sleeps: list[float] = []
 
@@ -91,7 +91,7 @@ def test_default_policy_recovers_from_several_transient_network_failures() -> No
         nonlocal attempts
         del request, timeout
         attempts += 1
-        if attempts < 6:
+        if attempts < 10:
             raise URLError("temporary connection failure")
         return FakeResponse(b"[]")
 
@@ -100,8 +100,8 @@ def test_default_policy_recovers_from_several_transient_network_failures() -> No
     )
 
     assert transport.get_json("div/AAA.XETRA") == []
-    assert attempts == 6
-    assert sleeps == [0.25, 0.5, 1.0, 2.0, 4.0]
+    assert attempts == 10
+    assert sleeps == [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0]
 
 
 @pytest.mark.parametrize(
