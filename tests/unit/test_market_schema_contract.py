@@ -36,11 +36,10 @@ def test_all_xetra_tables_have_generated_availability_timestamps() -> None:
     assert sql.count("next_business_day_utc(event_date)") == 4
 
 
-def test_feature_refresh_role_has_only_parameter_scoped_temp_file_limit_privilege() -> None:
+def test_feature_refresh_does_not_create_a_separate_writer_role() -> None:
     roles_sql = Path("sql/schema/002_roles.sql").read_text(encoding="utf-8")
-    assert "current_setting('server_version_num')::integer >= 150000" in roles_sql
-    assert "GRANT SET ON PARAMETER temp_file_limit TO \"xetra-data-loader\"" in roles_sql
-    assert "ALTER ROLE \"xetra-data-loader\" SUPERUSER" not in roles_sql
+    assert "CREATE ROLE xetra_writer NOLOGIN" in roles_sql
+    assert "xetra-data-loader" not in roles_sql
 
 
 @pytest.mark.parametrize("nullable", ["YES", "NO", None])

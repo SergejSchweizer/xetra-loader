@@ -32,12 +32,12 @@ def promotion_connection() -> Iterator[psycopg.Connection[Any]]:
     try:
         _drop_owned_schemas(connection)
         reader_exists = connection.execute(
-            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'xetra_loader')"
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'xetra_reader')"
         ).fetchone()
         if reader_exists is None:
             raise RuntimeError("could not inspect test reader role")
         if not reader_exists[0]:
-            connection.execute('CREATE ROLE "xetra_loader" NOLOGIN')
+            connection.execute('CREATE ROLE xetra_reader NOLOGIN')
             created_reader_role = True
         connection.commit()
         yield connection
@@ -45,7 +45,7 @@ def promotion_connection() -> Iterator[psycopg.Connection[Any]]:
         connection.rollback()
         _drop_owned_schemas(connection)
         if created_reader_role:
-            connection.execute('DROP ROLE IF EXISTS "xetra_loader"')
+            connection.execute('DROP ROLE IF EXISTS xetra_reader')
         connection.commit()
         connection.close()
 

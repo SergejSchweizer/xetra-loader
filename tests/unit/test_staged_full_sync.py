@@ -62,7 +62,7 @@ def test_staging_sql_retargets_schemas_without_renaming_loader_role() -> None:
         "CREATE SCHEMA IF NOT EXISTS xetra_loader; "
         "CREATE TABLE xetra_loader.eod_quotes (id int); "
         "CREATE TABLE xetra_loader_sync.sync_state (id int); "
-        "GRANT USAGE ON SCHEMA xetra_loader TO \"xetra-data-loader\";"
+        "GRANT USAGE ON SCHEMA xetra_loader TO xetra_writer;"
     )
 
     staged = _rewrite_staging_schema_names(source)
@@ -70,7 +70,7 @@ def test_staging_sql_retargets_schemas_without_renaming_loader_role() -> None:
     assert "CREATE SCHEMA IF NOT EXISTS xetra_loader_build" in staged
     assert "xetra_loader_build.eod_quotes" in staged
     assert "xetra_loader_sync_build.sync_state" in staged
-    assert 'TO "xetra-data-loader"' in staged
+    assert "TO xetra_writer" in staged
     assert "xetra_loader.eod_quotes" not in staged
 
 

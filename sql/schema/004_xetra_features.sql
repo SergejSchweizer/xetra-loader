@@ -663,33 +663,33 @@ DROP MATERIALIZED VIEW IF EXISTS xetra_loader.xetra_features;
 ALTER MATERIALIZED VIEW xetra_loader.xetra_features_build RENAME TO xetra_features;
 ALTER INDEX xetra_loader.xetra_features_build_identity_idx RENAME TO xetra_features_identity_idx;
 
-ALTER MATERIALIZED VIEW xetra_loader.xetra_features OWNER TO "xetra-data-loader";
+ALTER MATERIALIZED VIEW xetra_loader.xetra_features OWNER TO xetra_writer;
 
 ALTER FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], integer)
-    OWNER TO "xetra-data-loader";
+    OWNER TO xetra_writer;
 REVOKE ALL ON FUNCTION xetra_loader.wilder_rsi(double precision[], double precision[], integer) FROM PUBLIC;
 
 ALTER FUNCTION xetra_loader.exponential_moving_average(double precision[], integer, boolean)
-    OWNER TO "xetra-data-loader";
+    OWNER TO xetra_writer;
 REVOKE ALL ON FUNCTION xetra_loader.exponential_moving_average(double precision[], integer, boolean) FROM PUBLIC;
 
 ALTER FUNCTION xetra_loader.subtract_feature_arrays(double precision[], double precision[])
-    OWNER TO "xetra-data-loader";
+    OWNER TO xetra_writer;
 REVOKE ALL ON FUNCTION xetra_loader.subtract_feature_arrays(double precision[], double precision[]) FROM PUBLIC;
 
 ALTER FUNCTION xetra_loader.resolve_feature_work_mem()
-    OWNER TO "xetra-data-loader";
+    OWNER TO xetra_writer;
 REVOKE ALL ON FUNCTION xetra_loader.resolve_feature_work_mem() FROM PUBLIC;
 
 ALTER FUNCTION xetra_loader.resolve_feature_temp_file_limit()
-    OWNER TO "xetra-data-loader";
+    OWNER TO xetra_writer;
 REVOKE ALL ON FUNCTION xetra_loader.resolve_feature_temp_file_limit() FROM PUBLIC;
 
 COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
     'XETRA feature view; catalog version=4; base levels=adjusted_close_level,volume_level';
 
 REVOKE ALL ON xetra_loader.xetra_features FROM PUBLIC;
-GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app;
+GRANT SELECT ON xetra_loader.xetra_features TO portfell_app;
 
 CREATE OR REPLACE FUNCTION xetra_loader.refresh_xetra_features()
 RETURNS void
@@ -738,8 +738,8 @@ BEGIN
 END
 $$;
 
-ALTER FUNCTION xetra_loader.refresh_xetra_features() OWNER TO "xetra-data-loader";
+ALTER FUNCTION xetra_loader.refresh_xetra_features() OWNER TO xetra_writer;
 REVOKE ALL ON FUNCTION xetra_loader.refresh_xetra_features() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION xetra_loader.refresh_xetra_features() TO "xetra-data-loader";
+GRANT EXECUTE ON FUNCTION xetra_loader.refresh_xetra_features() TO xetra_writer;
 
 COMMIT;

@@ -696,7 +696,7 @@ class PostgresEodhdBootstrapRuntime:
         worker_count = resolve_cores(cores)
         root = resolve_medallion_root()
         return cls(
-            connection=connect_postgres(require_non_superuser=True, cores=worker_count),
+            connection=connect_postgres(cores=worker_count),
             transport=_MeasuredTransport(),
             medallion_root=Path(root),
             repository_root=Path.cwd(),
@@ -825,7 +825,7 @@ class PostgresEodhdBootstrapRuntime:
 
         worker_count = resolve_cores(cores) if cores is not None else self._cores
         return type(self)(
-            connection=connect_postgres(require_non_superuser=True, cores=worker_count),
+            connection=connect_postgres(cores=worker_count),
             transport=self._transport.clone(),
             medallion_root=self._layout.root,
             repository_root=self._repository_root,

@@ -80,7 +80,7 @@ def test_feature_schema_catalog_grants_and_types(tmp_path: Path) -> None:
         "has_table_privilege('portfell_app', 'xetra_loader.xetra_features', 'INSERT'), "
         "has_table_privilege('portfell_app', 'xetra_loader.xetra_features', 'UPDATE'), "
         "has_table_privilege('portfell_app', 'xetra_loader.xetra_features', 'DELETE'), "
-        "has_schema_privilege('xetra_data_loader_writer', 'xetra_loader', 'CREATE')",
+        "has_schema_privilege('portfell_app', 'xetra_loader', 'CREATE')",
     )
 
     actual_names = tuple(column.split(":", 1)[0] for column in columns)

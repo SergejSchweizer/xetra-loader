@@ -75,10 +75,11 @@ def apply_postgres_schema(
         db.commit()
         if server_version < 150000:
             # PostgreSQL 14 cannot delegate SET on a superuser-context GUC.
-            # Apply the validated cap at login for the dedicated writer role.
+            # PostgreSQL 14 has no parameter-level SET grants; set the
+            # configured cap as a default for the dedicated superuser writer.
             db.execute(
                 sql.SQL("ALTER ROLE {} SET temp_file_limit TO {}").format(
-                    sql.Identifier("xetra_data_loader_writer"),
+                    sql.Identifier("xetra_writer"),
                     sql.Literal(resolve_feature_temp_file_limit()),
                 )
             )

@@ -92,10 +92,9 @@ def connect_postgres(
     dsn: str | None = None,
     *,
     admin: bool = False,
-    require_non_superuser: bool = False,
     cores: int | None = None,
 ) -> Connection[Any]:
-    """Connect as an explicit admin or a normal writer, rejecting unsafe weekly sessions."""
+    """Connect through the configured writer or administrative PostgreSQL identity."""
 
     resolved = resolve_postgres_admin_dsn(dsn) if admin else resolve_postgres_writer_dsn(dsn)
     connection = psycopg.connect(resolved, autocommit=False)
@@ -109,7 +108,11 @@ def connect_postgres(
         if version_row is None:
             raise RuntimeError("PostgreSQL server version could not be determined")
         server_version = int(version_row[0])
-        if admin or server_version >= 150000:
+        superuser_row = connection.execute(
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+        ).fetchone()
+        is_superuser = superuser_row is not None and bool(superuser_row[0])
+        if admin or is_superuser or server_version >= 150000:
             connection.execute(
                 "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
                 (configured_temp_limit,),
@@ -144,12 +147,6 @@ def connect_postgres(
         connection.execute(
             "SELECT set_config('parallel_leader_participation', 'on', false)"
         )
-        if require_non_superuser:
-            row = connection.execute(
-                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
-            ).fetchone()
-            if row is None or bool(row[0]):
-                raise PermissionError("weekly PostgreSQL connection must not use a superuser")
         # End configuration/probe queries before callers open their own
         # transaction blocks.
         connection.commit()

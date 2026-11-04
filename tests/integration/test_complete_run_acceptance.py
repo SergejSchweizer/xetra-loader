@@ -353,7 +353,7 @@ def test_complete_gold_postgres_feature_acceptance(tmp_path: Path) -> None:
         privileges = connection.execute(
             "SELECT has_table_privilege('portfell_app', 'xetra_loader.xetra_features', 'SELECT'), "
             "has_table_privilege('portfell_app', 'xetra_loader.xetra_features', 'INSERT'), "
-            "has_table_privilege('xetra-data-loader', 'xetra_loader.xetra_features', 'SELECT')"
+            "has_table_privilege('xetra_writer', 'xetra_loader.xetra_features', 'SELECT')"
         ).fetchone()
         cron_timezone, cron_expression = read_scheduler_contract()
         restart = run_restartable_pipeline(
