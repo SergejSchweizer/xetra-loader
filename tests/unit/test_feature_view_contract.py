@@ -11,11 +11,11 @@ from xetra_loader.features.catalog import (
 VIEW_SQL = Path("sql/schema/004_xetra_features.sql").read_text(encoding="utf-8")
 
 
-def test_catalog_matches_the_fixed_105_column_view_contract() -> None:
+def test_catalog_matches_the_fixed_113_column_view_contract() -> None:
     identity_and_availability = ("isin", "exchange", "code", "trade_date", "available_at_utc")
     assert len(BASE_LEVEL_COLUMNS) == 2
-    assert len(FEATURE_SPECS) == 98
-    assert len(identity_and_availability + feature_columns()) == 105
+    assert len(FEATURE_SPECS) == 106
+    assert len(identity_and_availability + feature_columns()) == 113
 
 
 def test_feature_view_is_materialized_and_has_all_catalog_columns() -> None:
@@ -25,7 +25,7 @@ def test_feature_view_is_materialized_and_has_all_catalog_columns() -> None:
         assert column in VIEW_SQL
 
 
-def test_final_sql_projection_exactly_matches_the_105_column_catalog() -> None:
+def test_final_sql_projection_exactly_matches_the_113_column_catalog() -> None:
     build_start = VIEW_SQL.index("CREATE MATERIALIZED VIEW xetra_loader.xetra_features_build AS")
     select_start = VIEW_SQL.index("\nSELECT\n", build_start) + len("\nSELECT\n")
     projection_end = VIEW_SQL.index("\nFROM normalized AS r", select_start)
@@ -65,8 +65,8 @@ def test_final_sql_projection_exactly_matches_the_105_column_catalog() -> None:
         "available_at_utc",
         *feature_columns(),
     )
-    assert len(names) == 105
-    assert len(set(names)) == 105
+    assert len(names) == 113
+    assert len(set(names)) == 113
     assert set(names) == set(expected)
 
 
@@ -83,6 +83,7 @@ def test_available_at_utc_is_projected_from_the_raw_quote_table() -> None:
 
 def test_feature_view_has_identity_index_and_runtime_refresh_function() -> None:
     assert "CREATE UNIQUE INDEX xetra_features_build_identity_idx" in VIEW_SQL
+    assert "ON xetra_loader.xetra_features_build (isin, exchange, code, trade_date)" in VIEW_SQL
     assert "RENAME TO xetra_features_identity_idx" in VIEW_SQL
     assert "CREATE OR REPLACE FUNCTION xetra_loader.refresh_xetra_features()" in VIEW_SQL
     assert (

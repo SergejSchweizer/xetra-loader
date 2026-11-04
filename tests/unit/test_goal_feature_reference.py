@@ -33,9 +33,15 @@ def test_goal_feature_families_and_warmup_windows() -> None:
     assert selected["rolling_volatility_96"] is not None
     assert selected["volatility_zscore_96"] is not None
     assert selected["level_zscore_96"] is not None
-    assert selected["momentum_autocorr_lag1_window96"] is not None
-    assert selected["momentum_autocorr_lag4_window96"] is not None
-    assert selected["momentum_autocorr_lag8_window192"] is not None
+    assert selected["return_autocorr_lag1_window96"] is not None
+    assert selected["return_autocorr_lag4_window96"] is not None
+    assert selected["return_autocorr_lag8_window192"] is not None
+    assert selected["momentum_autocorr_delta_lag1_window60"] is not None
+    assert selected["momentum_autocorr_delta_lag5_window60"] is not None
+    assert selected["momentum_autocorr_delta_lag20_window120"] is not None
+    assert selected["adjusted_close_log_level"] is not None
+    assert selected["adjusted_close_absolute_delta_20obs"] is not None
+    assert selected["level_zscore_60"] is not None
     assert selected["rolling_drawdown_96"] is not None
     assert selected["log_tick_volume"] is not None
 

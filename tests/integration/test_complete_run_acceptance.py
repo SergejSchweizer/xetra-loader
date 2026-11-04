@@ -393,7 +393,7 @@ def test_complete_gold_postgres_feature_acceptance(tmp_path: Path) -> None:
             "feature_identity_matches_quotes": set(before_replay)
             == {(row.code, row.trade_date) for row in fixture},
             "feature_columns_are_catalog_exact": (
-                len(columns) == 105
+                len(columns) == 113
                 and set(columns)
                 == {
                     "isin",

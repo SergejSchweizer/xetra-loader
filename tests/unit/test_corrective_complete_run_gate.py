@@ -12,8 +12,8 @@ def test_corrective_complete_run_contract_is_closed() -> None:
         "isin", "exchange", "code", "trade_date", "available_at_utc", *feature_columns()
     )
 
-    assert len(feature_columns()) == 100
-    assert len(columns) == 105
+    assert len(feature_columns()) == 108
+    assert len(columns) == 113
     assert "average_correlation" not in sql
     for forbidden in ("open_level", "high_level", "low_level", "close_level"):
         assert re.search(rf"(?<![a-z_]){forbidden}(?![a-z_])", sql) is None

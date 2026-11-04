@@ -85,6 +85,10 @@ def reference_features(  # noqa: C901, PLR0912, PLR0915 -- one independent oracl
         adjusted = [row.adjusted_close for row in quotes]
         volumes = [float(row.volume) for row in quotes]
         log_returns = [_lagged_log_return(adjusted, index, 1) for index in range(len(quotes))]
+        deltas = [
+            None if index == 0 else adjusted[index] - adjusted[index - 1]
+            for index in range(len(quotes))
+        ]
         range_values = [
             (quote.high - quote.low) / quote.close if quote.close > 0 else None
             for quote in quotes
@@ -333,9 +337,30 @@ def reference_features(  # noqa: C901, PLR0912, PLR0915 -- one independent oracl
                 if level_mean is None or level_std in (None, 0.0)
                 else (adjusted[index] - level_mean) / level_std
             )
+            level_window_60 = _window(adjusted, index, 60)
+            level_mean_60 = _mean(level_window_60)
+            level_std_60 = _population_std(level_window_60)
+            features["level_zscore_60"] = (
+                None
+                if level_mean_60 is None or level_std_60 in (None, 0.0)
+                else (adjusted[index] - level_mean_60) / level_std_60
+            )
+            features["adjusted_close_log_level"] = (
+                math.log(adjusted[index]) if adjusted[index] > 0 else None
+            )
+            for window in (1, 5, 20):
+                previous = _lagged(adjusted, index, window)
+                features[f"adjusted_close_absolute_delta_{window}obs"] = (
+                    None if previous is None else adjusted[index] - previous
+                )
             for lag, window in ((1, 96), (4, 96), (8, 192)):
-                features[f"momentum_autocorr_lag{lag}_window{window}"] = (
+                features[f"return_autocorr_lag{lag}_window{window}"] = (
                     _rolling_autocorrelation(log_returns, index, lag, window)
+                )
+            for lag, window in ((1, 60), (5, 60), (20, 120)):
+                correlation = _rolling_autocorrelation(deltas, index, lag, window)
+                features[f"momentum_autocorr_delta_lag{lag}_window{window}"] = (
+                    None if correlation is None else max(0.0, correlation)
                 )
             for window in (32, 96):
                 prices = _window(adjusted, index, window)
@@ -484,6 +509,12 @@ def _rolling_autocorrelation(
         return statistics.correlation(left_values, right_values)
     except statistics.StatisticsError:
         return None
+
+
+def _population_std(values: list[float] | None) -> float | None:
+    if values is None:
+        return None
+    return statistics.pstdev(values)
 
 
 def _wilder_rsi(values: list[float | None], index: int, period: int) -> float | None:

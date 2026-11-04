@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Final
 
-FEATURE_CATALOG_VERSION: Final[int] = 4
+FEATURE_CATALOG_VERSION: Final[int] = 5
 BASE_LEVEL_COLUMNS: Final[tuple[str, ...]] = (
     "adjusted_close_level",
     "volume_level",
@@ -92,6 +92,23 @@ def _series_specs(
 
 
 FEATURE_SPECS: Final[tuple[FeatureSpec, ...]] = (
+    FeatureSpec(
+        name="adjusted_close_log_level",
+        source_columns=("adjusted_close_level",),
+        windows=(1,),
+        formula="ln(adjusted_close_level) when adjusted_close_level > 0",
+        count_domain=ObservationCountDomain.VALID_PRICE_LEVELS,
+        minimum_count=1,
+    ),
+    *_series_specs(
+        "adjusted_close_absolute_delta",
+        (1, 5, 20),
+        "adjusted_close_level[t] - adjusted_close_level[t-n]",
+        SeriesSpecOptions(
+            count_domain=ObservationCountDomain.VALID_PRICE_LEVELS,
+            minimum_count=lambda window: window + 1,
+        ),
+    ),
     *_series_specs(
         "adjusted_close_log_return",
         (1, 3, 5, 10, 20),
@@ -501,7 +518,15 @@ FEATURE_SPECS: Final[tuple[FeatureSpec, ...]] = (
         minimum_count=96,
     ),
     FeatureSpec(
-        name="momentum_autocorr_lag1_window96",
+        name="level_zscore_60",
+        source_columns=("adjusted_close_level",),
+        windows=(60,),
+        formula="(adjusted_close_level - trailing_mean_60) / trailing_population_std_60",
+        count_domain=ObservationCountDomain.VALID_PRICE_LEVELS,
+        minimum_count=60,
+    ),
+    FeatureSpec(
+        name="return_autocorr_lag1_window96",
         source_columns=("adjusted_close_level",),
         windows=("lag=1/window=96",),
         formula="Pearson correlation(log_return_1, lag(log_return_1, 1)) over 96 pairs",
@@ -509,7 +534,7 @@ FEATURE_SPECS: Final[tuple[FeatureSpec, ...]] = (
         minimum_count=99,
     ),
     FeatureSpec(
-        name="momentum_autocorr_lag4_window96",
+        name="return_autocorr_lag4_window96",
         source_columns=("adjusted_close_level",),
         windows=("lag=4/window=96",),
         formula="Pearson correlation(log_return_1, lag(log_return_1, 4)) over 96 pairs",
@@ -517,12 +542,36 @@ FEATURE_SPECS: Final[tuple[FeatureSpec, ...]] = (
         minimum_count=102,
     ),
     FeatureSpec(
-        name="momentum_autocorr_lag8_window192",
+        name="return_autocorr_lag8_window192",
         source_columns=("adjusted_close_level",),
         windows=("lag=8/window=192",),
         formula="Pearson correlation(log_return_1, lag(log_return_1, 8)) over 192 pairs",
         count_domain=ObservationCountDomain.VALID_PRICE_LEVELS,
         minimum_count=202,
+    ),
+    FeatureSpec(
+        name="momentum_autocorr_delta_lag1_window60",
+        source_columns=("adjusted_close_level",),
+        windows=("lag=1/window=60",),
+        formula="max(0, corr(delta_1, lag(delta_1, 1)) over 60 valid pairs)",
+        count_domain=ObservationCountDomain.VALID_PRICE_LEVELS,
+        minimum_count=62,
+    ),
+    FeatureSpec(
+        name="momentum_autocorr_delta_lag5_window60",
+        source_columns=("adjusted_close_level",),
+        windows=("lag=5/window=60",),
+        formula="max(0, corr(delta_1, lag(delta_1, 5)) over 60 valid pairs)",
+        count_domain=ObservationCountDomain.VALID_PRICE_LEVELS,
+        minimum_count=66,
+    ),
+    FeatureSpec(
+        name="momentum_autocorr_delta_lag20_window120",
+        source_columns=("adjusted_close_level",),
+        windows=("lag=20/window=120",),
+        formula="max(0, corr(delta_1, lag(delta_1, 20)) over 120 valid pairs)",
+        count_domain=ObservationCountDomain.VALID_PRICE_LEVELS,
+        minimum_count=141,
     ),
     *_series_specs(
         "rolling_drawdown",

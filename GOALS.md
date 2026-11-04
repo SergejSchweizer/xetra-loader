@@ -289,8 +289,8 @@ The executable feature contract is versioned in
 `src/xetra_loader/features/catalog.py`; SQL implementation is in
 `sql/schema/004_xetra_features.sql`; independent semantic/reference checks are
 under `tests/qa/` and `tests/integration/`. Keep these implementations in exact
-agreement. Current contract: 98 derived columns plus two levels, five row
-identity/date columns including `available_at_utc`, for **105 columns total**.
+agreement. Current contract: 106 derived columns plus two levels, five row
+identity/date columns including `available_at_utc`, for **113 columns total**.
 
 Only exposed levels are `adjusted_close_level` and `volume_level`. Never expose
 `open_level`, `high_level`, `low_level`, or `close_level`. Raw OHLC may feed only
@@ -528,8 +528,8 @@ A rebuild or material change is complete only when applicable items pass:
 - [ ] PostgreSQL integration tests prove DDL, FKs, constraints, generated
   `available_at_utc` (including Friday/Saturday-to-Monday), privileges,
   idempotent delta, historical correction, rollback, and exact view schema.
-- [ ] The view has exactly 105 columns: four identity fields, availability,
-  two levels, 98 catalogued derived columns; no forbidden OHLC levels or
+- [ ] The view has exactly 113 columns: four identity fields, availability,
+  two levels, 106 catalogued derived columns; no forbidden OHLC levels or
   average-correlation columns.
 - [ ] Feature output matches independent calculations, is causal, has expected
   NULL behavior, and refreshes after raw quote mutations in the same
