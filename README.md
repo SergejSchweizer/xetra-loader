@@ -201,9 +201,9 @@ It is invoked Sunday at 09:00 Europe/Vienna by `deploy/cron/xetra-loader.cron`.
 
 ## Feature catalog
 
-Catalog version **4** defines **98 derived features** from two exposed base
-levels. The materialized view therefore has 105 columns: four row-identity
-columns, `available_at_utc`, the two levels, and the 98 derived values.
+Catalog version **5** defines **106 derived features** from two exposed base
+levels. The materialized view therefore has 113 columns: four row-identity
+columns, `available_at_utc`, the two levels, and the 106 derived values.
 `available_at_utc` is midnight UTC on the next Monday–Friday after `trade_date`
 (Friday advances to Monday); this weekday rule does not account for exchange
 holidays. The executable catalog is
@@ -258,9 +258,11 @@ average.
 | `donchian_breakout_down` | Boolean: current low is below the minimum low of the **prior** 20 observations. |
 | `volatility_zscore_96` | Z-score of `rolling_volatility_8` against its trailing 96 valid volatility values. |
 | `level_zscore_96` | `(adjusted_close_level[t] - trailing_mean₉₆) / trailing_sample_std₉₆`. |
-| `momentum_autocorr_lag1_window96` | Pearson correlation of `r₁` with its one-observation lag over 96 valid return pairs. |
-| `momentum_autocorr_lag4_window96` | Pearson correlation of `r₁` with its four-observation lag over 96 valid return pairs. |
-| `momentum_autocorr_lag8_window192` | Pearson correlation of `r₁` with its eight-observation lag over 192 valid return pairs. |
+| `adjusted_close_log_level` | `ln(adjusted_close_level[t])` when the level is positive. |
+| `adjusted_close_absolute_delta_1obs`, `adjusted_close_absolute_delta_5obs`, `adjusted_close_absolute_delta_20obs` | `adjusted_close_level[t] - adjusted_close_level[t-n]`. |
+| `level_zscore_60` | `(adjusted_close_level[t] - trailing_mean₆₀) / trailing_population_std₆₀` (`ddof=0`). |
+| `return_autocorr_lag1_window96`, `return_autocorr_lag4_window96`, `return_autocorr_lag8_window192` | Pearson correlation of `r₁` with the named lag of `r₁`, requiring 96, 96, or 192 valid pairs. |
+| `momentum_autocorr_delta_lag1_window60`, `momentum_autocorr_delta_lag5_window60`, `momentum_autocorr_delta_lag20_window120` | `max(0, corr(Δxₜ, Δxₜ₋ₖ))` over the named number of valid pairs, where `Δxₜ = adjusted_close_level[t] - adjusted_close_level[t-1]`. |
 | `adjusted_close_drawdown_20obs`, `adjusted_close_drawdown_60obs`; `rolling_drawdown_32`, `rolling_drawdown_96` | `adjusted_close_level[t] / trailing_max(adjusted_close_level, n) - 1`, including the current observation. |
 | `relative_volume_5obs`, `relative_volume_10obs`, `relative_volume_20obs` | `volume_level[t] / trailing_mean(volume_level, n)`. |
 | `volume_zscore_5obs`, `volume_zscore_10obs`, `volume_zscore_20obs` | `(volume_level[t] - trailing_meanₙ) / trailing_sample_stdₙ`. |
@@ -272,7 +274,7 @@ average.
 
 All OHLC-derived columns above are derived features, not exposed OHLC levels.
 No pairwise or average-correlation columns are calculated. The complete
-105-column view inventory is recorded once in the PostgreSQL schema inventory
+113-column view inventory is recorded once in the PostgreSQL schema inventory
 below.
 
 ## Feature benchmark
@@ -360,13 +362,13 @@ date maps to the next Monday–Friday at 00:00 UTC (Friday/Saturday to Monday;
 exchange holidays are not modeled). These tables contain raw OHLCV data and
 metadata, not derived features.
 
-The materialized view `xetra_loader.xetra_features` has **105 columns**:
+The materialized view `xetra_loader.xetra_features` has **113 columns**:
 
 - **4 identity columns**: `isin`, `exchange`, `code`, `trade_date`;
 - **1 availability column**: `available_at_utc`, projected from the raw quote
   table and set to the next weekday at 00:00 UTC;
 - **2 exposed level columns**: `adjusted_close_level`, `volume_level`;
-- **98 derived feature columns** from the versioned catalog, or **100 feature
+- **106 derived feature columns** from the versioned catalog, or **108 feature
   columns** when the two base levels are included and identity columns are
   excluded.
 

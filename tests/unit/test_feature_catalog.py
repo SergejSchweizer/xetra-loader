@@ -56,7 +56,11 @@ def test_catalog_contains_requested_windows() -> None:
         "rolling_volatility_96",
         "volatility_zscore_96",
         "level_zscore_96",
-        "momentum_autocorr_lag8_window192",
+        "level_zscore_60",
+        "adjusted_close_log_level",
+        "adjusted_close_absolute_delta_20obs",
+        "return_autocorr_lag8_window192",
+        "momentum_autocorr_delta_lag20_window120",
         "rolling_drawdown_96",
         "log_tick_volume",
     )
@@ -78,7 +82,7 @@ def test_only_approved_feature_families_may_use_internal_ohlc() -> None:
 
 def test_catalog_fingerprint_is_stable_and_train_fold_fit_is_not_global() -> None:
     validate_feature_catalog()
-    assert FEATURE_CATALOG_VERSION == 4
+    assert FEATURE_CATALOG_VERSION == 5
     assert len(FEATURE_CATALOG_FINGERPRINT) == 64
     assert feature_catalog_payload()["train_fold_standardization"] == {
         "scope": "downstream_fold_aware_operation",
@@ -99,9 +103,13 @@ def test_catalog_declares_unambiguous_window_count_domains() -> None:
     assert specs["intraday_return_5obs"].minimum_count == 5
     assert specs["overnight_gap_5obs"].minimum_count == 6
     assert specs["adjusted_close_rsi_14obs"].minimum_count == 15
-    assert specs["momentum_autocorr_lag1_window96"].minimum_count == 99
-    assert specs["momentum_autocorr_lag4_window96"].minimum_count == 102
-    assert specs["momentum_autocorr_lag8_window192"].minimum_count == 202
+    assert specs["return_autocorr_lag1_window96"].minimum_count == 99
+    assert specs["return_autocorr_lag4_window96"].minimum_count == 102
+    assert specs["return_autocorr_lag8_window192"].minimum_count == 202
+    assert specs["momentum_autocorr_delta_lag1_window60"].minimum_count == 62
+    assert specs["momentum_autocorr_delta_lag5_window60"].minimum_count == 66
+    assert specs["momentum_autocorr_delta_lag20_window120"].minimum_count == 141
+    assert specs["level_zscore_60"].minimum_count == 60
     assert specs["volatility_zscore_96"].minimum_count == 104
     assert specs["donchian_breakout_up"].minimum_count == 21
     assert specs["breadth_daily"].count_domain is ObservationCountDomain.VALID_INSTRUMENT_RETURNS
@@ -117,5 +125,5 @@ def test_readme_documents_every_derived_output_column() -> None:
     documented = set(re.findall(r"`([a-z][a-z0-9_]+)`", table))
     expected = set(feature_columns()) - set(BASE_LEVEL_COLUMNS)
 
-    assert len(expected) == 98
+    assert len(expected) == 106
     assert documented.intersection(expected) == expected

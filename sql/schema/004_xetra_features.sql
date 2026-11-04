@@ -289,6 +289,7 @@ WITH ordered AS (
              THEN ln(adjusted_close_level / adjusted_close_lag_10) END AS log_return_10,
         CASE WHEN adjusted_close_level > 0 AND adjusted_close_lag_20 > 0
              THEN ln(adjusted_close_level / adjusted_close_lag_20) END AS log_return_20,
+        adjusted_close_level - adjusted_close_lag_1 AS delta_1,
         CASE WHEN close_value > 0 THEN (high_value - low_value) / close_value END AS range_1,
         CASE WHEN open_value > 0 THEN (close_value - open_value) / open_value END AS intraday_1,
         CASE WHEN close_lag_1 > 0 THEN (open_value - close_lag_1) / close_lag_1 END AS gap_1,
@@ -301,7 +302,10 @@ WITH ordered AS (
     SELECT r.*,
         lag(log_return_1, 1) OVER w AS return_lag_1,
         lag(log_return_1, 4) OVER w AS return_lag_4,
-        lag(log_return_1, 8) OVER w AS return_lag_8
+        lag(log_return_1, 8) OVER w AS return_lag_8,
+        lag(delta_1, 1) OVER w AS delta_lag_1,
+        lag(delta_1, 5) OVER w AS delta_lag_5,
+        lag(delta_1, 20) OVER w AS delta_lag_20
     FROM returns AS r
     WINDOW w AS (PARTITION BY isin, exchange, code ORDER BY trade_date)
 ), feature_series AS MATERIALIZED (
@@ -463,13 +467,25 @@ WITH ordered AS (
              THEN adjusted_close_level / adjusted_close_lag_8 - 1 END AS roc_8,
         CASE WHEN count(CASE WHEN log_return_1 IS NOT NULL AND return_lag_1 IS NOT NULL
                              THEN 1 END) OVER w96 = 96
-             THEN corr(log_return_1, return_lag_1) OVER w96 END AS autocorr_lag1_96,
+             THEN corr(log_return_1, return_lag_1) OVER w96 END AS return_autocorr_lag1_96,
         CASE WHEN count(CASE WHEN log_return_1 IS NOT NULL AND return_lag_4 IS NOT NULL
                              THEN 1 END) OVER w96 = 96
-             THEN corr(log_return_1, return_lag_4) OVER w96 END AS autocorr_lag4_96,
+             THEN corr(log_return_1, return_lag_4) OVER w96 END AS return_autocorr_lag4_96,
         CASE WHEN count(CASE WHEN log_return_1 IS NOT NULL AND return_lag_8 IS NOT NULL
                              THEN 1 END) OVER w192 = 192
-             THEN corr(log_return_1, return_lag_8) OVER w192 END AS autocorr_lag8_192,
+             THEN corr(log_return_1, return_lag_8) OVER w192 END AS return_autocorr_lag8_192,
+        CASE WHEN count(CASE WHEN delta_1 IS NOT NULL AND delta_lag_1 IS NOT NULL
+                             THEN 1 END) OVER w60 = 60
+             THEN greatest(corr(delta_1, delta_lag_1) OVER w60, 0.0) END
+            AS momentum_autocorr_delta_lag1_60,
+        CASE WHEN count(CASE WHEN delta_1 IS NOT NULL AND delta_lag_5 IS NOT NULL
+                             THEN 1 END) OVER w60 = 60
+             THEN greatest(corr(delta_1, delta_lag_5) OVER w60, 0.0) END
+            AS momentum_autocorr_delta_lag5_60,
+        CASE WHEN count(CASE WHEN delta_1 IS NOT NULL AND delta_lag_20 IS NOT NULL
+                             THEN 1 END) OVER w120 = 120
+             THEN greatest(corr(delta_1, delta_lag_20) OVER w120, 0.0) END
+            AS momentum_autocorr_delta_lag20_120,
         CASE WHEN count(volume_level) OVER w5 = 5
              THEN volume_level / nullif(avg(volume_level) OVER w5, 0) END AS rel_volume_5,
         CASE WHEN count(volume_level) OVER w10 = 10
@@ -495,6 +511,7 @@ WITH ordered AS (
         w40 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 39 PRECEDING AND CURRENT ROW),
         w60 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW),
         w96 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 95 PRECEDING AND CURRENT ROW),
+        w120 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW),
         w192 AS (PARTITION BY isin, exchange, code ORDER BY trade_date ROWS BETWEEN 191 PRECEDING AND CURRENT ROW)
 -- Keep the wide observation-level feature rows in one computed rowset for the
 -- final projection; daily market statistics use the narrower returns CTE.
@@ -505,10 +522,15 @@ WITH ordered AS (
                   / nullif(stddev_samp(vol_8) OVER w96, 0) END AS volatility_zscore_96,
         CASE WHEN count(adjusted_close_level) OVER w96 = 96
              THEN (adjusted_close_level - avg(adjusted_close_level) OVER w96)
-                  / nullif(stddev_samp(adjusted_close_level) OVER w96, 0) END AS level_zscore_96
+                  / nullif(stddev_samp(adjusted_close_level) OVER w96, 0) END AS level_zscore_96,
+        CASE WHEN count(adjusted_close_level) OVER w60 = 60
+             THEN (adjusted_close_level - avg(adjusted_close_level) OVER w60)
+                  / nullif(stddev_pop(adjusted_close_level) OVER w60, 0) END AS level_zscore_60
     FROM rolling AS r
     WINDOW w96 AS (PARTITION BY isin, exchange, code ORDER BY trade_date
-        ROWS BETWEEN 95 PRECEDING AND CURRENT ROW)
+        ROWS BETWEEN 95 PRECEDING AND CURRENT ROW),
+        w60 AS (PARTITION BY isin, exchange, code ORDER BY trade_date
+        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
 ), daily_cross AS (
     SELECT trade_date,
         avg(CASE WHEN log_return_1 > 0 THEN 1.0 WHEN log_return_1 IS NOT NULL THEN 0.0 END) AS breadth_daily,
@@ -533,6 +555,11 @@ SELECT
     r.isin, r.exchange, r.code, r.trade_date,
     r.available_at_utc,
     r.adjusted_close_level, r.volume_level,
+    CASE WHEN r.adjusted_close_level > 0 THEN ln(r.adjusted_close_level) END
+        AS adjusted_close_log_level,
+    r.adjusted_close_level - r.adjusted_close_lag_1 AS adjusted_close_absolute_delta_1obs,
+    r.adjusted_close_level - r.adjusted_close_lag_5 AS adjusted_close_absolute_delta_5obs,
+    r.adjusted_close_level - r.adjusted_close_lag_20 AS adjusted_close_absolute_delta_20obs,
     r.log_return_1 AS adjusted_close_log_return_1obs,
     r.log_return_3 AS adjusted_close_log_return_3obs,
     r.log_return_5 AS adjusted_close_log_return_5obs,
@@ -616,13 +643,17 @@ SELECT
          THEN (r.stoch_k_5 - r.stoch_k_5_lag_3) / 3.0 END AS stoch_k_slope_3,
     r.donchian_breakout_up AS donchian_breakout_up,
     r.donchian_breakout_down AS donchian_breakout_down,
-    r.autocorr_lag1_96 AS momentum_autocorr_lag1_window96,
-    r.autocorr_lag4_96 AS momentum_autocorr_lag4_window96,
-    r.autocorr_lag8_192 AS momentum_autocorr_lag8_window192,
+    r.return_autocorr_lag1_96 AS return_autocorr_lag1_window96,
+    r.return_autocorr_lag4_96 AS return_autocorr_lag4_window96,
+    r.return_autocorr_lag8_192 AS return_autocorr_lag8_window192,
+    r.momentum_autocorr_delta_lag1_60 AS momentum_autocorr_delta_lag1_window60,
+    r.momentum_autocorr_delta_lag5_60 AS momentum_autocorr_delta_lag5_window60,
+    r.momentum_autocorr_delta_lag20_120 AS momentum_autocorr_delta_lag20_window120,
     r.drawdown_32 AS rolling_drawdown_32,
     r.drawdown_96 AS rolling_drawdown_96,
     r.volatility_zscore_96 AS volatility_zscore_96,
     r.level_zscore_96 AS level_zscore_96,
+    r.level_zscore_60 AS level_zscore_60,
     CASE WHEN r.volume_level >= 0 THEN ln(1.0 + r.volume_level) END AS log_tick_volume,
     r.roc_1 AS roc_1,
     r.roc_2 AS roc_2,
@@ -686,7 +717,7 @@ ALTER FUNCTION xetra_loader.resolve_feature_temp_file_limit()
 REVOKE ALL ON FUNCTION xetra_loader.resolve_feature_temp_file_limit() FROM PUBLIC;
 
 COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features IS
-    'XETRA feature view; catalog version=4; base levels=adjusted_close_level,volume_level';
+    'XETRA feature view; catalog version=5; base levels=adjusted_close_level,volume_level';
 
 REVOKE ALL ON xetra_loader.xetra_features FROM PUBLIC;
 GRANT SELECT ON xetra_loader.xetra_features TO portfell_app;
