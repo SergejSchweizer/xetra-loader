@@ -86,7 +86,7 @@ def test_feature_view_has_identity_index_and_runtime_refresh_function() -> None:
     assert "RENAME TO xetra_features_identity_idx" in VIEW_SQL
     assert "CREATE OR REPLACE FUNCTION xetra_loader.refresh_xetra_features()" in VIEW_SQL
     assert (
-        'GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app'
+        'GRANT SELECT ON xetra_loader.xetra_features TO portfell_app'
         in VIEW_SQL
     )
 

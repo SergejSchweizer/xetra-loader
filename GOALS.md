@@ -405,20 +405,22 @@ Read `config.yaml` (ignored) with environment overrides. `config.example.yaml`
 documents field names without secrets. Supported secret/config categories:
 
 - EODHD API token (`EODHD_API_TOKEN` or `eodhd.api_token`);
-- least-privilege PostgreSQL writer DSN (`XDL_POSTGRES_WRITER_DSN` or
+- PostgreSQL writer DSN for the XETRA writer identity (`XDL_POSTGRES_WRITER_DSN` or
   `postgres.writer_dsn`);
 - admin DSN for provisioning, schema migration, backup/reset, and controlled
   full sync only (`XDL_POSTGRES_ADMIN_DSN` or `postgres.admin_dsn`);
 - database, host, port, local credentials, medallion root, API bearer token,
   core budget, feature work memory, and temp-file cap.
 
-Weekly publication must reject a PostgreSQL superuser session. The writer role
-`xetra_data_loader_writer` is a member of `xetra-data-loader`. The external
-reader role `xetra_loader` receives `USAGE` and `SELECT` on
-`xetra_loader.xetra_features` only; it must not modify serving tables or read
-the sync schema. `portfell_app` receives read-only market data access according
-to role SQL. Provision roles through the migration scripts; never place role
-passwords in tracked SQL.
+The only XETRA login roles are `xetra_writer` and `xetra_reader`. Both weekly
+publication and full refresh use `xetra_writer`; it is a PostgreSQL superuser
+by explicit operator configuration, so credentials must remain local and the
+role must never be used outside this dedicated pipeline. `xetra_reader` is the
+read-only XETRA consumer login. No extra XETRA roles are required: `xetra_writer`
+owns and operates the pipeline objects, while `xetra_reader` receives direct
+read access to the feature view and raw data. `portfell_app` receives read-only
+market data access according to role SQL. Never place role passwords in
+tracked SQL.
 
 Every application entry point configures DEBUG file logs below `.logs/` (or
 `XDL_LOG_DIR`): restrictive directory/file permissions, UTC daily rotation,

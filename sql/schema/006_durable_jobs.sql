@@ -41,7 +41,6 @@ CREATE TRIGGER loader_jobs_notify_insert
     FOR EACH ROW EXECUTE FUNCTION xetra_loader.notify_loader_job();
 
 REVOKE ALL ON TABLE xetra_loader.loader_jobs FROM PUBLIC, portfell_app;
-GRANT SELECT, INSERT, UPDATE ON TABLE xetra_loader.loader_jobs TO "xetra-data-loader";
 REVOKE ALL ON FUNCTION xetra_loader.notify_loader_job() FROM PUBLIC;
 
 COMMENT ON TABLE xetra_loader.loader_jobs IS

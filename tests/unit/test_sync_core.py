@@ -52,6 +52,8 @@ def test_postgres_session_uses_bounded_parallel_query_and_maintenance_workers(
             self.calls.append((query, params))
             if query == "SHOW server_version_num":
                 return _Result((self.server_version,))
+            if query == "SELECT rolsuper FROM pg_roles WHERE rolname = current_user":
+                return _Result((False,))
             return _Result(None)
 
         def commit(self) -> None:
@@ -106,6 +108,8 @@ def test_postgres_14_writer_uses_migrated_login_role_temp_file_limit(
             self.calls.append((query, params))
             if query == "SHOW server_version_num":
                 return _Result((140000,))
+            if query == "SELECT rolsuper FROM pg_roles WHERE rolname = current_user":
+                return _Result((False,))
             if "current_setting('temp_file_limit')" in query:
                 return _Result((True,))
             return _Result(None)
@@ -127,3 +131,40 @@ def test_postgres_14_writer_uses_migrated_login_role_temp_file_limit(
         for query, _params in connection.calls
     )
     assert not connection.closed
+
+
+def test_postgres_14_superuser_sets_temp_file_limit_per_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Result:
+        def __init__(self, row: tuple[object, ...] | None) -> None:
+            self.row = row
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            return self.row
+
+    class _Connection:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def execute(self, query: str, params: tuple[object, ...] = ()) -> _Result:
+            self.calls.append((query, params))
+            if query == "SHOW server_version_num":
+                return _Result((140000,))
+            if query == "SELECT rolsuper FROM pg_roles WHERE rolname = current_user":
+                return _Result((True,))
+            return _Result(None)
+
+        def commit(self) -> None:
+            pass
+
+    connection = _Connection()
+    monkeypatch.setattr(sync_core, "resolve_postgres_writer_dsn", lambda _dsn: "dsn")
+    monkeypatch.setattr(sync_core, "resolve_feature_temp_file_limit", lambda: "32GB")
+    monkeypatch.setattr(sync_core.psycopg, "connect", lambda *_args, **_kwargs: connection)
+
+    assert sync_core.connect_postgres(cores=6) is connection
+    assert (
+        "SELECT set_config('xetra_loader.feature_temp_file_limit', %s, false)",
+        ("32GB",),
+    ) in connection.calls

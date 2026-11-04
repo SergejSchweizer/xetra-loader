@@ -118,7 +118,7 @@ def test_schema_provisioner_configures_pg14_writer_login_temp_limit(
     statement, params = connection.statements[-1]
     statement_text = str(statement)
     assert "ALTER ROLE" in statement_text
-    assert "xetra_data_loader_writer" in statement_text
+    assert "xetra_writer" in statement_text
     assert "temp_file_limit" in statement_text
     assert "24GB" in statement_text
     assert params == ()

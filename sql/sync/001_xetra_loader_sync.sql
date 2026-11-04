@@ -39,10 +39,6 @@ CREATE TABLE IF NOT EXISTS xetra_loader_sync.row_hashes (
 
 REVOKE ALL ON SCHEMA xetra_loader_sync FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA xetra_loader_sync FROM PUBLIC;
-GRANT USAGE ON SCHEMA xetra_loader_sync TO "xetra-data-loader";
-REVOKE CREATE ON SCHEMA xetra_loader_sync FROM "xetra-data-loader";
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA xetra_loader_sync
-    TO "xetra-data-loader";
 REVOKE ALL ON SCHEMA xetra_loader_sync FROM portfell_app;
 REVOKE ALL ON ALL TABLES IN SCHEMA xetra_loader_sync FROM portfell_app;
 

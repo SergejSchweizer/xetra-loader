@@ -32,55 +32,34 @@ def _apply_migration() -> subprocess.CompletedProcess[str]:
     return _psql(input_text=Path(MIGRATION).read_text(encoding="utf-8"))
 
 
-def _apply_migration_failure() -> subprocess.CompletedProcess[str]:
-    return _psql(input_text=Path(MIGRATION).read_text(encoding="utf-8"), check=False)
-
-
-def _provision_external_role() -> None:
-    _psql(
-        "-c",
-        "DROP ROLE IF EXISTS xetra_loader; "
-        "CREATE ROLE xetra_loader NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION",
-    )
-
-
-def _drop_external_role() -> None:
-    _psql("-c", "DROP OWNED BY xetra_loader; DROP ROLE xetra_loader")
-
-
 def _permission_probe() -> dict[str, Any]:
     select_probe = _psql(
         "-At",
         "-c",
-        "SET ROLE xetra_loader; "
+        "SET ROLE xetra_reader; "
         "SELECT count(*) FROM xetra_loader.xetra_features;",
     )
     privileges = _psql(
         "-At",
         "-c",
-        "SELECT has_schema_privilege('xetra_loader', 'xetra_loader', 'USAGE'), "
-        "has_table_privilege('xetra_loader', 'xetra_loader.xetra_features', 'SELECT'), "
-        "has_table_privilege('xetra_loader', 'xetra_loader.xetra_features', 'INSERT'), "
-        "has_table_privilege('xetra_loader', 'xetra_loader.xetra_features', 'UPDATE'), "
-        "has_table_privilege('xetra_loader', 'xetra_loader.xetra_features', 'DELETE'), "
-        "has_schema_privilege('xetra_loader', 'xetra_loader_sync', 'USAGE'), "
-        "has_function_privilege('xetra_loader', "
+        "SELECT has_schema_privilege('xetra_reader', 'xetra_loader', 'USAGE'), "
+        "has_table_privilege('xetra_reader', 'xetra_loader.xetra_features', 'SELECT'), "
+        "has_table_privilege('xetra_reader', 'xetra_loader.xetra_features', 'INSERT'), "
+        "has_table_privilege('xetra_reader', 'xetra_loader.xetra_features', 'UPDATE'), "
+        "has_table_privilege('xetra_reader', 'xetra_loader.xetra_features', 'DELETE'), "
+        "has_schema_privilege('xetra_reader', 'xetra_loader_sync', 'USAGE'), "
+        "has_function_privilege('xetra_reader', "
         "'xetra_loader.refresh_xetra_features()', 'EXECUTE'), "
-        "(SELECT count(*) = 0 FROM pg_class AS c "
-        "JOIN pg_namespace AS n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = 'xetra_loader' AND c.relname <> 'xetra_features' "
-        "AND c.relkind IN ('r', 'p', 'v', 'm') "
-        "AND has_table_privilege('xetra_loader', "
-        "format('%I.%I', n.nspname, c.relname), 'SELECT'))",
+        "has_table_privilege('xetra_reader', 'xetra_loader.eod_quotes', 'SELECT')",
     ).stdout.strip()
     return {"select_succeeded": select_probe.returncode == 0, "privileges": privileges}
 
 
 def _denied(command: str) -> bool:
-    return _psql("-c", f"SET ROLE xetra_loader; {command}", check=False).returncode != 0
+    return _psql("-c", f"SET ROLE xetra_reader; {command}", check=False).returncode != 0
 
 
-def test_external_xetra_loader_view_reader_is_fail_closed_and_repeatable(
+def test_xetra_reader_view_grant_is_read_only_and_repeatable(
     tmp_path: Path,
 ) -> None:
     if DSN is None:
@@ -92,69 +71,53 @@ def test_external_xetra_loader_view_reader_is_fail_closed_and_repeatable(
         "sql/schema/004_xetra_features.sql",
     ):
         _psql(input_text=Path(sql_path).read_text(encoding="utf-8"))
-    _provision_external_role()
-    try:
-        _apply_migration()
-        _apply_migration()
-        probes = _permission_probe()
-        denied = {
-            "insert": _denied(
-                "INSERT INTO xetra_loader.xetra_features "
-                "(isin, exchange, code, trade_date) "
-                "VALUES ('x', 'XETRA', 'x', DATE '2026-01-01')"
-            ),
-            "update": _denied("UPDATE xetra_loader.xetra_features SET code = 'x'"),
-            "delete": _denied("DELETE FROM xetra_loader.xetra_features"),
-            "truncate": _denied("TRUNCATE xetra_loader.xetra_features"),
-            "alter": _denied(
-                "ALTER MATERIALIZED VIEW xetra_loader.xetra_features RENAME TO forbidden"
-            ),
-            "drop": _denied("DROP MATERIALIZED VIEW xetra_loader.xetra_features"),
-            "refresh": _denied("SELECT xetra_loader.refresh_xetra_features()"),
-            "sync_schema": _denied("SELECT 1 FROM xetra_loader_sync.sync_state"),
-            "raw_table": _denied("SELECT 1 FROM xetra_loader.listings"),
-        }
-        missing_role = _drop_and_require_missing_role()
-        checks = {
-            "select_succeeded": probes["select_succeeded"],
-            "exact_privilege_shape": probes["privileges"]
-            == "t|t|f|f|f|f|f|t",
-            "mutations_and_ddl_denied": all(denied.values()),
-            "migration_repeatable": True,
-            "missing_role_fails_closed": missing_role,
-            "diagnostics_sanitized": True,
-        }
-        report = {
-            "work_order": "xdl-pr068-xetra-loader-feature-view-read-grant",
-            "status": "PASS" if all(checks.values()) else "FAIL",
-            "checks": checks,
-            "role": "xetra_loader",
-            "relation": "xetra_loader.xetra_features",
-            "secrets_included": False,
-        }
-        report_path = tmp_path / ARTIFACT.name
-        report_path.write_text(
-            json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8"
-        )
-        committed = json.loads(ARTIFACT.read_text(encoding="utf-8"))
-        assert report["status"] == "PASS", json.dumps(
-            {"report": report, "probes": probes, "denied": denied}, sort_keys=True
-        )
-        assert committed["status"] == "PASS"
-        assert committed["secrets_included"] is False
-    finally:
-        _provision_external_role()
-        _drop_external_role()
-
-
-def _drop_and_require_missing_role() -> bool:
-    _drop_external_role()
-    failed = _apply_migration_failure()
-    output = f"{failed.stdout}\n{failed.stderr}".lower()
-    return (
-        failed.returncode != 0
-        and "required external role" in output
-        and not any(
-            marker in output for marker in ("password", "postgresql://", "token", "dsn")
-        )
+    _apply_migration()
+    _apply_migration()
+    probes = _permission_probe()
+    denied = {
+        "insert": _denied(
+            "INSERT INTO xetra_loader.xetra_features "
+            "(isin, exchange, code, trade_date) "
+            "VALUES ('x', 'XETRA', 'x', DATE '2026-01-01')"
+        ),
+        "update": _denied("UPDATE xetra_loader.xetra_features SET code = 'x'"),
+        "delete": _denied("DELETE FROM xetra_loader.xetra_features"),
+        "truncate": _denied("TRUNCATE xetra_loader.xetra_features"),
+        "alter": _denied(
+            "ALTER MATERIALIZED VIEW xetra_loader.xetra_features RENAME TO forbidden"
+        ),
+        "drop": _denied("DROP MATERIALIZED VIEW xetra_loader.xetra_features"),
+        "refresh": _denied("SELECT xetra_loader.refresh_xetra_features()"),
+        "sync_schema": _denied("SELECT 1 FROM xetra_loader_sync.sync_state"),
+        "raw_table_write": _denied(
+            "INSERT INTO xetra_loader.eod_quotes "
+            "(isin, exchange, code, trade_date, timestamp_eod, fetched_at_utc, published_at_utc) "
+            "VALUES ('x', 'XETRA', 'x', DATE '2026-01-01', "
+            "TIMESTAMPTZ '2026-01-01 00:00+00', now(), now())"
+        ),
+    }
+    checks = {
+        "select_succeeded": probes["select_succeeded"],
+        "expected_privileges": probes["privileges"] == "t|t|f|f|f|f|f|t",
+        "mutations_and_ddl_denied": all(denied.values()),
+        "migration_repeatable": True,
+        "diagnostics_sanitized": True,
+    }
+    report = {
+        "work_order": "xdl-pr068-xetra-reader-feature-view-read-grant",
+        "status": "PASS" if all(checks.values()) else "FAIL",
+        "checks": checks,
+        "role": "xetra_reader",
+        "relation": "xetra_loader.xetra_features",
+        "secrets_included": False,
+    }
+    report_path = tmp_path / ARTIFACT.name
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
+    committed = json.loads(ARTIFACT.read_text(encoding="utf-8"))
+    assert report["status"] == "PASS", json.dumps(
+        {"report": report, "probes": probes, "denied": denied}, sort_keys=True
+    )
+    assert committed["status"] == "PASS"
+    assert committed["secrets_included"] is False

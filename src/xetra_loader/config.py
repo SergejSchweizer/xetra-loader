@@ -69,7 +69,7 @@ def resolve_eodhd_token(explicit: str | None = None) -> str:
 
 
 def resolve_postgres_writer_dsn(explicit: str | None = None) -> str:
-    """Resolve the least-privilege weekly writer DSN without exposing its secret."""
+    """Resolve the configured XETRA writer DSN without exposing its secret."""
 
     dsn = explicit or os.getenv("XDL_POSTGRES_WRITER_DSN")
     if dsn and dsn.strip():

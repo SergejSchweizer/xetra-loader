@@ -60,7 +60,7 @@ def test_schema_qa_scopes_raw_ohlc_to_approved_intraday_families() -> None:
     assert "adjusted_close_level" in VIEW_SQL
     assert "volume_level" in VIEW_SQL
     assert (
-        'ALTER MATERIALIZED VIEW xetra_loader.xetra_features OWNER TO "xetra-data-loader"'
+        'ALTER MATERIALIZED VIEW xetra_loader.xetra_features OWNER TO xetra_writer'
         in VIEW_SQL
     )
 
@@ -69,7 +69,7 @@ def test_schema_qa_has_repeatable_privilege_contract_and_catalog_version() -> No
     assert "COMMENT ON MATERIALIZED VIEW xetra_loader.xetra_features" in VIEW_SQL
     assert "catalog version=4" in VIEW_SQL
     assert (
-        'GRANT SELECT ON xetra_loader.xetra_features TO "xetra-data-loader", portfell_app'
+        'GRANT SELECT ON xetra_loader.xetra_features TO portfell_app'
         in VIEW_SQL
     )
     assert "REVOKE ALL ON xetra_loader.xetra_features FROM PUBLIC" in VIEW_SQL

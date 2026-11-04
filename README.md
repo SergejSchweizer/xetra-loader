@@ -36,24 +36,26 @@ administrative connection in this order: `sql/schema/001_xetra_loader.sql`,
 `sql/schema/002_roles.sql`, `sql/schema/003_listing_lifecycle.sql`,
 `sql/sync/001_xetra_loader_sync.sql`, `sql/schema/004_xetra_features.sql`, and
 `sql/schema/006_durable_jobs.sql`. Apply
-`sql/roles/005_xetra_loader_feature_view_reader.sql` only after the externally
-provisioned `xetra_loader` role exists; it grants that role `USAGE` on the
-`xetra_loader` schema and `SELECT` only on `xetra_loader.xetra_features`.
-`xdl-migrate` reapplies this reader contract after rebuilding the materialized
-view whenever that external role exists, because dropping and recreating the
-view discards its object-level grants.
+`sql/roles/005_xetra_loader_feature_view_reader.sql` after the provisioned
+`xetra_reader` login exists; it grants `USAGE` on the `xetra_loader` schema and
+`SELECT` only on `xetra_loader.xetra_features`. `xdl-migrate` reapplies this
+reader contract after rebuilding the materialized view because replacing it
+discards its object-level grants.
 The explicit provisioning command is `.venv/bin/xdl-migrate --cores 6`; it uses
 only the admin DSN and creates/populates the materialized feature view and
 durable job queue. `--cores` bounds PostgreSQL parallel plans; it defaults to
 `weekly.cores` or six. The weekly API worker never creates or alters
 PostgreSQL objects.
-The publication writer is the non-superuser `xetra_data_loader_writer`, a
-member of the `xetra-data-loader` group. The legacy files in `sql/migrations/`
-are historical rename migrations, not the current clean-create setup.
+The XETRA login roles are `xetra_writer` and `xetra_reader`. The writer is a
+superuser used by both weekly publication and controlled full refresh; this is
+a deliberate high-privilege deployment choice. No additional XETRA PostgreSQL
+roles are used: `xetra_writer` owns the pipeline objects and `xetra_reader`
+receives direct read grants. The legacy files in `sql/migrations/` are
+historical rename migrations, not the current clean-create setup.
 
 ## Local secrets
 
-Copy `config.example.yaml` to `config.yaml` and fill in the EODHD token plus separate PostgreSQL writer and admin credentials. Set `postgres.database` to the dedicated repository database `xetra_loader`; it overrides the database component of the configured writer URI. `postgres.writer_dsn` (or `XDL_POSTGRES_WRITER_DSN`) is used by the weekly runner and must authenticate as the non-superuser `xetra_data_loader_writer`; the runner rejects superuser sessions. `postgres.admin_dsn` (or `XDL_POSTGRES_ADMIN_DSN`) is required only for schema provisioning, migration, reset, and the controlled full bootstrap. When no explicit admin URI is set, the loader composes one from the local `host`, `port`, `user`, `password`, and `database` fields. The loader reads this ignored local file; never commit it. `EODHD_API_TOKEN` and `XDL_MEDALLION_ROOT` can still be provided through the environment.
+Copy `config.example.yaml` to `config.yaml`, then store the EODHD token and `xetra_writer` credential only there. Set `postgres.database` to `xetra_loader`; it overrides the database component of `postgres.writer_dsn`. Both `postgres.writer_dsn` (weekly/API publication) and `postgres.admin_dsn` (schema provisioning and controlled full refresh) authenticate as `xetra_writer`. `xetra_reader` is reserved for read-only consumers. The loader reads this ignored local file; never commit it. `EODHD_API_TOKEN` and `XDL_MEDALLION_ROOT` can still be provided through the environment.
 
 Set `api.token` to a long random bearer token in `config.yaml`; it protects job
 submission and status reads. The API defaults to loopback (`127.0.0.1:8765`),
